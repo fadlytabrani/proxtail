@@ -1,0 +1,45 @@
+# Docker Compose configuration for proxtail
+# Multi-tailnet Tailscale Layer 4 reverse proxy service
+services:
+  proxtail:
+    image: proxtail
+    build: ..
+    container_name: proxtail
+    restart: unless-stopped
+
+    # Environment variables for Tailscale configuration
+    environment:
+      - PROXTAIL_CONFIG=/etc/proxtail/config.yaml
+      - TS_STATE_DIR=/var/lib/tsnet
+      # Add your Tailscale auth keys here:
+      - TS_AUTHKEY_PROD=tskey-auth-xxxxx
+      - TS_AUTHKEY_STAGING=tskey-auth-yyyyy
+      - TS_AUTHKEY_DEVELOPMENT=tskey-auth-zzzzz
+
+    # Port mappings - adjust these to match your config.yaml
+    ports:
+      - '8080:8080' # Production web service
+      - '8443:8443' # Production HTTPS service
+      - '9080:9080' # Staging service
+      - '3000:3000' # Development service
+      - '12345:12345/udp' # UDP service
+
+    # Volume mounts
+    volumes:
+      - ./config.yaml:/etc/proxtail/config.yaml:ro
+      - tsnet-data:/var/lib/tsnet
+
+    # Health check
+    healthcheck:
+      test: ['CMD', 'pgrep', 'proxtail']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Graceful shutdown
+    stop_grace_period: 30s
+
+volumes:
+  tsnet-data:
+    driver: local

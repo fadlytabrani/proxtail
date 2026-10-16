@@ -1,0 +1,27 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Environment and OS files
+.env
+.DS_Store
+
+# Project binaries
+/proxtail
+/proxtail-*
+
+# Test environment
+test/
