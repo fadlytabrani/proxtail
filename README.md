@@ -285,8 +285,11 @@ make build
 # Run formatting, go vet, and race-enabled test suite
 make check
 
-# Run throughput benchmarks
+# Run synthetic socket throughput benchmarks
 make bench
+
+# Run real end-to-end tsnet + WireGuard (ChaCha20-Poly1305 + gVisor) throughput benchmarks
+make bench-real
 
 # Validate example configuration
 make validate

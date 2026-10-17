@@ -31,7 +31,8 @@ proxtail/
 | `make build` | Compile the `./proxtail` binary with version metadata. |
 | `make test` | Run all unit and integration tests. |
 | `make race` | Run the full test suite with the Go `-race` detector enabled. |
-| `make bench` | Run TCP and UDP throughput benchmarks (`internal/proxy`). |
+| `make bench` | Run synthetic socket TCP and UDP throughput benchmarks (`internal/proxy`). |
+| `make bench-real` | Run real end-to-end `tsnet` + WireGuard (`gVisor` + `ChaCha20-Poly1305`) throughput benchmarks. |
 | `make vet` | Run `go vet ./...` static analysis. |
 | `make check` | Run `fmt`, `vet`, and `race` tests (run before opening a PR). |
 | `make validate` | Build `proxtail` and validate `examples/config.yaml`. |

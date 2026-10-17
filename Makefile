@@ -4,7 +4,7 @@ GO          := GOTOOLCHAIN=auto go
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 IMAGE_REPO  ?= ghcr.io/fadlytabrani/proxtail
 
-.PHONY: all build test race bench vet fmt check validate docker-build clean help
+.PHONY: all build test race bench bench-real vet fmt check validate docker-build clean help
 
 all: check build
 
@@ -20,9 +20,13 @@ test:
 race:
 	$(GO) test -v -race ./...
 
-## bench: Run TCP and UDP throughput benchmarks
+## bench: Run synthetic socket TCP and UDP throughput benchmarks
 bench:
-	$(GO) test -run=^$$ -bench=. -benchmem ./internal/proxy
+	$(GO) test -run=^$$ -bench='^Benchmark(TCP|UDP|MultiTailnet)' -benchmem ./internal/proxy
+
+## bench-real: Run real end-to-end tsnet + WireGuard (ChaCha20-Poly1305 + gVisor) throughput benchmarks
+bench-real:
+	$(GO) test -run=^$$ -bench='^BenchmarkRealTSNet' -benchmem -benchtime=3s ./internal/proxy
 
 ## vet: Run go vet static analysis
 vet:

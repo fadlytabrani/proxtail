@@ -6,9 +6,22 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"tailscale.com/ipn/store/mem"
+	"tailscale.com/net/netns"
+	"tailscale.com/tailcfg"
+	"tailscale.com/tsnet"
+	"tailscale.com/tstest/integration"
+	"tailscale.com/tstest/integration/testcontrol"
+	"tailscale.com/types/logger"
 )
 
 type localDialer struct{}
@@ -1199,3 +1212,366 @@ func BenchmarkMultiTailnetParallelTCPThroughput(b *testing.B) {
 		}
 	})
 }
+
+// startRealTSNetPair spins up an in-process Tailscale control plane, STUN/DERP relay,
+// and two real userspace tsnet.Server nodes (proxyNode and backendNode) that communicate
+// over real WireGuard (ChaCha20-Poly1305) and gVisor netstack (gonet).
+func startRealTSNetPair(tb testing.TB) (proxyNode *tsnet.Server, backendNode *tsnet.Server, backendIP netip.Addr) {
+	tb.Helper()
+
+	netns.SetEnabled(false)
+	tb.Cleanup(func() {
+		netns.SetEnabled(true)
+	})
+
+	derpMap := integration.RunDERPAndSTUN(tb, logger.Discard, "127.0.0.1")
+	control := &testcontrol.Server{
+		DERPMap: derpMap,
+		DNSConfig: &tailcfg.DNSConfig{
+			Proxied: true,
+		},
+		MagicDNSDomain: "tail-scale.ts.net",
+		Logf:           logger.Discard,
+	}
+	controlSrv := httptest.NewServer(control)
+	tb.Cleanup(controlSrv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	tmpDir := tb.TempDir()
+	newNode := func(hostname string) *tsnet.Server {
+		dir := filepath.Join(tmpDir, hostname)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			tb.Fatalf("mkdir %s: %v", dir, err)
+		}
+		s := &tsnet.Server{
+			Dir:        dir,
+			ControlURL: controlSrv.URL,
+			Hostname:   hostname,
+			Store:      new(mem.Store),
+			Ephemeral:  true,
+			Logf:       logger.Discard,
+			UserLogf:   logger.Discard,
+		}
+		tb.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+
+	proxyNode = newNode("proxtail-node")
+	backendNode = newNode("backend-node")
+
+	var wg sync.WaitGroup
+	var proxyErr, backendErr error
+	var backendIPs []netip.Addr
+
+	wg.Go(func() {
+		_, proxyErr = proxyNode.Up(ctx)
+	})
+	wg.Go(func() {
+		st, err := backendNode.Up(ctx)
+		if err != nil {
+			backendErr = err
+			return
+		}
+		backendIPs = st.TailscaleIPs
+	})
+	wg.Wait()
+
+	if proxyErr != nil {
+		tb.Fatalf("proxyNode.Up failed: %v", proxyErr)
+	}
+	if backendErr != nil || len(backendIPs) == 0 {
+		tb.Fatalf("backendNode.Up failed: %v", backendErr)
+	}
+
+	waitDERP := func(s *tsnet.Server) {
+		h := s.Sys().HealthTracker.Get()
+		ms := s.Sys().MagicSock.Get()
+		for {
+			if r := ms.GetLastNetcheckReport(ctx); r != nil &&
+				r.PreferredDERP != 0 &&
+				!h.GetDERPRegionReceivedTime(r.PreferredDERP).IsZero() {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				tb.Fatalf("timed out waiting for DERP on %s", s.Hostname)
+			case <-time.After(15 * time.Millisecond):
+			}
+		}
+	}
+	waitDERP(proxyNode)
+	waitDERP(backendNode)
+
+	return proxyNode, backendNode, backendIPs[0]
+}
+
+// BenchmarkRealTSNetWireGuardTCPThroughput measures end-to-end TCP throughput through
+// proxtail -> tsnet (gVisor gonet + wireguard-go ChaCha20-Poly1305) -> peer tsnet node.
+func BenchmarkRealTSNetWireGuardTCPThroughput(b *testing.B) {
+	proxyNode, backendNode, backendIP := startRealTSNetPair(b)
+
+	backendLn, err := backendNode.Listen("tcp", ":8080")
+	if err != nil {
+		b.Fatalf("backendNode.Listen failed: %v", err)
+	}
+	defer backendLn.Close()
+
+	go func() {
+		for {
+			conn, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to get free TCP port: %v", err)
+	}
+	proxyPort := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       net.JoinHostPort(backendIP.String(), "8080"),
+			Protocol:          "tcp",
+			Tailnet:           "real-tsnet",
+			ConnectionTimeout: 60,
+		},
+	}
+
+	p := NewProxyWithMultiTailnet(ports, map[string]*tsnet.Server{"real-tsnet": proxyNode}, 512*1024, 200)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	clientConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 10*time.Second)
+	if err != nil {
+		b.Fatalf("failed to dial proxy: %v", err)
+	}
+	defer clientConn.Close()
+
+	chunk := bytes.Repeat([]byte("W"), 256*1024)
+	recvBuf := make([]byte, len(chunk))
+
+	// Warm up WireGuard handshake & direct peer-to-peer UDP upgrade before timing
+	for range 4 {
+		if _, err := clientConn.Write(chunk); err != nil {
+			b.Fatalf("warmup write failed: %v", err)
+		}
+		if _, err := io.ReadFull(clientConn, recvBuf); err != nil {
+			b.Fatalf("warmup read failed: %v", err)
+		}
+	}
+
+	// Each iteration streams chunk outbound and receives chunk inbound (full-duplex pipelined, like iperf3 --bidir)
+	b.SetBytes(int64(2 * len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len(chunk))
+		for i := 0; i < b.N; i++ {
+			if _, err := io.ReadFull(clientConn, buf); err != nil {
+				readErrCh <- err
+				return
+			}
+		}
+		readErrCh <- nil
+	}()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := clientConn.Write(chunk); err != nil {
+			b.Fatalf("write failed: %v", err)
+		}
+	}
+	if err := <-readErrCh; err != nil {
+		b.Fatalf("read failed: %v", err)
+	}
+	b.StopTimer()
+}
+
+// BenchmarkRealTSNetWireGuardTCPParallelThroughput measures multi-stream concurrent TCP
+// throughput across a real encrypted tsnet WireGuard tunnel.
+func BenchmarkRealTSNetWireGuardTCPParallelThroughput(b *testing.B) {
+	proxyNode, backendNode, backendIP := startRealTSNetPair(b)
+
+	backendLn, err := backendNode.Listen("tcp", ":8080")
+	if err != nil {
+		b.Fatalf("backendNode.Listen failed: %v", err)
+	}
+	defer backendLn.Close()
+
+	go func() {
+		for {
+			conn, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to get free TCP port: %v", err)
+	}
+	proxyPort := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       net.JoinHostPort(backendIP.String(), "8080"),
+			Protocol:          "tcp",
+			Tailnet:           "real-tsnet",
+			ConnectionTimeout: 60,
+		},
+	}
+
+	p := NewProxyWithMultiTailnet(ports, map[string]*tsnet.Server{"real-tsnet": proxyNode}, 512*1024, 200)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	chunk := bytes.Repeat([]byte("P"), 128*1024)
+
+	// Warm up WireGuard tunnel with one initial round-trip
+	warmConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 10*time.Second)
+	if err != nil {
+		b.Fatalf("warmup dial failed: %v", err)
+	}
+	warmBuf := make([]byte, len(chunk))
+	if _, err := warmConn.Write(chunk); err != nil {
+		b.Fatalf("warmup write failed: %v", err)
+	}
+	if _, err := io.ReadFull(warmConn, warmBuf); err != nil {
+		b.Fatalf("warmup read failed: %v", err)
+	}
+	_ = warmConn.Close()
+
+	b.SetBytes(int64(2 * len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 10*time.Second)
+		if err != nil {
+			b.Fatalf("parallel dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		recvBuf := make([]byte, len(chunk))
+		for pb.Next() {
+			if _, err := conn.Write(chunk); err != nil {
+				b.Fatalf("parallel write failed: %v", err)
+			}
+			if _, err := io.ReadFull(conn, recvBuf); err != nil {
+				b.Fatalf("parallel read failed: %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkRealTSNetWireGuardUDPThroughput measures end-to-end UDP datagram forwarding
+// through proxtail -> tsnet WireGuard -> peer tsnet node.
+func BenchmarkRealTSNetWireGuardUDPThroughput(b *testing.B) {
+	proxyNode, backendNode, backendIP := startRealTSNetPair(b)
+
+	backendAddr := net.JoinHostPort(backendIP.String(), "5353")
+	backendPC, err := backendNode.ListenPacket("udp", backendAddr)
+	if err != nil {
+		b.Fatalf("backendNode.ListenPacket failed: %v", err)
+	}
+	defer backendPC.Close()
+
+	go func() {
+		buf := make([]byte, 64*1024)
+		for {
+			n, addr, err := backendPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = backendPC.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	u, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to get free UDP port: %v", err)
+	}
+	proxyUDPPort := u.LocalAddr().(*net.UDPAddr).Port
+	_ = u.Close()
+
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "udp",
+			Tailnet:           "real-tsnet",
+			ConnectionTimeout: 60,
+		},
+	}
+
+	p := NewProxyWithMultiTailnet(ports, map[string]*tsnet.Server{"real-tsnet": proxyNode}, 512*1024, 200)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	clientConn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort), 5*time.Second)
+	if err != nil {
+		b.Fatalf("failed to dial UDP proxy: %v", err)
+	}
+	defer clientConn.Close()
+
+	payload := bytes.Repeat([]byte("U"), 1024)
+	recvBuf := make([]byte, len(payload))
+
+	// Warm up WireGuard tunnel over UDP (first packet triggers DISCO/WireGuard handshake)
+	for range 10 {
+		_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = clientConn.Write(payload)
+		if _, err := io.ReadFull(clientConn, recvBuf); err == nil {
+			break
+		}
+	}
+	_ = clientConn.SetDeadline(time.Time{})
+
+	b.SetBytes(int64(2 * len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := clientConn.Write(payload); err != nil {
+			b.Fatalf("udp write failed: %v", err)
+		}
+		if _, err := io.ReadFull(clientConn, recvBuf); err != nil {
+			b.Fatalf("udp read failed: %v", err)
+		}
+	}
+}
+
