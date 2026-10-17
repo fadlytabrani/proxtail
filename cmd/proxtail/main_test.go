@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"proxtail/internal/config"
+	"proxtail/internal/proxy"
 )
 
 func TestTailnetManagerSyncTailnets(t *testing.T) {
@@ -73,6 +76,132 @@ func TestTailnetManagerSyncTailnets(t *testing.T) {
 	}
 	if len(cleaned) != 2 {
 		t.Errorf("expected 2 cleaned up servers (old prod and removed staging), got %v", cleaned)
+	}
+}
+
+func getFreePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func TestMultiTailnetReloadConfigEndToEnd(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+
+	port1 := getFreePort(t)
+	port2 := getFreePort(t)
+	port3 := getFreePort(t)
+
+	initialYAML := fmt.Sprintf(`
+tailnets:
+  - name: 'production'
+    hostname: 'prod-v1'
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.1:8080'
+  - name: 'staging'
+    hostname: 'staging-v1'
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.1:8080'
+`, port1, port2)
+
+	if err := os.WriteFile(cfgPath, []byte(initialYAML), 0o600); err != nil {
+		t.Fatalf("failed to write initial config: %v", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	var cleanedTailnets []string
+	tm := newTailnetManager()
+	tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: c.Hostname}, nil
+	}
+	tm.cleanupFunc = func(srv *tsnet.Server, name string) {
+		cleanedTailnets = append(cleanedTailnets, name+":"+srv.Hostname)
+	}
+	defer tm.closeAll()
+
+	servers, _, _, err := tm.syncTailnets(cfg.Tailnets)
+	if err != nil {
+		t.Fatalf("syncTailnets failed: %v", err)
+	}
+
+	proxyServer := proxy.NewProxyWithMultiTailnet(
+		cfg.ToProxyPortMappings(),
+		servers,
+		64*1024,
+		50,
+		100,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = proxyServer.Start(ctx) }()
+	defer proxyServer.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Reload 1: Add 'development' tailnet on port3, modify 'production' hostname to 'prod-v2', remove 'staging'
+	updatedYAML := fmt.Sprintf(`
+tailnets:
+  - name: 'production'
+    hostname: 'prod-v2'
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.1:8080'
+  - name: 'development'
+    hostname: 'dev-v1'
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.1:9000'
+`, port1, port3)
+
+	if err := os.WriteFile(cfgPath, []byte(updatedYAML), 0o600); err != nil {
+		t.Fatalf("failed to write updated config: %v", err)
+	}
+
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("reloadConfig failed: %v", err)
+	}
+
+	if len(cleanedTailnets) != 2 {
+		t.Fatalf("expected 2 cleaned tailnet servers (old production + removed staging), got %v", cleanedTailnets)
+	}
+
+	// Reload 2: Attempt invalid reload with conflicting port across two tailnets; verify it fails cleanly
+	invalidYAML := fmt.Sprintf(`
+tailnets:
+  - name: 'production'
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.1:8080'
+  - name: 'development'
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.2:8080'
+`, port1, port1)
+
+	if err := os.WriteFile(cfgPath, []byte(invalidYAML), 0o600); err != nil {
+		t.Fatalf("failed to write invalid config: %v", err)
+	}
+
+	if err := reloadConfig(cfgPath, proxyServer, tm); err == nil {
+		t.Fatalf("expected reloadConfig to fail on cross-tailnet port conflict, got nil")
 	}
 }
 

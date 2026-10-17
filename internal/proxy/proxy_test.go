@@ -727,6 +727,260 @@ func TestDialFailureIncrementsErrorStats(t *testing.T) {
 	}
 }
 
+// virtualTailnetDialer simulates an isolated tailnet namespace where virtual addresses
+// (such as overlapping "100.64.0.10:8080" or MagicDNS names) resolve to tailnet-specific local listeners.
+type virtualTailnetDialer struct {
+	name      string
+	tcpRoutes map[string]string
+	udpRoutes map[string]string
+}
+
+func (d *virtualTailnetDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	var target string
+	switch network {
+	case "tcp":
+		target = d.tcpRoutes[address]
+	case "udp":
+		target = d.udpRoutes[address]
+	}
+	if target == "" {
+		return nil, fmt.Errorf("tailnet %s: unknown %s destination %s", d.name, network, address)
+	}
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, target)
+}
+
+func startTaggedTCPServer(t *testing.T, tag string) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start TCP server (%s): %v", tag, err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if n > 0 {
+						_, _ = c.Write([]byte(tag + ":" + string(buf[:n])))
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return ln
+}
+
+func startTaggedUDPServer(t *testing.T, tag string) net.PacketConn {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start UDP server (%s): %v", tag, err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				_, _ = pc.WriteTo([]byte(tag+":"+string(buf[:n])), addr)
+			}
+		}
+	}()
+	return pc
+}
+
+func TestMultiTailnetIsolationOverlappingDestinationsAndDynamicLifecycle(t *testing.T) {
+	// All three tailnets expose the EXACT same virtual Tailscale IP/port ("100.64.0.10:8080" and "100.64.0.10:5353")
+	const sharedTCPDest = "100.64.0.10:8080"
+	const sharedUDPDest = "100.64.0.10:5353"
+
+	alphaTCP := startTaggedTCPServer(t, "ALPHA-TCP")
+	alphaUDP := startTaggedUDPServer(t, "ALPHA-UDP")
+
+	betaTCPv1 := startTaggedTCPServer(t, "BETA-V1-TCP")
+	betaUDPv1 := startTaggedUDPServer(t, "BETA-V1-UDP")
+
+	betaTCPv2 := startTaggedTCPServer(t, "BETA-V2-TCP")
+	betaUDPv2 := startTaggedUDPServer(t, "BETA-V2-UDP")
+
+	gammaTCP := startTaggedTCPServer(t, "GAMMA-TCP")
+	gammaUDP := startTaggedUDPServer(t, "GAMMA-UDP")
+
+	alphaDialer := &virtualTailnetDialer{
+		name:      "tailnet-alpha",
+		tcpRoutes: map[string]string{sharedTCPDest: alphaTCP.Addr().String()},
+		udpRoutes: map[string]string{sharedUDPDest: alphaUDP.LocalAddr().String()},
+	}
+	betaDialerV1 := &virtualTailnetDialer{
+		name:      "tailnet-beta",
+		tcpRoutes: map[string]string{sharedTCPDest: betaTCPv1.Addr().String()},
+		udpRoutes: map[string]string{sharedUDPDest: betaUDPv1.LocalAddr().String()},
+	}
+	betaDialerV2 := &virtualTailnetDialer{
+		name:      "tailnet-beta-v2",
+		tcpRoutes: map[string]string{sharedTCPDest: betaTCPv2.Addr().String()},
+		udpRoutes: map[string]string{sharedUDPDest: betaUDPv2.LocalAddr().String()},
+	}
+	gammaDialer := &virtualTailnetDialer{
+		name:      "tailnet-gamma",
+		tcpRoutes: map[string]string{sharedTCPDest: gammaTCP.Addr().String()},
+		udpRoutes: map[string]string{sharedUDPDest: gammaUDP.LocalAddr().String()},
+	}
+
+	alphaTCPPort := getFreeTCPPort(t)
+	alphaUDPPort := getFreeUDPPort(t)
+	betaTCPPort := getFreeTCPPort(t)
+	betaUDPPort := getFreeUDPPort(t)
+	reassignTCPPort := getFreeTCPPort(t)
+	gammaTCPPort := getFreeTCPPort(t)
+	gammaUDPPort := getFreeUDPPort(t)
+
+	initialPorts := []PortMapping{
+		{Source: alphaTCPPort, Destination: sharedTCPDest, Protocol: "tcp", Tailnet: "tailnet-alpha", ConnectionTimeout: 5},
+		{Source: alphaUDPPort, Destination: sharedUDPDest, Protocol: "udp", Tailnet: "tailnet-alpha", ConnectionTimeout: 5},
+		{Source: betaTCPPort, Destination: sharedTCPDest, Protocol: "tcp", Tailnet: "tailnet-beta", ConnectionTimeout: 5},
+		{Source: betaUDPPort, Destination: sharedUDPDest, Protocol: "udp", Tailnet: "tailnet-beta", ConnectionTimeout: 5},
+		{Source: reassignTCPPort, Destination: sharedTCPDest, Protocol: "tcp", Tailnet: "tailnet-alpha", ConnectionTimeout: 5},
+	}
+
+	dialers := map[string]Dialer{
+		"tailnet-alpha": alphaDialer,
+		"tailnet-beta":  betaDialerV1,
+	}
+
+	p := NewProxyWithDialers(initialPorts, dialers, 32*1024, 50, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(100 * time.Millisecond)
+
+	assertTCP := func(port int, msg, want string) {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+		if err != nil {
+			t.Fatalf("TCP dial port %d failed: %v", port, err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write([]byte(msg)); err != nil {
+			t.Fatalf("TCP write port %d failed: %v", port, err)
+		}
+		buf := make([]byte, len(want))
+		if _, err := io.ReadFull(c, buf); err != nil {
+			t.Fatalf("TCP read port %d failed: %v", port, err)
+		}
+		if string(buf) != want {
+			t.Fatalf("TCP port %d: got %q, want %q", port, string(buf), want)
+		}
+	}
+
+	assertUDP := func(port int, msg, want string) {
+		t.Helper()
+		c, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+		if err != nil {
+			t.Fatalf("UDP dial port %d failed: %v", port, err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write([]byte(msg)); err != nil {
+			t.Fatalf("UDP write port %d failed: %v", port, err)
+		}
+		buf := make([]byte, len(want))
+		if _, err := io.ReadFull(c, buf); err != nil {
+			t.Fatalf("UDP read port %d failed: %v", port, err)
+		}
+		if string(buf) != want {
+			t.Fatalf("UDP port %d: got %q, want %q", port, string(buf), want)
+		}
+	}
+
+	// 1. Verify TCP & UDP isolation across tailnet-alpha and tailnet-beta despite identical Destination strings
+	assertTCP(alphaTCPPort, "ping", "ALPHA-TCP:ping")
+	assertUDP(alphaUDPPort, "ping", "ALPHA-UDP:ping")
+	assertTCP(betaTCPPort, "ping", "BETA-V1-TCP:ping")
+	assertUDP(betaUDPPort, "ping", "BETA-V1-UDP:ping")
+	assertTCP(reassignTCPPort, "check", "ALPHA-TCP:check")
+
+	// Open a persistent TCP connection on alphaTCPPort to verify it survives multi-tailnet reloads and restarts
+	persistentAlphaConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", alphaTCPPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to open persistent connection on alphaTCPPort: %v", err)
+	}
+	defer persistentAlphaConn.Close()
+
+	// 2. Replace tailnet-beta's dialer (v1 -> v2) and restart ONLY tailnet-beta's ports
+	p.UpdateTailnetDialers(map[string]Dialer{
+		"tailnet-alpha": alphaDialer,
+		"tailnet-beta":  betaDialerV2,
+	})
+	if err := p.RestartTailnetPorts(map[string]bool{"tailnet-beta": true}); err != nil {
+		t.Fatalf("RestartTailnetPorts for tailnet-beta failed: %v", err)
+	}
+
+	assertTCP(betaTCPPort, "ping", "BETA-V2-TCP:ping")
+	assertUDP(betaUDPPort, "ping", "BETA-V2-UDP:ping")
+
+	// Verify persistentAlphaConn on tailnet-alpha was completely unaffected by tailnet-beta restart
+	if _, err := persistentAlphaConn.Write([]byte("still-up")); err != nil {
+		t.Fatalf("persistentAlphaConn write failed after beta restart: %v", err)
+	}
+	alphaBuf := make([]byte, len("ALPHA-TCP:still-up"))
+	if _, err := io.ReadFull(persistentAlphaConn, alphaBuf); err != nil || string(alphaBuf) != "ALPHA-TCP:still-up" {
+		t.Fatalf("persistentAlphaConn read mismatch after beta restart: got %q, err=%v", string(alphaBuf), err)
+	}
+
+	// 3. Hot reload:
+	//    - Add a 3rd tailnet ("tailnet-gamma") with TCP and UDP ports
+	//    - Reassign reassignTCPPort from "tailnet-alpha" to "tailnet-beta" (same destination "100.64.0.10:8080")
+	p.UpdateTailnetDialers(map[string]Dialer{
+		"tailnet-alpha": alphaDialer,
+		"tailnet-beta":  betaDialerV2,
+		"tailnet-gamma": gammaDialer,
+	})
+	reloadedPorts := []PortMapping{
+		{Source: alphaTCPPort, Destination: sharedTCPDest, Protocol: "tcp", Tailnet: "tailnet-alpha", ConnectionTimeout: 5},
+		{Source: alphaUDPPort, Destination: sharedUDPDest, Protocol: "udp", Tailnet: "tailnet-alpha", ConnectionTimeout: 5},
+		{Source: betaTCPPort, Destination: sharedTCPDest, Protocol: "tcp", Tailnet: "tailnet-beta", ConnectionTimeout: 5},
+		{Source: betaUDPPort, Destination: sharedUDPDest, Protocol: "udp", Tailnet: "tailnet-beta", ConnectionTimeout: 5},
+		{Source: reassignTCPPort, Destination: sharedTCPDest, Protocol: "tcp", Tailnet: "tailnet-beta", ConnectionTimeout: 5},
+		{Source: gammaTCPPort, Destination: sharedTCPDest, Protocol: "tcp", Tailnet: "tailnet-gamma", ConnectionTimeout: 5},
+		{Source: gammaUDPPort, Destination: sharedUDPDest, Protocol: "udp", Tailnet: "tailnet-gamma", ConnectionTimeout: 5},
+	}
+	if err := p.ReloadConfig(reloadedPorts); err != nil {
+		t.Fatalf("ReloadConfig for 3 tailnets failed: %v", err)
+	}
+
+	// Verify reassigned port now routes to tailnet-beta (BETA-V2-TCP) and new tailnet-gamma ports work
+	assertTCP(reassignTCPPort, "switched", "BETA-V2-TCP:switched")
+	assertTCP(gammaTCPPort, "hello", "GAMMA-TCP:hello")
+	assertUDP(gammaUDPPort, "hello", "GAMMA-UDP:hello")
+
+	// Verify persistentAlphaConn is STILL alive after adding tailnet-gamma and reassigning reassignTCPPort
+	if _, err := persistentAlphaConn.Write([]byte("alive-2")); err != nil {
+		t.Fatalf("persistentAlphaConn write failed after 3-tailnet reload: %v", err)
+	}
+	alphaBuf2 := make([]byte, len("ALPHA-TCP:alive-2"))
+	if _, err := io.ReadFull(persistentAlphaConn, alphaBuf2); err != nil || string(alphaBuf2) != "ALPHA-TCP:alive-2" {
+		t.Fatalf("persistentAlphaConn read mismatch after 3-tailnet reload: got %q, err=%v", string(alphaBuf2), err)
+	}
+}
+
 func BenchmarkTCPThroughput(b *testing.B) {
 	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
