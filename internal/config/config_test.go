@@ -408,5 +408,3 @@ tailnets:
 		t.Errorf("expected Parse to fail on invalid PROXTAIL_HEALTH_PORT")
 	}
 }
-
-

@@ -584,16 +584,27 @@ func resolveConfigPath(flagConfig string) string {
 	return "/etc/proxtail/config.yaml"
 }
 
+// version is populated at build time via -ldflags="-X main.version=..."
+var version = "dev"
+
 func main() {
 	var flagConfig string
 	var flagValidate bool
 	var flagHealthCheck bool
+	var flagVersion bool
 	flag.StringVar(&flagConfig, "config", "", "Path to configuration file")
 	flag.StringVar(&flagConfig, "c", "", "Path to configuration file (shorthand)")
 	flag.BoolVar(&flagValidate, "validate", false, "Validate configuration file and exit")
 	flag.BoolVar(&flagValidate, "check", false, "Validate configuration file and exit (shorthand)")
 	flag.BoolVar(&flagHealthCheck, "healthcheck", false, "Probe running proxtail instance health and exit")
+	flag.BoolVar(&flagVersion, "version", false, "Print version and exit")
+	flag.BoolVar(&flagVersion, "v", false, "Print version and exit (shorthand)")
 	flag.Parse()
+
+	if flagVersion {
+		fmt.Printf("proxtail %s\n", version)
+		return
+	}
 
 	configFile := resolveConfigPath(flagConfig)
 

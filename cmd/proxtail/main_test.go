@@ -442,5 +442,3 @@ func TestResolveTailnetDirReadOnlyFallback(t *testing.T) {
 		t.Errorf("expected non-ephemeral resolveTailnetDir to fail when TS_STATE_DIR is unwritable")
 	}
 }
-
-

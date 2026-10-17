@@ -1,0 +1,57 @@
+name: Bug Report
+description: Report a bug, unexpected behavior, or regression in proxtail
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please redact any real Tailscale auth keys (`tskey-...`) before submitting.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or Container Image Digest
+      description: Output of `proxtail -version` or the Docker image tag/digest used.
+      placeholder: "e.g., ghcr.io/fadlytabrani/proxtail:latest or v1.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Deployment Environment
+      options:
+        - Docker / Docker Compose
+        - Kubernetes
+        - Standalone Binary (Linux)
+        - Standalone Binary (macOS)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (`config.yaml`)
+      description: Minimal `config.yaml` that reproduces the issue (redact any secrets).
+      render: yaml
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Paste any relevant log output from `proxtail`.
+      render: text
+    validations:
+      required: false

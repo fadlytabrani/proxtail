@@ -1199,4 +1199,3 @@ func BenchmarkMultiTailnetParallelTCPThroughput(b *testing.B) {
 		}
 	})
 }
-

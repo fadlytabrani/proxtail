@@ -1,0 +1,29 @@
+name: Feature Request
+description: Suggest an enhancement, new configuration option, or operational improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use Case / Problem Statement
+      description: What problem or operational scenario are you trying to solve?
+      placeholder: "I want to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How would you like `proxtail` to work or be configured?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any workarounds or alternative approaches you have considered.
+    validations:
+      required: false

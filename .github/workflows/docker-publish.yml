@@ -36,6 +36,9 @@ jobs:
       - name: Run test suite with race detector
         run: go test -v -race ./...
 
+      - name: Validate example configuration
+        run: go run ./cmd/proxtail -validate -c examples/config.yaml
+
   build-and-push:
     name: Build & Publish Multi-Arch Image
     needs: test
@@ -91,6 +94,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false

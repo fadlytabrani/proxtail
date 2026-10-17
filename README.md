@@ -192,6 +192,7 @@ tailnets:
 | `-c`, `-config <path>` | Path to the YAML configuration file. |
 | `-validate`, `-check` | Validate configuration syntax and port rules, then exit (`0` if valid, `1` on error). |
 | `-healthcheck` | Probe the running `proxtail` instance (`/readyz` or TCP listener) and exit (`0` if healthy, `1` on error). |
+| `-v`, `-version` | Print the `proxtail` build version and exit. |
 | `TS_AUTHKEY` / `TS_CLIENT_SECRET` | Default Tailscale auth key or OAuth client secret used in single-tailnet mode. |
 | `TS_AUTHKEY_<NAME>` | Per-tailnet auth key (`<NAME>` is uppercase with hyphens/dots replaced by `_`). |
 | `TS_CLIENT_SECRET_<NAME>` | Per-tailnet OAuth client secret (`tskey-client-...`) for non-expiring node registration. |
@@ -278,15 +279,24 @@ METRICS: TCP_Connections=4, UDP_Packets=1280, Bytes_Transferred=10485760, Errors
 ## Building & Testing from Source
 
 ```bash
-# Build binary
-go build -o proxtail ./cmd/proxtail
+# Build binary with embedded version metadata
+make build
 
-# Run unit, race, and multi-tailnet integration tests
-go test -v -race ./...
+# Run formatting, go vet, and race-enabled test suite
+make check
 
 # Run throughput benchmarks
-go test -bench=. -benchmem ./internal/proxy
+make bench
+
+# Validate example configuration
+make validate
 ```
+
+## Contributing & Security
+
+- **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture details, development setup, and pull request guidelines.
+- **Security Policy**: See [SECURITY.md](SECURITY.md) for supported versions and how to report vulnerabilities privately.
+- **Changelog**: See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 

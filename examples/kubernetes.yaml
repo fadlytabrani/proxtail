@@ -71,7 +71,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: proxtail
-          image: ghcr.io/italoag/proxtail:latest
+          image: ghcr.io/fadlytabrani/proxtail:latest
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef:

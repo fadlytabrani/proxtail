@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security Vulnerability Report
+    url: https://github.com/fadlytabrani/proxtail/security/advisories/new
+    about: Please report security vulnerabilities privately rather than in public issues.
+  - name: Documentation & Configuration Guide
+    url: https://github.com/fadlytabrani/proxtail#readme
+    about: Check the README for quick-start guides, Kubernetes manifests, and configuration reference.
