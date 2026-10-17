@@ -44,14 +44,14 @@ tailnets:
 
 ### 3. Run `proxtail`
 
-**Option A: Docker Compose (Recommended)**
+**Option A: Prebuilt Docker Image (`amd64` / `arm64`)**
 ```bash
 export TS_AUTHKEY="tskey-auth-xxxxx"
 docker run -d --name proxtail \
   -e TS_AUTHKEY="$TS_AUTHKEY" \
   -v "$(pwd)/config.yaml:/etc/proxtail/config.yaml:ro" \
   -p 8080:8080 \
-  proxtail
+  ghcr.io/fadlytabrani/proxtail:latest
 ```
 
 **Option B: Standalone Binary**

@@ -2,7 +2,7 @@
 # Multi-tailnet Tailscale Layer 4 reverse proxy service
 services:
   proxtail:
-    image: proxtail
+    image: ghcr.io/fadlytabrani/proxtail:latest
     build: ..
     container_name: proxtail
     restart: unless-stopped

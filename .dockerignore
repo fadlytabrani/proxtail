@@ -1,0 +1,7 @@
+.git
+.gitignore
+.github
+README.md
+LICENSE
+examples/docker-compose.yaml
+**/*_test.go
