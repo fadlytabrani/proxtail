@@ -7,11 +7,12 @@ services:
     container_name: proxtail
     restart: unless-stopped
 
-    # Tailscale auth keys (PROXTAIL_CONFIG and TS_STATE_DIR are preconfigured in the image)
+    # Tailscale auth keys (set in your shell or a .env file; PROXTAIL_CONFIG and TS_STATE_DIR are preconfigured)
     environment:
-      - TS_AUTHKEY_PRODUCTION=tskey-auth-xxxxx
-      - TS_AUTHKEY_STAGING=tskey-auth-yyyyy
-      - TS_AUTHKEY_DEVELOPMENT=tskey-auth-zzzzz
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_AUTHKEY_PRODUCTION=${TS_AUTHKEY_PRODUCTION:-}
+      - TS_AUTHKEY_STAGING=${TS_AUTHKEY_STAGING:-}
+      - TS_AUTHKEY_DEVELOPMENT=${TS_AUTHKEY_DEVELOPMENT:-}
 
     # Port mappings - adjust these to match your config.yaml
     ports:

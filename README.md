@@ -1,103 +1,246 @@
 # proxtail
 
-A high-performance Layer 4 (TCP/UDP) reverse proxy for Tailscale networks, written in Go. `proxtail` forwards local TCP and UDP traffic to services across one or more Tailscale networks (`tailnets`) using userspace networking (`tsnet`) without requiring root privileges or a host Tailscale daemon.
+**Expose services from one or more Tailscale networks on local TCP and UDP ports—without root privileges, `/dev/net/tun`, or a host Tailscale daemon.**
 
-## Features
+`proxtail` is a lightweight, high-performance Layer 4 (TCP/UDP) reverse proxy built on Tailscale's userspace networking library (`tsnet`). Drop it into Docker, Kubernetes, or a Linux/macOS host to bridge local applications, ingress controllers (NGINX, Traefik, Caddy, HAProxy), or LAN clients directly to backends across one or more Tailscale tailnets (or self-hosted Headscale networks).
 
-- **Multi-Tailnet Support**: Connect to multiple Tailscale networks simultaneously, each with its own `tsnet.Server` instance, hostname, auth key, and ephemeral/persistent state configuration.
-- **High Performance**: Pooled `OptimizedBuffer` memory management, bounded worker pools, TCP socket tuning (`TCP_NODELAY`, 30s keepalive), and per-client-address UDP session NAT forwarding.
-- **Hot Reload**: Zero-downtime configuration reloads via file system watching (`fsnotify`) and `SIGHUP` signals, supporting live port and tailnet additions, removals, and updates without dropping unaffected active connections.
-- **TCP & UDP Support**: Unified Layer 4 forwarding for both TCP streams and UDP datagrams (including unidirectional, request-response, and streaming/gaming UDP traffic).
-- **Performance Metrics**: Built-in atomic metrics tracking (`TCP_Connections`, `UDP_Packets`, `Bytes_Transferred`, `Errors`).
-- **Docker Ready**: Multi-stage Alpine container image running as a non-root user with graceful shutdown and health checks.
+---
 
-## Configuration Path
+## Why `proxtail`?
 
-`proxtail` resolves its configuration file in the following order:
-1. `-config` / `-c` command-line flag (`proxtail -c /path/to/config.yaml`)
-2. `PROXTAIL_CONFIG` (or `TSNET_PROXY_CONFIG`) environment variable
-3. `./config.yaml` in the current working directory (if present)
-4. `/etc/proxtail/config.yaml` (default in Docker)
+- **Zero Host Privileges Required**: Runs entirely in userspace as an unprivileged user. No `CAP_NET_ADMIN`, no `/dev/net/tun` device, and no host `tailscaled` installation needed.
+- **Multi-Tailnet Gateway**: Connect to multiple independent tailnets (`production`, `staging`, partner networks) from a single container—even when backends across tailnets have overlapping `100.64.x.x` Tailscale IPs or identical hostnames.
+- **Convention Over Configuration**: Forward a port in 4 lines of YAML. Protocol defaults to TCP, target ports default to the local port, and auth keys are discovered automatically from environment variables.
+- **Zero-Downtime Hot Reload**: Add, modify, or remove ports and tailnets on the fly via file watching or `SIGHUP` without dropping existing connections on unaffected ports.
+- **Full TCP & UDP Support**: High-throughput TCP streaming (`TCP_NODELAY`, pooled buffers) and zero-allocation per-client UDP NAT session forwarding (DNS, gaming, telemetry, VoIP).
 
-## Hot Reload
+```
+Local Clients / Ingress                 proxtail (unprivileged)                 Tailscale / Headscale
+───────────────────────            ─────────────────────────────────           ───────────────────────
+localhost:8080 (TCP)  ──────────►  :8080 ──► tsnet [production]   ──────────►  web-server:8080
+localhost:5353 (UDP)  ──────────►  :5353 ──► tsnet [production]   ──────────►  internal-dns:5353
+localhost:9080 (TCP)  ──────────►  :9080 ──► tsnet [staging]      ──────────►  staging-web:8080
+```
 
-`proxtail` supports live reloading of configuration changes via:
-1. **Automatic File Watching (`fsnotify`)**: Watches the configuration directory for modifications, creations, or atomic renames of `config.yaml` (with automatic event debouncing).
-2. **Manual Signal (`SIGHUP`)**: Send `kill -HUP <pid>` or `docker kill --signal=HUP proxtail` to trigger an immediate reload.
+---
 
-During a reload:
-- The new configuration is parsed and validated before applying any changes.
-- Newly added tailnets are initialized, modified tailnets (`hostname`, `auth_key`, `control_url`, `ephemeral`) are reinitialized, and removed tailnets are gracefully closed.
-- Added, removed, and modified port listeners are updated incrementally while unaffected active connections continue uninterrupted.
-- Process-level `proxy` tuning parameters (`buffer_size`, `worker_pool_size`, `metrics_interval`) are initialized at startup and require a process restart to change.
+## 60-Second Quick Start
 
-## Configuration
+### 1. Generate a Tailscale Auth Key
+1. Open the [Tailscale Admin Console → Settings → Keys](https://login.tailscale.com/admin/settings/keys).
+2. Click **Generate auth key**.
+3. *(Recommended for containers)* Enable **Reusable** and **Ephemeral**, then copy your `tskey-auth-...` key.
 
-`proxtail` uses convention over configuration so most fields can be omitted:
-
-### Minimal Single-Tailnet Example
+### 2. Create `config.yaml`
+Create a minimal `config.yaml` in your current directory:
 
 ```yaml
 tailnets:
   - ports:
       - port: 8080
-        destination: 'web-server' # Automatically forwards TCP :8080 -> web-server:8080
+        destination: 'web-server' # Forwards local TCP :8080 -> web-server:8080 in your tailnet
 ```
-With a single tailnet, set `export TS_AUTHKEY="tskey-auth-xxxxx"` and run `proxtail`.
+*(You can use a Tailscale MagicDNS hostname like `web-server`, a full FQDN, or a Tailscale IP like `100.64.0.10`.)*
 
-### Multi-Tailnet & Full Options Example
+### 3. Run `proxtail`
+
+**Option A: Docker Compose (Recommended)**
+```bash
+export TS_AUTHKEY="tskey-auth-xxxxx"
+docker run -d --name proxtail \
+  -e TS_AUTHKEY="$TS_AUTHKEY" \
+  -v "$(pwd)/config.yaml:/etc/proxtail/config.yaml:ro" \
+  -p 8080:8080 \
+  proxtail
+```
+
+**Option B: Standalone Binary**
+```bash
+go build -o proxtail ./cmd/proxtail
+export TS_AUTHKEY="tskey-auth-xxxxx"
+./proxtail
+```
+*(When run locally, `proxtail` automatically loads `./config.yaml` from the current directory.)*
+
+### 4. Test Your Connection
+```bash
+curl http://localhost:8080
+```
+
+---
+
+## Common Configuration Recipes
+
+### Recipe 1: Single Tailnet with Multiple TCP & UDP Ports
+When only one tailnet is configured, you don't need to specify `name` or `auth_key`—just set `TS_AUTHKEY` in your environment:
+
+```yaml
+tailnets:
+  - ports:
+      # Same local and remote port (TCP :8080 -> web-server:8080)
+      - port: 8080
+        destination: 'web-server'
+
+      # Different local and remote port (TCP :8443 -> api-server:443)
+      - port: 8443
+        destination: 'api-server:443'
+
+      # UDP port forwarding (UDP :5353 -> dns-server:53)
+      - port: 5353
+        destination: 'dns-server:53'
+        protocol: 'udp'
+```
+
+### Recipe 2: Multi-Tailnet Gateway (Production + Staging)
+Connect to multiple tailnets simultaneously. By convention, each tailnet reads its auth key from `TS_AUTHKEY_<NAME>` (uppercase, with hyphens converted to underscores):
+
+```yaml
+tailnets:
+  - name: 'production' # Reads TS_AUTHKEY_PRODUCTION
+    ports:
+      - port: 8080
+        destination: '100.64.0.10:8080'
+
+  - name: 'staging'    # Reads TS_AUTHKEY_STAGING
+    ports:
+      - port: 9080
+        destination: '100.64.0.10:8080' # Overlapping Tailscale IPs are completely isolated!
+```
+
+Run with environment variables for each tailnet:
+```bash
+export TS_AUTHKEY_PRODUCTION="tskey-auth-prod-xxxx"
+export TS_AUTHKEY_STAGING="tskey-auth-staging-yyyy"
+./proxtail -c config.yaml
+```
+
+### Recipe 3: Persistent Node Identity (`ephemeral: false`)
+By default, `proxtail` creates ephemeral nodes (`ephemeral: true`) stored in memory so containers leave no stale devices behind on exit. If you want `proxtail` to keep a permanent Tailscale IP and node identity across restarts:
 
 ```yaml
 tailnets:
   - name: 'production'
-    hostname: 'proxy-prod'             # Optional, defaults to <system-hostname>-<name>
-    auth_key: 'TS_AUTHKEY_PRODUCTION'  # Optional, defaults to TS_AUTHKEY_<UPPERCASE_NAME> (or literal tskey-*)
-    control_url: ''                    # Optional, custom coordination server URL (e.g. Headscale)
-    ephemeral: true                    # Optional, defaults to true
+    hostname: 'proxtail-gateway'
+    ephemeral: false # Persist node state in TS_STATE_DIR (/var/lib/tsnet/production)
     ports:
-      - port: 8080                     # Alias for source_port
-        destination: 'web-server'      # Omitting :port reuses source port (web-server:8080)
-      - port: 8443
-        destination: 'api-server:443'  # Explicit destination port
-        timeout: 45                    # Optional, defaults to 30 seconds
-      - port: 12345
-        destination: 'game-server'
-        protocol: 'udp'                # Optional, defaults to 'tcp'
-
-  - name: 'staging'
-    ports:
-      - port: 9080
-        destination: 'staging-web:8080'
-
-proxy:
-  buffer_size: 512      # Optional: Buffer size in KB (default: 512, valid: 1-8192)
-  worker_pool_size: 200 # Optional: Max concurrent workers (default: 200, valid: 1-10000)
-  metrics_interval: 30  # Optional: Log metrics every N seconds (auto-enables metrics; omit to disable)
+      - port: 5432
+        destination: 'postgres-db'
 ```
+
+### Recipe 4: Self-Hosted Headscale (`control_url`)
+Point any tailnet to a self-hosted [Headscale](https://github.com/juanfont/headscale) coordination server:
+
+```yaml
+tailnets:
+  - name: 'selfhosted'
+    control_url: 'https://headscale.example.com'
+    ports:
+      - port: 8080
+        destination: 'internal-app:8080'
+```
+
+---
+
+## Configuration Reference
+
+### Config File Discovery Order
+`proxtail` looks for its configuration file in the following order:
+1. **CLI Flag**: `proxtail -c /path/to/config.yaml` (or `-config`)
+2. **Environment Variable**: `PROXTAIL_CONFIG` (or `TSNET_PROXY_CONFIG`)
+3. **Current Working Directory**: `./config.yaml` (if the file exists)
+4. **Default System Path**: `/etc/proxtail/config.yaml` (default inside the Docker image)
+
+### `tailnets[]` Settings
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `name` | `string` | `"default"` *(if 1 tailnet)* | Unique identifier for the tailnet. Required when configuring multiple tailnets. |
+| `ports` | `list` | *(required)* | List of TCP/UDP port forwarding rules for this tailnet. |
+| `hostname` | `string` | `<system-hostname>-<name>` | Hostname registered in the Tailscale admin console for this node. |
+| `auth_key` | `string` | `TS_AUTHKEY_<NAME>` *(or `TS_AUTHKEY`)* | Name of the environment variable holding the auth key (or a literal `tskey-...` key). |
+| `ephemeral` | `bool` | `true` | If `true`, keeps state in memory and removes the node when disconnected. If `false`, persists state to `TS_STATE_DIR`. |
+| `control_url` | `string` | Tailscale Control Plane | Custom coordination server URL (e.g., for Headscale). |
+
+### `tailnets[].ports[]` Settings
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `port` *(or `source_port`)* | `int` | *(required)* | Local port for `proxtail` to listen on (`1`–`65535`). |
+| `destination` | `string` | *(required)* | Target `host:port` or `host` inside the tailnet. If `:port` is omitted, reuses `port`. |
+| `protocol` | `string` | `"tcp"` | Layer 4 protocol: `"tcp"` or `"udp"`. |
+| `timeout` | `int` | `30` | Idle connection/session timeout in seconds (`1`–`3600`). |
+
+### `proxy` Settings *(Optional)*
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `metrics_interval` | `int` | Disabled (`60` if enabled) | Log `METRICS:` summary every `N` seconds (`1`–`3600`). Setting this automatically enables metrics. |
+| `enable_metrics` | `bool` | `false` | Explicitly enable/disable periodic metrics logging. |
+| `buffer_size` | `int` | `512` | Per-connection I/O buffer size in KB (`1`–`8192`). |
+| `worker_pool_size` | `int` | `200` | Maximum concurrent forwarding workers (`1`–`10000`). |
 
 ### Environment Variables
 
-```bash
-export TS_AUTHKEY="tskey-auth-xxxxx"            # Used automatically in single-tailnet mode
-export TS_AUTHKEY_PRODUCTION="tskey-auth-xxxxx" # Per-tailnet auth key (hyphens normalized to '_')
-export TS_AUTHKEY_STAGING="tskey-auth-yyyyy"
-export TS_STATE_DIR="/var/lib/tsnet"            # Used when ephemeral: false
-```
+| Variable | Description |
+| :--- | :--- |
+| `TS_AUTHKEY` | Default Tailscale auth key used in single-tailnet mode when `TS_AUTHKEY_<NAME>` is unset. |
+| `TS_AUTHKEY_<NAME>` | Per-tailnet auth key. `<NAME>` is uppercase with hyphens/dots replaced by `_` (e.g., `name: prod-us` → `TS_AUTHKEY_PROD_US`). |
+| `PROXTAIL_CONFIG` | Path to the YAML configuration file. |
+| `TS_STATE_DIR` | Directory used to persist Tailscale state when `ephemeral: false` (default in Docker: `/var/lib/tsnet`). |
 
-## Building & Testing
+---
+
+## Day-2 Operations
+
+### Zero-Downtime Hot Reload
+You can add, remove, or update ports and tailnets without restarting `proxtail`:
+- **Automatic**: `proxtail` watches the configuration directory and automatically reloads within 100ms when `config.yaml` is saved or atomically replaced.
+- **Manual Signal (`SIGHUP`)**:
+  ```bash
+  # Docker
+  docker kill --signal=HUP proxtail
+
+  # Host process
+  kill -HUP $(pgrep proxtail)
+  ```
+- **Safe Rollback**: If a modified `config.yaml` contains a syntax or validation error, `proxtail` logs the error and keeps the existing configuration and active connections running uninterrupted.
+
+### Monitoring & Metrics
+When `metrics_interval` is set (e.g., `metrics_interval: 30`), `proxtail` logs live traffic counters:
+```text
+METRICS: TCP_Connections=4, UDP_Packets=1280, Bytes_Transferred=10485760, Errors=0
+```
+- `TCP_Connections`: Currently active TCP connections.
+- `UDP_Packets`: Cumulative UDP packets forwarded.
+- `Bytes_Transferred`: Cumulative bytes transferred across all TCP and UDP flows.
+- `Errors`: Cumulative dial or forwarding errors.
+
+---
+
+## Troubleshooting
+
+- **`environment variable TS_AUTHKEY_... not set`**
+  Ensure you have exported either `TS_AUTHKEY` (for a single tailnet) or `TS_AUTHKEY_<NAME>` matching your tailnet's `name` in uppercase (with hyphens replaced by underscores, e.g., `name: my-net` requires `TS_AUTHKEY_MY_NET`).
+- **Container restarts fail to authenticate with single-use Auth Key**
+  When `ephemeral: true` (default), `proxtail` registers a fresh ephemeral node on each container start. Either generate a **Reusable** auth key in the Tailscale Admin Console, or set `ephemeral: false` and mount a persistent volume at `/var/lib/tsnet`.
+- **File edits not triggering automatic reload in Docker**
+  Mounting a single file (`-v ./config.yaml:/etc/proxtail/config.yaml`) in Docker binds the file's inode; editors that save via atomic rename (`vim`, `sed -i`) change the host inode. Either mount the parent directory (`-v ./config:/etc/proxtail:ro`) or send `docker kill --signal=HUP proxtail` after editing.
+- **`listen tcp :8080: bind: address already in use`**
+  Another process on the host or another tailnet entry in `config.yaml` is already using port `8080`. If startup fails to bind any port, `proxtail` cleanly rolls back all listeners and exits.
+
+---
+
+## Building & Testing from Source
 
 ```bash
 # Build binary
 go build -o proxtail ./cmd/proxtail
 
-# Run test suite
-go test -v ./...
-```
+# Run unit, race, and multi-tailnet integration tests
+go test -v -race ./...
 
-## Docker Deployment
-
-```bash
-docker compose -f examples/docker-compose.yaml up -d
+# Run throughput benchmarks
+go test -bench=. -benchmem ./internal/proxy
 ```
 
 ## License
