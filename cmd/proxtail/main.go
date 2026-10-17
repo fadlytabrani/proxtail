@@ -22,15 +22,20 @@ import (
 
 // tailnetManager manages the lifecycle of multiple tsnet.Server instances.
 type tailnetManager struct {
-	mu      sync.Mutex
-	servers map[string]*tsnet.Server
-	configs map[string]config.TailnetConfig
+	mu          sync.Mutex
+	reloadMu    sync.Mutex
+	servers     map[string]*tsnet.Server
+	configs     map[string]config.TailnetConfig
+	initFunc    func(config.TailnetConfig) (*tsnet.Server, error)
+	cleanupFunc func(*tsnet.Server, string)
 }
 
 func newTailnetManager() *tailnetManager {
 	return &tailnetManager{
-		servers: make(map[string]*tsnet.Server),
-		configs: make(map[string]config.TailnetConfig),
+		servers:     make(map[string]*tsnet.Server),
+		configs:     make(map[string]config.TailnetConfig),
+		initFunc:    initializeServer,
+		cleanupFunc: cleanupTailnetServer,
 	}
 }
 
@@ -48,9 +53,10 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 
 	ephemeral := tailnetCfg.IsEphemeral()
 	server := &tsnet.Server{
-		Hostname:  tailnetCfg.Hostname,
-		AuthKey:   authKey,
-		Ephemeral: ephemeral,
+		Hostname:   tailnetCfg.Hostname,
+		AuthKey:    authKey,
+		ControlURL: tailnetCfg.ControlURL,
+		Ephemeral:  ephemeral,
 	}
 
 	// Use in-memory store for ephemeral nodes, or persistent state directory for non-ephemeral nodes.
@@ -77,15 +83,17 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 // cleanupTailnetServer performs thorough cleanup of a Tailscale server.
 func cleanupTailnetServer(server *tsnet.Server, tailnetName string) {
 	log.Printf("Cleaning up tailnet connection: %s", tailnetName)
-	if err := server.Close(); err != nil {
-		log.Printf("Warning: error closing tailnet server %s: %v", tailnetName, err)
+	if server != nil {
+		if err := server.Close(); err != nil {
+			log.Printf("Warning: error closing tailnet server %s: %v", tailnetName, err)
+		}
 	}
-	time.Sleep(100 * time.Millisecond)
 	log.Printf("Tailnet connection %s cleaned up", tailnetName)
 }
 
-// syncTailnets reconciles running tsnet.Server instances with the provided configuration.
-func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[string]*tsnet.Server, func(), error) {
+// syncTailnets reconciles running tsnet.Server instances with the provided configuration,
+// starting added tailnets, restarting modified tailnets, and returning a cleanup callback for removed ones.
+func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[string]*tsnet.Server, map[string]bool, func(), error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -94,18 +102,45 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 		newConfigs[t.Name] = t
 	}
 
-	// Start any newly added tailnets first before tearing down removed ones.
 	addedServers := make(map[string]*tsnet.Server)
+	restartedTailnets := make(map[string]bool)
+	removedServers := make(map[string]*tsnet.Server)
+
 	for _, t := range tailnets {
-		if _, exists := tm.servers[t.Name]; !exists {
-			srv, err := initializeServer(t)
+		existingSrv, exists := tm.servers[t.Name]
+		if !exists {
+			srv, err := tm.initFunc(t)
 			if err != nil {
 				for name, started := range addedServers {
-					cleanupTailnetServer(started, name)
+					tm.cleanupFunc(started, name)
 				}
-				return nil, nil, fmt.Errorf("failed to initialize tailnet '%s': %w", t.Name, err)
+				return nil, nil, nil, fmt.Errorf("failed to initialize tailnet '%s': %w", t.Name, err)
 			}
 			addedServers[t.Name] = srv
+			continue
+		}
+
+		oldCfg := tm.configs[t.Name]
+		if !oldCfg.ConnectionSettingsEqual(t) {
+			log.Printf("Tailnet '%s' connection settings changed, reinitializing...", t.Name)
+			// If non-ephemeral, close the existing server first to release any state dir lock.
+			if !oldCfg.IsEphemeral() || !t.IsEphemeral() {
+				tm.cleanupFunc(existingSrv, t.Name)
+				delete(tm.servers, t.Name)
+				delete(tm.configs, t.Name)
+			} else {
+				removedServers[t.Name] = existingSrv
+			}
+
+			srv, err := tm.initFunc(t)
+			if err != nil {
+				for name, started := range addedServers {
+					tm.cleanupFunc(started, name)
+				}
+				return nil, nil, nil, fmt.Errorf("failed to reinitialize tailnet '%s': %w", t.Name, err)
+			}
+			addedServers[t.Name] = srv
+			restartedTailnets[t.Name] = true
 		}
 	}
 
@@ -115,7 +150,6 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 	}
 
 	// Identify removed tailnets so they can be closed after listeners stop using them.
-	removedServers := make(map[string]*tsnet.Server)
 	for name, srv := range tm.servers {
 		if _, exists := newConfigs[name]; !exists {
 			removedServers[name] = srv
@@ -131,11 +165,11 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 
 	cleanupRemoved := func() {
 		for name, srv := range removedServers {
-			cleanupTailnetServer(srv, name)
+			tm.cleanupFunc(srv, name)
 		}
 	}
 
-	return snapshot, cleanupRemoved, nil
+	return snapshot, restartedTailnets, cleanupRemoved, nil
 }
 
 // closeAll shuts down all managed tsnet.Server instances.
@@ -145,7 +179,7 @@ func (tm *tailnetManager) closeAll() {
 
 	log.Println("Starting cleanup of tailnet servers...")
 	for name, srv := range tm.servers {
-		cleanupTailnetServer(srv, name)
+		tm.cleanupFunc(srv, name)
 		delete(tm.servers, name)
 		delete(tm.configs, name)
 	}
@@ -154,6 +188,9 @@ func (tm *tailnetManager) closeAll() {
 
 // reloadConfig loads and validates the updated configuration and applies it to the running proxy.
 func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManager) error {
+	tm.reloadMu.Lock()
+	defer tm.reloadMu.Unlock()
+
 	newCfg, err := config.Load(configFile)
 	if err != nil {
 		return fmt.Errorf("failed to load new config: %w", err)
@@ -161,7 +198,7 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 
 	newPortMappings := newCfg.ToProxyPortMappings()
 
-	servers, cleanupRemoved, err := tm.syncTailnets(newCfg.Tailnets)
+	servers, restartedTailnets, cleanupRemoved, err := tm.syncTailnets(newCfg.Tailnets)
 	if err != nil {
 		return err
 	}
@@ -179,11 +216,17 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 		return fmt.Errorf("failed to apply new config: %w", err)
 	}
 
+	if len(restartedTailnets) > 0 {
+		if err := proxyServer.RestartTailnetPorts(restartedTailnets); err != nil {
+			return fmt.Errorf("failed to restart ports for updated tailnets: %w", err)
+		}
+	}
+
 	return nil
 }
 
-// startConfigWatcher watches the configuration file's directory for updates and triggers reloads.
-func startConfigWatcher(ctx context.Context, configFile string, proxyServer *proxy.Proxy, tm *tailnetManager) {
+// startConfigWatcher watches the configuration file's directory for updates and signals reloadChan.
+func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<- struct{}) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Printf("Warning: Failed to create config watcher: %v", err)
@@ -202,9 +245,15 @@ func startConfigWatcher(ctx context.Context, configFile string, proxyServer *pro
 
 	log.Printf("Watching for config changes in: %s", configDir)
 
+	var debounceTimer *time.Timer
+	var debounceC <-chan time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
 			return
 		case event, ok := <-watcher.Events:
 			if !ok {
@@ -212,14 +261,25 @@ func startConfigWatcher(ctx context.Context, configFile string, proxyServer *pro
 			}
 			if filepath.Base(event.Name) == configBase &&
 				(event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0) {
-				log.Printf("Config file changed (%s), reloading configuration...", event.Op)
-				time.Sleep(100 * time.Millisecond)
-
-				if err := reloadConfig(cleanConfigFile, proxyServer, tm); err != nil {
-					log.Printf("Failed to reload config: %v", err)
+				log.Printf("Config file change detected (%s), scheduling reload...", event.Op)
+				if debounceTimer == nil {
+					debounceTimer = time.NewTimer(100 * time.Millisecond)
+					debounceC = debounceTimer.C
 				} else {
-					log.Printf("Configuration reloaded successfully")
+					if !debounceTimer.Stop() {
+						select {
+						case <-debounceTimer.C:
+						default:
+						}
+					}
+					debounceTimer.Reset(100 * time.Millisecond)
 				}
+			}
+		case <-debounceC:
+			debounceC = nil
+			select {
+			case reloadChan <- struct{}{}:
+			default:
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -268,9 +328,9 @@ func main() {
 				log.Printf("Received SIGHUP signal, triggering config reload...")
 				select {
 				case reloadChan <- struct{}{}:
-					log.Printf("Config reload signal sent")
+					log.Printf("Config reload signal queued")
 				default:
-					log.Printf("Config reload already in progress, skipping")
+					log.Printf("Config reload already queued, skipping duplicate signal")
 				}
 			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT:
 				log.Printf("Received %s signal, initiating graceful shutdown...", sig)
@@ -284,7 +344,7 @@ func main() {
 	tm := newTailnetManager()
 	defer tm.closeAll()
 
-	tailnetServers, _, err := tm.syncTailnets(cfg.Tailnets)
+	tailnetServers, _, _, err := tm.syncTailnets(cfg.Tailnets)
 	if err != nil {
 		log.Fatalf("Failed to initialize tailnets: %v", err)
 	}
@@ -303,7 +363,7 @@ func main() {
 		cfg.Proxy.WorkerPoolSize,
 	)
 
-	go startConfigWatcher(ctx, configFile, proxyServer, tm)
+	go startConfigWatcher(ctx, configFile, reloadChan)
 
 	go func() {
 		for {
@@ -311,11 +371,11 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-reloadChan:
-				log.Printf("Processing SIGHUP-triggered config reload...")
+				log.Printf("Processing configuration reload...")
 				if err := reloadConfig(configFile, proxyServer, tm); err != nil {
-					log.Printf("Failed to reload config via SIGHUP: %v", err)
+					log.Printf("Failed to reload config: %v", err)
 				} else {
-					log.Printf("Configuration reloaded successfully via SIGHUP")
+					log.Printf("Configuration reloaded successfully")
 				}
 			}
 		}
@@ -344,27 +404,37 @@ func main() {
 	fmt.Printf("Hot reload enabled - watching for config changes in: %s\n", configFile)
 	fmt.Printf("Manual reload available - send SIGHUP signal to trigger config reload\n")
 
+	proxyErrChan := make(chan error, 1)
 	go func() {
-		if err := proxyServer.Start(ctx); err != nil {
-			log.Printf("Error starting proxy: %v", err)
-		}
+		proxyErrChan <- proxyServer.Start(ctx)
 	}()
 
+	var startupErr error
 	select {
+	case startupErr = <-proxyErrChan:
+		if startupErr != nil {
+			log.Printf("Proxy server exited with error: %v", startupErr)
+			cancel()
+		}
 	case <-shutdown:
-		log.Println("Shutdown signal received, waiting for proxy to stop...")
+		log.Println("Shutdown signal received, stopping proxy...")
 	case <-ctx.Done():
-		log.Println("Context cancelled, waiting for proxy to stop...")
+		log.Println("Context cancelled, stopping proxy...")
 	}
-
-	log.Println("Waiting for proxy to shut down gracefully...")
-	time.Sleep(3 * time.Second)
 
 	log.Println("Stopping proxy server...")
 	proxyServer.Stop()
 
-	log.Println("Waiting for Tailscale cleanup...")
-	time.Sleep(2 * time.Second)
+	if startupErr == nil {
+		if err := <-proxyErrChan; err != nil {
+			startupErr = err
+		}
+	}
+
+	if startupErr != nil {
+		tm.closeAll()
+		os.Exit(1)
+	}
 
 	log.Println("Proxy shutdown complete")
 }

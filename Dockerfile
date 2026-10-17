@@ -17,14 +17,16 @@ RUN go mod tidy
 RUN go build -o proxtail ./cmd/proxtail
 
 # Runtime stage: Create a lightweight Alpine-based image for running the application
-FROM alpine:3.21
+FROM alpine:3.22
 
 # Install runtime dependencies: ca-certificates for secure Tailscale connections
 RUN apk add --no-cache ca-certificates
 
-# Create directories for the configuration file and Tailscale state
+# Create non-root user and directories for configuration and Tailscale state
 # /etc/proxtail holds config.yaml, /var/lib/tsnet stores Tailscale state
-RUN mkdir -p /etc/proxtail /var/lib/tsnet
+RUN addgroup -S proxtail && adduser -S -G proxtail proxtail && \
+    mkdir -p /etc/proxtail /var/lib/tsnet && \
+    chown -R proxtail:proxtail /etc/proxtail /var/lib/tsnet
 
 # Set the TS_STATE_DIR environment variable to specify where Tailscale stores its state
 ENV TS_STATE_DIR=/var/lib/tsnet
@@ -35,7 +37,9 @@ COPY --from=builder /app/proxtail /usr/local/bin/proxtail
 
 # Copy the sample configuration file to the default location
 # This can be overridden by mounting a custom config at runtime
-COPY --from=builder /app/examples/config.yaml /etc/proxtail/config.yaml
+COPY --from=builder --chown=proxtail:proxtail /app/examples/config.yaml /etc/proxtail/config.yaml
+
+USER proxtail
 
 # Run the proxtail binary using the exec form to ensure signals (e.g., SIGTERM, SIGHUP)
 # are properly passed to the process for graceful shutdown and hot reload

@@ -5,11 +5,11 @@ A high-performance Layer 4 (TCP/UDP) reverse proxy for Tailscale networks, writt
 ## Features
 
 - **Multi-Tailnet Support**: Connect to multiple Tailscale networks simultaneously, each with its own `tsnet.Server` instance, hostname, auth key, and ephemeral/persistent state configuration.
-- **High Performance**: Pooled `OptimizedBuffer` memory management, bounded worker pools, TCP socket tuning (`TCP_NODELAY`, 30s keepalive), zero-copy `io.Copy` transfers, and per-tailnet/destination UDP connection pooling.
-- **Hot Reload**: Zero-downtime configuration reloads via file system watching (`fsnotify`) and `SIGHUP` signals, supporting live port and tailnet additions, removals, and updates without dropping active connections.
-- **TCP & UDP Support**: Unified Layer 4 forwarding for both TCP streams and UDP datagrams.
+- **High Performance**: Pooled `OptimizedBuffer` memory management, bounded worker pools, TCP socket tuning (`TCP_NODELAY`, 30s keepalive), and per-client-address UDP session NAT forwarding.
+- **Hot Reload**: Zero-downtime configuration reloads via file system watching (`fsnotify`) and `SIGHUP` signals, supporting live port and tailnet additions, removals, and updates without dropping unaffected active connections.
+- **TCP & UDP Support**: Unified Layer 4 forwarding for both TCP streams and UDP datagrams (including unidirectional, request-response, and streaming/gaming UDP traffic).
 - **Performance Metrics**: Built-in atomic metrics tracking (`TCP_Connections`, `UDP_Packets`, `Bytes_Transferred`, `Errors`).
-- **Docker Ready**: Multi-stage Alpine container image with graceful shutdown and health checks.
+- **Docker Ready**: Multi-stage Alpine container image running as a non-root user with graceful shutdown and health checks.
 
 ## Configuration Path
 
@@ -27,13 +27,14 @@ docker run -d \
 ## Hot Reload
 
 `proxtail` supports live reloading of configuration changes via:
-1. **Automatic File Watching (`fsnotify`)**: Watches the configuration directory for modifications, creations, or atomic renames of `config.yaml`.
+1. **Automatic File Watching (`fsnotify`)**: Watches the configuration directory for modifications, creations, or atomic renames of `config.yaml` (with automatic event debouncing).
 2. **Manual Signal (`SIGHUP`)**: Send `kill -HUP <pid>` or `docker kill --signal=HUP proxtail` to trigger an immediate reload.
 
 During a reload:
 - The new configuration is parsed and validated before applying any changes.
-- Newly added tailnets are initialized and removed tailnets are gracefully closed.
+- Newly added tailnets are initialized, modified tailnets (`hostname`, `auth_key`, `ephemeral`) are reinitialized, and removed tailnets are gracefully closed.
 - Added, removed, and modified port listeners are updated incrementally while unaffected active connections continue uninterrupted.
+- Process-level `proxy` tuning parameters (`buffer_size`, `queue_size`, `worker_pool_size`, `enable_metrics`, `metrics_interval`) are initialized at startup and require a process restart to change.
 
 ## Configuration
 

@@ -162,6 +162,30 @@ tailnets:
 `,
 			errContains: "invalid timeout 5000",
 		},
+		{
+			name: "missing destination port",
+			yaml: `
+tailnets:
+  - name: 'prod'
+    ports:
+      - protocol: 'tcp'
+        source_port: 8080
+        destination: 'web-server'
+`,
+			errContains: "must be in host:port format",
+		},
+		{
+			name: "invalid destination port range",
+			yaml: `
+tailnets:
+  - name: 'prod'
+    ports:
+      - protocol: 'tcp'
+        source_port: 8080
+        destination: 'web-server:70000'
+`,
+			errContains: "invalid destination port '70000'",
+		},
 	}
 
 	for _, tc := range tests {
@@ -174,5 +198,38 @@ tailnets:
 				t.Fatalf("expected error containing %q, got %q", tc.errContains, err.Error())
 			}
 		})
+	}
+}
+
+func TestConnectionSettingsEqual(t *testing.T) {
+	tVal := true
+	fVal := false
+	base := TailnetConfig{
+		Name:      "prod",
+		Hostname:  "proxy-prod",
+		AuthKey:   "TS_AUTHKEY_PROD",
+		Ephemeral: &tVal,
+	}
+
+	same := TailnetConfig{
+		Name:     "prod",
+		Hostname: "proxy-prod",
+		AuthKey:  "TS_AUTHKEY_PROD",
+		// nil Ephemeral defaults to true
+	}
+	if !base.ConnectionSettingsEqual(same) {
+		t.Errorf("expected base and same to be equal")
+	}
+
+	diffHost := base
+	diffHost.Hostname = "proxy-prod-2"
+	if base.ConnectionSettingsEqual(diffHost) {
+		t.Errorf("expected different hostname to not be equal")
+	}
+
+	diffEph := base
+	diffEph.Ephemeral = &fVal
+	if base.ConnectionSettingsEqual(diffEph) {
+		t.Errorf("expected different ephemeral to not be equal")
 	}
 }

@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -12,11 +14,12 @@ import (
 
 // TailnetConfig defines settings for a specific Tailscale network.
 type TailnetConfig struct {
-	Name      string        `yaml:"name"`                // Unique identifier for this tailnet (required)
-	Hostname  string        `yaml:"hostname,omitempty"`  // Hostname for this tailnet (optional, defaults to "<system-hostname>-<name>")
-	AuthKey   string        `yaml:"auth_key,omitempty"`  // Auth key environment variable name (optional, defaults to "TS_AUTHKEY_<NAME>")
-	Ephemeral *bool         `yaml:"ephemeral,omitempty"` // Whether this node is ephemeral (optional, defaults to true)
-	Ports     []PortMapping `yaml:"ports"`               // Ports to forward for this tailnet
+	Name       string        `yaml:"name"`                  // Unique identifier for this tailnet (required)
+	Hostname   string        `yaml:"hostname,omitempty"`    // Hostname for this tailnet (optional, defaults to "<system-hostname>-<name>")
+	AuthKey    string        `yaml:"auth_key,omitempty"`    // Auth key environment variable name (optional, defaults to "TS_AUTHKEY_<NAME>")
+	ControlURL string        `yaml:"control_url,omitempty"` // Coordination server URL (optional, defaults to Tailscale control plane)
+	Ephemeral  *bool         `yaml:"ephemeral,omitempty"`   // Whether this node is ephemeral (optional, defaults to true)
+	Ports      []PortMapping `yaml:"ports"`                 // Ports to forward for this tailnet
 }
 
 // IsEphemeral returns the configured ephemeral value, defaulting to true if unset.
@@ -25,6 +28,16 @@ func (t TailnetConfig) IsEphemeral() bool {
 		return true
 	}
 	return *t.Ephemeral
+}
+
+// ConnectionSettingsEqual reports whether two TailnetConfig values have identical
+// connection-level settings (name, hostname, auth key env var, control URL, and ephemeral mode).
+func (t TailnetConfig) ConnectionSettingsEqual(other TailnetConfig) bool {
+	return t.Name == other.Name &&
+		t.Hostname == other.Hostname &&
+		t.AuthKey == other.AuthKey &&
+		t.ControlURL == other.ControlURL &&
+		t.IsEphemeral() == other.IsEphemeral()
 }
 
 // PortMapping defines a port forwarding rule under a tailnet.
@@ -142,8 +155,17 @@ func Validate(cfg *Config) error {
 			if port.Source <= 0 || port.Source > 65535 {
 				return fmt.Errorf("invalid source port %d in tailnet %s: must be between 1 and 65535", port.Source, tailnet.Name)
 			}
-			if strings.TrimSpace(port.Destination) == "" {
+			dest := strings.TrimSpace(port.Destination)
+			if dest == "" {
 				return fmt.Errorf("empty destination in tailnet %s, port %d", tailnet.Name, port.Source)
+			}
+			destHost, destPortStr, err := net.SplitHostPort(dest)
+			if err != nil || strings.TrimSpace(destHost) == "" {
+				return fmt.Errorf("invalid destination '%s' in tailnet %s, port %d: must be in host:port format", port.Destination, tailnet.Name, port.Source)
+			}
+			destPort, err := strconv.Atoi(destPortStr)
+			if err != nil || destPort <= 0 || destPort > 65535 {
+				return fmt.Errorf("invalid destination port '%s' in tailnet %s, port %d: must be between 1 and 65535", destPortStr, tailnet.Name, port.Source)
 			}
 			if strings.TrimSpace(port.Protocol) == "" {
 				return fmt.Errorf("empty protocol in tailnet %s, port %d", tailnet.Name, port.Source)
