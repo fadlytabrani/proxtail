@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -14,12 +15,15 @@ import (
 
 // TailnetConfig defines settings for a specific Tailscale network.
 type TailnetConfig struct {
-	Name       string        `yaml:"name"`                  // Unique identifier for this tailnet (required)
-	Hostname   string        `yaml:"hostname,omitempty"`    // Hostname for this tailnet (optional, defaults to "<system-hostname>-<name>")
-	AuthKey    string        `yaml:"auth_key,omitempty"`    // Auth key environment variable name (optional, defaults to "TS_AUTHKEY_<NAME>")
-	ControlURL string        `yaml:"control_url,omitempty"` // Coordination server URL (optional, defaults to Tailscale control plane)
-	Ephemeral  *bool         `yaml:"ephemeral,omitempty"`   // Whether this node is ephemeral (optional, defaults to true)
-	Ports      []PortMapping `yaml:"ports"`                 // Ports to forward for this tailnet
+	Name          string        `yaml:"name"`                     // Unique identifier for this tailnet (defaults to "default" if single tailnet)
+	Hostname      string        `yaml:"hostname,omitempty"`       // Hostname for this tailnet (optional, defaults to "<system-hostname>-<name>")
+	AuthKey       string        `yaml:"auth_key,omitempty"`       // Auth key or OAuth secret env var / literal (optional, defaults to "TS_AUTHKEY_<NAME>")
+	ControlURL    string        `yaml:"control_url,omitempty"`    // Coordination server URL (optional, defaults to Tailscale control plane)
+	Ephemeral     *bool         `yaml:"ephemeral,omitempty"`      // Whether this node is ephemeral (optional, defaults to true)
+	Tags          []string      `yaml:"tags,omitempty"`           // Tailscale ACL tags to advertise (e.g., ["tag:proxy"])
+	WireGuardPort uint16        `yaml:"wireguard_port,omitempty"` // Optional UDP port for direct peer-to-peer WireGuard traffic
+	WebClient     bool          `yaml:"web_client,omitempty"`     // Optional Tailscale web management client on port 5252
+	Ports         []PortMapping `yaml:"ports"`                    // Ports to forward for this tailnet
 }
 
 // IsEphemeral returns the configured ephemeral value, defaulting to true if unset.
@@ -31,54 +35,92 @@ func (t TailnetConfig) IsEphemeral() bool {
 }
 
 // ConnectionSettingsEqual reports whether two TailnetConfig values have identical
-// connection-level settings (name, hostname, auth key env var, control URL, and ephemeral mode).
+// connection-level settings.
 func (t TailnetConfig) ConnectionSettingsEqual(other TailnetConfig) bool {
 	return t.Name == other.Name &&
 		t.Hostname == other.Hostname &&
 		t.AuthKey == other.AuthKey &&
 		t.ControlURL == other.ControlURL &&
-		t.IsEphemeral() == other.IsEphemeral()
+		t.IsEphemeral() == other.IsEphemeral() &&
+		t.WireGuardPort == other.WireGuardPort &&
+		t.WebClient == other.WebClient &&
+		slices.Equal(t.Tags, other.Tags)
 }
 
-// ResolveAuthKey resolves the Tailscale auth key for this tailnet from:
-//  1. The environment variable named by AuthKey (or TS_AUTHKEY_<NAME> if unset),
-//  2. A literal "tskey-..." string if AuthKey was provided directly in YAML, or
-//  3. The standard TS_AUTHKEY environment variable when allowGlobalFallback is true (single-tailnet mode).
+// ResolveAuthKey resolves the Tailscale credential for this tailnet.
+// Kept for compatibility; see ResolveCredentials for separated authKey vs OAuth clientSecret resolution.
 func (t TailnetConfig) ResolveAuthKey(allowGlobalFallback bool) (string, error) {
+	authKey, clientSecret, err := t.ResolveCredentials(allowGlobalFallback)
+	if err != nil {
+		return "", err
+	}
+	if clientSecret != "" {
+		return clientSecret, nil
+	}
+	return authKey, nil
+}
+
+// ResolveCredentials resolves either a Tailscale AuthKey ("tskey-auth-...") or an OAuth ClientSecret ("tskey-client-...")
+// from environment variables or literal configuration values:
+//  1. The environment variable named by AuthKey (or TS_AUTHKEY_<NAME> if unset),
+//  2. The environment variable TS_CLIENT_SECRET_<NAME>,
+//  3. A literal "tskey-..." string if AuthKey was provided directly in YAML, or
+//  4. Standard TS_AUTHKEY / TS_CLIENT_SECRET environment variables when allowGlobalFallback is true.
+func (t TailnetConfig) ResolveCredentials(allowGlobalFallback bool) (authKey string, clientSecret string, err error) {
+	classify := func(val string) (string, string) {
+		if strings.HasPrefix(val, "tskey-client-") {
+			return "", val
+		}
+		return val, ""
+	}
+
 	keySpec := strings.TrimSpace(t.AuthKey)
 	if keySpec == "" {
 		keySpec = DefaultAuthKeyEnv(t.Name)
 	}
 	if val := strings.TrimSpace(os.Getenv(keySpec)); val != "" {
-		return val, nil
+		ak, cs := classify(val)
+		return ak, cs, nil
+	}
+	clientSecretEnv := DefaultClientSecretEnv(t.Name)
+	if val := strings.TrimSpace(os.Getenv(clientSecretEnv)); val != "" {
+		return "", val, nil
 	}
 	if strings.HasPrefix(keySpec, "tskey-") {
-		return keySpec, nil
+		ak, cs := classify(keySpec)
+		return ak, cs, nil
 	}
 	if allowGlobalFallback {
 		if val := strings.TrimSpace(os.Getenv("TS_AUTHKEY")); val != "" {
-			return val, nil
+			ak, cs := classify(val)
+			return ak, cs, nil
+		}
+		if val := strings.TrimSpace(os.Getenv("TS_CLIENT_SECRET")); val != "" {
+			return "", val, nil
 		}
 	}
-	return "", fmt.Errorf("environment variable %s not set", keySpec)
+	return "", "", fmt.Errorf("environment variable %s not set", keySpec)
 }
 
 // PortMapping defines a port forwarding rule under a tailnet.
 type PortMapping struct {
-	Source            int    `yaml:"source_port,omitempty"` // Local source port to listen on (1-65535)
-	Port              int    `yaml:"port,omitempty"`        // Alias for source_port
-	Destination       string `yaml:"destination"`           // Destination in tailnet ("host:port" or "host" to reuse source_port)
-	Tailnet           string `yaml:"-"`                     // Populated automatically from parent TailnetConfig
-	Protocol          string `yaml:"protocol,omitempty"`    // Protocol: "tcp" or "udp" (default: "tcp")
-	ConnectionTimeout int    `yaml:"timeout,omitempty"`     // Connection timeout in seconds (default: 30)
+	Source            int    `yaml:"source_port,omitempty"`    // Local source port to listen on (1-65535)
+	Port              int    `yaml:"port,omitempty"`           // Alias for source_port
+	ListenAddress     string `yaml:"listen_address,omitempty"` // Optional local bind IP (e.g., "127.0.0.1"; default: all interfaces)
+	Destination       string `yaml:"destination"`              // Destination in tailnet ("host:port" or "host" to reuse source_port)
+	Tailnet           string `yaml:"-"`                        // Populated automatically from parent TailnetConfig
+	Protocol          string `yaml:"protocol,omitempty"`       // Protocol: "tcp" or "udp" (default: "tcp")
+	ConnectionTimeout int    `yaml:"timeout,omitempty"`        // Connection timeout in seconds (default: 30)
 }
 
-// ProxySettings defines performance and monitoring settings for the proxy server.
+// ProxySettings defines performance, binding, health check, and monitoring settings for the proxy server.
 type ProxySettings struct {
-	BufferSize      int  `yaml:"buffer_size,omitempty"`      // Buffer size in KB (default: 512)
-	WorkerPoolSize  int  `yaml:"worker_pool_size,omitempty"` // Max concurrent workers (default: 200)
-	EnableMetrics   bool `yaml:"enable_metrics,omitempty"`   // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
-	MetricsInterval int  `yaml:"metrics_interval,omitempty"` // Metrics logging interval in seconds (default: 60 when metrics enabled)
+	ListenAddress   string `yaml:"listen_address,omitempty"`   // Default local bind IP for all ports (default: all interfaces)
+	BufferSize      int    `yaml:"buffer_size,omitempty"`      // Buffer size in KB (default: 512)
+	WorkerPoolSize  int    `yaml:"worker_pool_size,omitempty"` // Max concurrent workers (default: 200)
+	EnableMetrics   bool   `yaml:"enable_metrics,omitempty"`   // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
+	MetricsInterval int    `yaml:"metrics_interval,omitempty"` // Metrics logging interval in seconds (default: 60 when metrics enabled)
+	HealthPort      int    `yaml:"health_port,omitempty"`      // Optional HTTP port for /healthz and Prometheus /metrics endpoints
 }
 
 // Config defines the structure for the YAML configuration file.
@@ -87,11 +129,8 @@ type Config struct {
 	Proxy    ProxySettings   `yaml:"proxy"`
 }
 
-// DefaultAuthKeyEnv returns the canonical environment variable name for a tailnet's auth key,
-// normalizing hyphens and non-alphanumeric characters to underscores (e.g., "prod-us" -> "TS_AUTHKEY_PROD_US").
-func DefaultAuthKeyEnv(tailnetName string) string {
+func sanitizeEnvSuffix(tailnetName string) string {
 	var b strings.Builder
-	b.WriteString("TS_AUTHKEY_")
 	for _, r := range strings.ToUpper(strings.TrimSpace(tailnetName)) {
 		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
 			b.WriteRune(r)
@@ -100,6 +139,18 @@ func DefaultAuthKeyEnv(tailnetName string) string {
 		}
 	}
 	return b.String()
+}
+
+// DefaultAuthKeyEnv returns the canonical environment variable name for a tailnet's auth key,
+// normalizing hyphens and non-alphanumeric characters to underscores (e.g., "prod-us" -> "TS_AUTHKEY_PROD_US").
+func DefaultAuthKeyEnv(tailnetName string) string {
+	return "TS_AUTHKEY_" + sanitizeEnvSuffix(tailnetName)
+}
+
+// DefaultClientSecretEnv returns the canonical environment variable name for a tailnet's OAuth client secret
+// (e.g., "prod-us" -> "TS_CLIENT_SECRET_PROD_US").
+func DefaultClientSecretEnv(tailnetName string) string {
+	return "TS_CLIENT_SECRET_" + sanitizeEnvSuffix(tailnetName)
 }
 
 // Load reads, parses, applies defaults, and validates the YAML configuration file.
@@ -140,6 +191,7 @@ func ApplyDefaults(cfg *Config) {
 	} else {
 		cfg.Proxy.MetricsInterval = 60 // Default: 60 seconds
 	}
+	cfg.Proxy.ListenAddress = strings.TrimSpace(cfg.Proxy.ListenAddress)
 
 	sysHostname, err := os.Hostname()
 	if err != nil || sysHostname == "" {
@@ -167,11 +219,23 @@ func ApplyDefaults(cfg *Config) {
 				cfg.Tailnets[i].AuthKey = defaultEnv
 			}
 		}
+		for tIdx, tag := range cfg.Tailnets[i].Tags {
+			trimmed := strings.TrimSpace(tag)
+			if trimmed != "" && !strings.HasPrefix(trimmed, "tag:") {
+				cfg.Tailnets[i].Tags[tIdx] = "tag:" + trimmed
+			} else {
+				cfg.Tailnets[i].Tags[tIdx] = trimmed
+			}
+		}
 		for j := range cfg.Tailnets[i].Ports {
 			p := &cfg.Tailnets[i].Ports[j]
 			p.Tailnet = cfg.Tailnets[i].Name
 			if p.Source == 0 && p.Port != 0 {
 				p.Source = p.Port
+			}
+			p.ListenAddress = strings.TrimSpace(p.ListenAddress)
+			if p.ListenAddress == "" && cfg.Proxy.ListenAddress != "" {
+				p.ListenAddress = cfg.Proxy.ListenAddress
 			}
 			if strings.TrimSpace(p.Protocol) == "" {
 				p.Protocol = "tcp"
@@ -201,6 +265,14 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("at least one tailnet must be configured")
 	}
 
+	if cfg.Proxy.ListenAddress != "" && net.ParseIP(cfg.Proxy.ListenAddress) == nil {
+		return fmt.Errorf("invalid proxy listen_address '%s': must be a valid IP address", cfg.Proxy.ListenAddress)
+	}
+
+	if cfg.Proxy.HealthPort < 0 || cfg.Proxy.HealthPort > 65535 {
+		return fmt.Errorf("invalid health_port %d: must be between 1 and 65535", cfg.Proxy.HealthPort)
+	}
+
 	tailnetNames := make(map[string]bool)
 	for _, tailnet := range cfg.Tailnets {
 		if strings.TrimSpace(tailnet.Name) == "" {
@@ -210,6 +282,12 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("duplicate tailnet name: %s", tailnet.Name)
 		}
 		tailnetNames[tailnet.Name] = true
+
+		for _, tag := range tailnet.Tags {
+			if tag == "" || tag == "tag:" || strings.ContainsAny(tag, " \t\n") {
+				return fmt.Errorf("invalid ACL tag '%s' in tailnet %s", tag, tailnet.Name)
+			}
+		}
 	}
 
 	portMap := make(map[string]string) // "<port>-<protocol>" -> tailnet name
@@ -223,6 +301,10 @@ func Validate(cfg *Config) error {
 			}
 			if port.Source <= 0 || port.Source > 65535 {
 				return fmt.Errorf("invalid source port %d in tailnet %s: must be between 1 and 65535", port.Source, tailnet.Name)
+			}
+			if port.ListenAddress != "" && net.ParseIP(port.ListenAddress) == nil {
+				return fmt.Errorf("invalid listen_address '%s' in tailnet %s, port %d: must be a valid IP address",
+					port.ListenAddress, tailnet.Name, port.Source)
 			}
 			dest := strings.TrimSpace(port.Destination)
 			if dest == "" {
@@ -243,6 +325,11 @@ func Validate(cfg *Config) error {
 			protocol := strings.ToLower(port.Protocol)
 			if protocol != "tcp" && protocol != "udp" {
 				return fmt.Errorf("invalid protocol '%s' in tailnet %s, port %d: must be 'tcp' or 'udp'", port.Protocol, tailnet.Name, port.Source)
+			}
+
+			if cfg.Proxy.HealthPort > 0 && protocol == "tcp" && port.Source == cfg.Proxy.HealthPort {
+				return fmt.Errorf("port conflict: health_port %d conflicts with TCP source port %d in tailnet '%s'",
+					cfg.Proxy.HealthPort, port.Source, tailnet.Name)
 			}
 
 			portKey := fmt.Sprintf("%d-%s", port.Source, protocol)
@@ -289,8 +376,13 @@ func (c *Config) ToProxyPortMappings() []proxy.PortMapping {
 			if protocol == "" {
 				protocol = "tcp"
 			}
+			listenAddr := strings.TrimSpace(port.ListenAddress)
+			if listenAddr == "" {
+				listenAddr = strings.TrimSpace(c.Proxy.ListenAddress)
+			}
 			mappings = append(mappings, proxy.PortMapping{
 				Source:            port.Source,
+				ListenAddress:     listenAddr,
 				Destination:       port.Destination,
 				Protocol:          protocol,
 				Tailnet:           tailnet.Name,

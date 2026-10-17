@@ -2,12 +2,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"maps"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -41,25 +49,38 @@ func newTailnetManager() *tailnetManager {
 
 // initializeServer creates and starts a tsnet.Server for a specific tailnet configuration.
 func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
-	authKey, err := tailnetCfg.ResolveAuthKey(tailnetCfg.Name == "default")
-	if err != nil {
+	ephemeral := tailnetCfg.IsEphemeral()
+	stateDir := os.Getenv("TS_STATE_DIR")
+	var tailnetDir string
+	hasPersistedState := false
+
+	if !ephemeral && stateDir != "" {
+		tailnetDir = filepath.Join(stateDir, tailnetCfg.Name)
+		if _, err := os.Stat(filepath.Join(tailnetDir, "tailscaled.state")); err == nil {
+			hasPersistedState = true
+		}
+	}
+
+	authKey, clientSecret, err := tailnetCfg.ResolveCredentials(tailnetCfg.Name == "default")
+	if err != nil && !hasPersistedState {
 		return nil, err
 	}
 
-	ephemeral := tailnetCfg.IsEphemeral()
 	server := &tsnet.Server{
-		Hostname:   tailnetCfg.Hostname,
-		AuthKey:    authKey,
-		ControlURL: tailnetCfg.ControlURL,
-		Ephemeral:  ephemeral,
+		Hostname:      tailnetCfg.Hostname,
+		AuthKey:       authKey,
+		ClientSecret:  clientSecret,
+		ControlURL:    tailnetCfg.ControlURL,
+		Ephemeral:     ephemeral,
+		AdvertiseTags: tailnetCfg.Tags,
+		Port:          tailnetCfg.WireGuardPort,
+		RunWebClient:  tailnetCfg.WebClient,
 	}
 
 	// Use in-memory store for ephemeral nodes, or persistent state directory for non-ephemeral nodes.
-	stateDir := os.Getenv("TS_STATE_DIR")
 	if ephemeral {
 		server.Store = &mem.Store{}
-	} else if stateDir != "" {
-		tailnetDir := filepath.Join(stateDir, tailnetCfg.Name)
+	} else if tailnetDir != "" {
 		if err := os.MkdirAll(tailnetDir, 0o700); err != nil {
 			return nil, fmt.Errorf("creating tailnet state dir %s: %w", tailnetDir, err)
 		}
@@ -87,7 +108,7 @@ func cleanupTailnetServer(server *tsnet.Server, tailnetName string) {
 }
 
 // syncTailnets reconciles running tsnet.Server instances with the provided configuration,
-// starting added tailnets, restarting modified tailnets, and returning a cleanup callback for removed ones.
+// starting added tailnets in parallel, restarting modified tailnets, and returning a cleanup callback for removed ones.
 func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[string]*tsnet.Server, map[string]bool, func(), error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
@@ -101,17 +122,16 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 	restartedTailnets := make(map[string]bool)
 	removedServers := make(map[string]*tsnet.Server)
 
+	type initTask struct {
+		cfg     config.TailnetConfig
+		restart bool
+	}
+	var tasks []initTask
+
 	for _, t := range tailnets {
 		existingSrv, exists := tm.servers[t.Name]
 		if !exists {
-			srv, err := tm.initFunc(t)
-			if err != nil {
-				for name, started := range addedServers {
-					tm.cleanupFunc(started, name)
-				}
-				return nil, nil, nil, fmt.Errorf("failed to initialize tailnet '%s': %w", t.Name, err)
-			}
-			addedServers[t.Name] = srv
+			tasks = append(tasks, initTask{cfg: t, restart: false})
 			continue
 		}
 
@@ -126,16 +146,56 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 			} else {
 				removedServers[t.Name] = existingSrv
 			}
+			tasks = append(tasks, initTask{cfg: t, restart: true})
+		}
+	}
 
-			srv, err := tm.initFunc(t)
-			if err != nil {
-				for name, started := range addedServers {
-					tm.cleanupFunc(started, name)
+	if len(tasks) > 0 {
+		type initResult struct {
+			name    string
+			srv     *tsnet.Server
+			restart bool
+			err     error
+		}
+		results := make([]initResult, len(tasks))
+		var wg sync.WaitGroup
+		for i, task := range tasks {
+			idx, tk := i, task
+			wg.Go(func() {
+				srv, err := tm.initFunc(tk.cfg)
+				results[idx] = initResult{
+					name:    tk.cfg.Name,
+					srv:     srv,
+					restart: tk.restart,
+					err:     err,
 				}
-				return nil, nil, nil, fmt.Errorf("failed to reinitialize tailnet '%s': %w", t.Name, err)
+			})
+		}
+		wg.Wait()
+
+		var firstErr error
+		for _, res := range results {
+			if res.err != nil {
+				if firstErr == nil {
+					if res.restart {
+						firstErr = fmt.Errorf("failed to reinitialize tailnet '%s': %w", res.name, res.err)
+					} else {
+						firstErr = fmt.Errorf("failed to initialize tailnet '%s': %w", res.name, res.err)
+					}
+				}
+				continue
 			}
-			addedServers[t.Name] = srv
-			restartedTailnets[t.Name] = true
+			addedServers[res.name] = res.srv
+			if res.restart {
+				restartedTailnets[res.name] = true
+			}
+		}
+
+		if firstErr != nil {
+			for name, started := range addedServers {
+				tm.cleanupFunc(started, name)
+			}
+			return nil, nil, nil, firstErr
 		}
 	}
 
@@ -153,10 +213,7 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 		}
 	}
 
-	snapshot := make(map[string]*tsnet.Server, len(tm.servers))
-	for name, srv := range tm.servers {
-		snapshot[name] = srv
-	}
+	snapshot := maps.Clone(tm.servers)
 
 	cleanupRemoved := func() {
 		for name, srv := range removedServers {
@@ -165,6 +222,13 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 	}
 
 	return snapshot, restartedTailnets, cleanupRemoved, nil
+}
+
+// snapshotServers returns a thread-safe copy of the currently active tailnet servers.
+func (tm *tailnetManager) snapshotServers() map[string]*tsnet.Server {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return maps.Clone(tm.servers)
 }
 
 // closeAll shuts down all managed tsnet.Server instances.
@@ -255,7 +319,7 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 				return
 			}
 			if filepath.Base(event.Name) == configBase &&
-				(event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0) {
+				event.Has(fsnotify.Write|fsnotify.Create|fsnotify.Rename) {
 				log.Printf("Config file change detected (%s), scheduling reload...", event.Op)
 				if debounceTimer == nil {
 					debounceTimer = time.NewTimer(100 * time.Millisecond)
@@ -285,6 +349,127 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 	}
 }
 
+// healthTailnetStatus describes the runtime status of a single tailnet for /healthz.
+type healthTailnetStatus struct {
+	Name     string `json:"name"`
+	Hostname string `json:"hostname,omitempty"`
+	IPv4     string `json:"ipv4,omitempty"`
+	IPv6     string `json:"ipv6,omitempty"`
+}
+
+// healthResponse is the JSON payload returned by GET /healthz.
+type healthResponse struct {
+	Status           string                `json:"status"`
+	Tailnets         []healthTailnetStatus `json:"tailnets"`
+	TCPConnections   int64                 `json:"tcp_connections"`
+	UDPPackets       int64                 `json:"udp_packets"`
+	BytesTransferred int64                 `json:"bytes_transferred"`
+	Errors           int64                 `json:"errors"`
+}
+
+// newHealthHandler constructs an http.Handler serving /healthz (JSON) and /metrics (Prometheus text format).
+func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		stats := proxyServer.GetStats()
+		servers := tm.snapshotServers()
+
+		names := make([]string, 0, len(servers))
+		for name := range servers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		tailnets := make([]healthTailnetStatus, 0, len(names))
+		for _, name := range names {
+			st := healthTailnetStatus{Name: name}
+			if srv := servers[name]; srv != nil {
+				st.Hostname = srv.Hostname
+				if srv.Sys() != nil {
+					ip4, ip6 := srv.TailscaleIPs()
+					if ip4.IsValid() {
+						st.IPv4 = ip4.String()
+					}
+					if ip6.IsValid() {
+						st.IPv6 = ip6.String()
+					}
+				}
+			}
+			tailnets = append(tailnets, st)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(healthResponse{
+			Status:           "ok",
+			Tailnets:         tailnets,
+			TCPConnections:   stats.TCPConnections,
+			UDPPackets:       stats.UDPPackets,
+			BytesTransferred: stats.BytesTransferred,
+			Errors:           stats.ErrorCount,
+		})
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		stats := proxyServer.GetStats()
+		servers := tm.snapshotServers()
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		var b strings.Builder
+		fmt.Fprintf(&b, "# HELP proxtail_tcp_connections_active Current number of active TCP connections.\n")
+		fmt.Fprintf(&b, "# TYPE proxtail_tcp_connections_active gauge\n")
+		fmt.Fprintf(&b, "proxtail_tcp_connections_active %d\n", stats.TCPConnections)
+		fmt.Fprintf(&b, "# HELP proxtail_udp_packets_total Total number of UDP packets forwarded.\n")
+		fmt.Fprintf(&b, "# TYPE proxtail_udp_packets_total counter\n")
+		fmt.Fprintf(&b, "proxtail_udp_packets_total %d\n", stats.UDPPackets)
+		fmt.Fprintf(&b, "# HELP proxtail_bytes_transferred_total Total number of bytes transferred across all flows.\n")
+		fmt.Fprintf(&b, "# TYPE proxtail_bytes_transferred_total counter\n")
+		fmt.Fprintf(&b, "proxtail_bytes_transferred_total %d\n", stats.BytesTransferred)
+		fmt.Fprintf(&b, "# HELP proxtail_errors_total Total number of connection or forwarding errors.\n")
+		fmt.Fprintf(&b, "# TYPE proxtail_errors_total counter\n")
+		fmt.Fprintf(&b, "proxtail_errors_total %d\n", stats.ErrorCount)
+		fmt.Fprintf(&b, "# HELP proxtail_tailnets_configured Number of currently active tailnet instances.\n")
+		fmt.Fprintf(&b, "# TYPE proxtail_tailnets_configured gauge\n")
+		fmt.Fprintf(&b, "proxtail_tailnets_configured %d\n", len(servers))
+		_, _ = w.Write([]byte(b.String()))
+	})
+
+	return mux
+}
+
+// startHealthServer starts the optional HTTP health check and Prometheus metrics server.
+func startHealthServer(ctx context.Context, listenAddress string, port int, proxyServer *proxy.Proxy, tm *tailnetManager) error {
+	addr := fmt.Sprintf(":%d", port)
+	if strings.TrimSpace(listenAddress) != "" {
+		addr = net.JoinHostPort(strings.TrimSpace(listenAddress), strconv.Itoa(port))
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("starting health server on %s: %w", addr, err)
+	}
+
+	srv := &http.Server{
+		Handler:           newHealthHandler(proxyServer, tm),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	context.AfterFunc(ctx, func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	})
+
+	go func() {
+		log.Printf("Health & metrics server listening on %s (/healthz, /metrics)", addr)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("Health server error: %v", err)
+		}
+	}()
+
+	return nil
+}
+
 // resolveConfigPath determines the configuration file path from CLI flag, environment variables,
 // a local ./config.yaml in the current working directory, or /etc/proxtail/config.yaml.
 func resolveConfigPath(flagConfig string) string {
@@ -305,8 +490,11 @@ func resolveConfigPath(flagConfig string) string {
 
 func main() {
 	var flagConfig string
+	var flagValidate bool
 	flag.StringVar(&flagConfig, "config", "", "Path to configuration file")
 	flag.StringVar(&flagConfig, "c", "", "Path to configuration file (shorthand)")
+	flag.BoolVar(&flagValidate, "validate", false, "Validate configuration file and exit")
+	flag.BoolVar(&flagValidate, "check", false, "Validate configuration file and exit (shorthand)")
 	flag.Parse()
 
 	configFile := resolveConfigPath(flagConfig)
@@ -317,6 +505,11 @@ func main() {
 	}
 
 	portMappings := cfg.ToProxyPortMappings()
+	if flagValidate {
+		fmt.Printf("Configuration %s is valid (%d tailnets, %d port mappings)\n",
+			configFile, len(cfg.Tailnets), len(portMappings))
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -368,6 +561,12 @@ func main() {
 		cfg.Proxy.BufferSize*1024,
 		cfg.Proxy.WorkerPoolSize,
 	)
+
+	if cfg.Proxy.HealthPort > 0 {
+		if err := startHealthServer(ctx, cfg.Proxy.ListenAddress, cfg.Proxy.HealthPort, proxyServer, tm); err != nil {
+			log.Fatalf("Failed to start health server: %v", err)
+		}
+	}
 
 	go startConfigWatcher(ctx, configFile, reloadChan)
 

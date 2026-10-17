@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,16 +21,21 @@ import (
 )
 
 func TestTailnetManagerSyncTailnets(t *testing.T) {
+	var mu sync.Mutex
 	var initialized []string
 	var cleaned []string
 
 	tm := newTailnetManager()
 	tm.initFunc = func(cfg config.TailnetConfig) (*tsnet.Server, error) {
+		mu.Lock()
 		initialized = append(initialized, cfg.Name+":"+cfg.Hostname)
+		mu.Unlock()
 		return &tsnet.Server{Hostname: cfg.Hostname}, nil
 	}
 	tm.cleanupFunc = func(srv *tsnet.Server, name string) {
+		mu.Lock()
 		cleaned = append(cleaned, name+":"+srv.Hostname)
+		mu.Unlock()
 	}
 
 	tVal := true
@@ -256,3 +266,52 @@ func TestResolveConfigPath(t *testing.T) {
 		t.Errorf("expected CLI flag path to take precedence, got %q", got)
 	}
 }
+
+func TestHealthAndMetricsEndpoints(t *testing.T) {
+	tm := newTailnetManager()
+	tm.initFunc = func(cfg config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: cfg.Hostname}, nil
+	}
+	tm.cleanupFunc = func(*tsnet.Server, string) {}
+
+	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{
+		{Name: "production", Hostname: "proxy-prod"},
+		{Name: "staging", Hostname: "proxy-staging"},
+	})
+	if err != nil {
+		t.Fatalf("syncTailnets failed: %v", err)
+	}
+
+	proxyServer := proxy.NewProxyWithMultiTailnet(nil, servers, 64*1024, 50)
+	handler := newHealthHandler(proxyServer, tm)
+
+	// 1. Verify /healthz returns JSON with active tailnets
+	reqHealth := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recHealth := httptest.NewRecorder()
+	handler.ServeHTTP(recHealth, reqHealth)
+
+	if recHealth.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK, got %d", recHealth.Code)
+	}
+	var hr healthResponse
+	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
+		t.Fatalf("failed to decode /healthz JSON: %v", err)
+	}
+	if hr.Status != "ok" || len(hr.Tailnets) != 2 || hr.Tailnets[0].Name != "production" || hr.Tailnets[1].Name != "staging" {
+		t.Errorf("unexpected /healthz response: %+v", hr)
+	}
+
+	// 2. Verify /metrics returns Prometheus exposition format
+	reqMetrics := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	recMetrics := httptest.NewRecorder()
+	handler.ServeHTTP(recMetrics, reqMetrics)
+
+	if recMetrics.Code != http.StatusOK {
+		t.Fatalf("expected /metrics 200 OK, got %d", recMetrics.Code)
+	}
+	body := recMetrics.Body.String()
+	if !strings.Contains(body, "proxtail_tailnets_configured 2") || !strings.Contains(body, "proxtail_tcp_connections_active 0") {
+		t.Errorf("unexpected /metrics output:\n%s", body)
+	}
+}
+

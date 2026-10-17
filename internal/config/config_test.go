@@ -319,3 +319,65 @@ func TestExampleConfigFileValid(t *testing.T) {
 			cfg.Proxy.EnableMetrics, cfg.Proxy.MetricsInterval)
 	}
 }
+
+func TestOAuthTagsListenAddressAndHealthPort(t *testing.T) {
+	t.Setenv("TS_CLIENT_SECRET_PROD", "tskey-client-oauth-secret-999")
+
+	yamlData := []byte(`
+tailnets:
+  - name: 'prod'
+    tags: ['proxy', 'tag:ingress']
+    wireguard_port: 41641
+    web_client: true
+    ports:
+      - port: 8080
+        destination: 'web-server'
+      - port: 8443
+        listen_address: '0.0.0.0'
+        destination: 'api-server:443'
+proxy:
+  listen_address: '127.0.0.1'
+  health_port: 9090
+`)
+
+	cfg, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("expected valid config, got error: %v", err)
+	}
+
+	tn := cfg.Tailnets[0]
+	if len(tn.Tags) != 2 || tn.Tags[0] != "tag:proxy" || tn.Tags[1] != "tag:ingress" {
+		t.Errorf("expected normalized ACL tags [tag:proxy tag:ingress], got %v", tn.Tags)
+	}
+	if tn.WireGuardPort != 41641 || !tn.WebClient {
+		t.Errorf("expected WireGuardPort=41641 and WebClient=true, got %d, %v", tn.WireGuardPort, tn.WebClient)
+	}
+
+	authKey, clientSecret, err := tn.ResolveCredentials(false)
+	if err != nil || authKey != "" || clientSecret != "tskey-client-oauth-secret-999" {
+		t.Errorf("expected OAuth clientSecret resolution, got authKey=%q clientSecret=%q err=%v", authKey, clientSecret, err)
+	}
+
+	mappings := cfg.ToProxyPortMappings()
+	if mappings[0].ListenAddress != "127.0.0.1" || mappings[0].ListenAddr() != "127.0.0.1:8080" {
+		t.Errorf("expected inherited listen_address 127.0.0.1:8080, got %q", mappings[0].ListenAddr())
+	}
+	if mappings[1].ListenAddress != "0.0.0.0" || mappings[1].ListenAddr() != "0.0.0.0:8443" {
+		t.Errorf("expected overridden listen_address 0.0.0.0:8443, got %q", mappings[1].ListenAddr())
+	}
+
+	// Verify health_port conflict with TCP source port is rejected
+	conflictYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 9090
+        destination: 'web-server'
+proxy:
+  health_port: 9090
+`)
+	if _, err := Parse(conflictYAML); err == nil || !strings.Contains(err.Error(), "health_port 9090 conflicts") {
+		t.Errorf("expected health_port conflict error, got %v", err)
+	}
+}
+

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1119,3 +1120,83 @@ func BenchmarkUDPThroughput(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkMultiTailnetParallelTCPThroughput(b *testing.B) {
+	const numTailnets = 3
+	dialers := make(map[string]Dialer, numTailnets)
+	ports := make([]PortMapping, 0, numTailnets)
+	proxyPorts := make([]int, numTailnets)
+
+	for tIdx := 0; tIdx < numTailnets; tIdx++ {
+		backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			b.Fatalf("failed to start backend listener %d: %v", tIdx, err)
+		}
+		b.Cleanup(func() { _ = backendListener.Close() })
+
+		go func(ln net.Listener) {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					_, _ = io.Copy(c, c)
+				}(conn)
+			}
+		}(backendListener)
+
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			b.Fatalf("failed to get free port: %v", err)
+		}
+		proxyPorts[tIdx] = l.Addr().(*net.TCPAddr).Port
+		_ = l.Close()
+
+		tailnetName := fmt.Sprintf("tailnet-%d", tIdx)
+		dialers[tailnetName] = &localDialer{}
+		ports = append(ports, PortMapping{
+			Source:            proxyPorts[tIdx],
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendListener.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           tailnetName,
+			ConnectionTimeout: 30,
+		})
+	}
+
+	p := NewProxyWithDialers(ports, dialers, 256*1024, 400)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	chunk := bytes.Repeat([]byte("M"), 64*1024)
+	b.SetBytes(int64(len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var clientSeq atomic.Uint32
+	b.RunParallel(func(pb *testing.PB) {
+		idx := int(clientSeq.Add(1)-1) % numTailnets
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPorts[idx]), 2*time.Second)
+		if err != nil {
+			b.Fatalf("failed to dial proxy port %d: %v", proxyPorts[idx], err)
+		}
+		defer conn.Close()
+
+		recvBuf := make([]byte, len(chunk))
+		for pb.Next() {
+			if _, err := conn.Write(chunk); err != nil {
+				b.Fatalf("parallel write failed: %v", err)
+			}
+			if _, err := io.ReadFull(conn, recvBuf); err != nil {
+				b.Fatalf("parallel read failed: %v", err)
+			}
+		}
+	})
+}
+

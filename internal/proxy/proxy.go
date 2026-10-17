@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -220,13 +221,23 @@ func (b *OptimizedBuffer) Release() {
 }
 
 // PortMapping defines the configuration for a port to be proxied, including source port,
-// destination address, protocol (TCP/UDP), target tailnet, and connection timeout.
+// optional local bind address, destination address, protocol (TCP/UDP), target tailnet, and connection timeout.
 type PortMapping struct {
 	Source            int
+	ListenAddress     string
 	Destination       string
 	Protocol          string
 	Tailnet           string
 	ConnectionTimeout int
+}
+
+// ListenAddr returns the host:port string to bind on locally.
+func (pm PortMapping) ListenAddr() string {
+	addr := strings.TrimSpace(pm.ListenAddress)
+	if addr == "" {
+		return fmt.Sprintf(":%d", pm.Source)
+	}
+	return net.JoinHostPort(addr, strconv.Itoa(pm.Source))
 }
 
 // ProxyStats holds a snapshot of performance counters.
@@ -539,23 +550,20 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 	defer stopCancel()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		p.forwardStream(conn, destConn, port.Source, timeout)
 		if cw, ok := destConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
-	}()
+	})
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		p.forwardStream(destConn, conn, port.Source, timeout)
 		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
-	}()
+	})
 
 	wg.Wait()
 }
@@ -1010,6 +1018,7 @@ func (p *Proxy) RestartTailnetPorts(tailnetNames map[string]bool) error {
 
 func portsEqual(a, b PortMapping) bool {
 	return a.Source == b.Source &&
+		strings.TrimSpace(a.ListenAddress) == strings.TrimSpace(b.ListenAddress) &&
 		a.Destination == b.Destination &&
 		a.Tailnet == b.Tailnet &&
 		strings.EqualFold(a.Protocol, b.Protocol) &&
@@ -1057,9 +1066,10 @@ func (p *Proxy) startTCPListener(port PortMapping, key string) error {
 		return fmt.Errorf("tailnet server '%s' not found for port %d", port.Tailnet, port.Source)
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port.Source))
+	listenAddr := port.ListenAddr()
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to start TCP listener on port %d: %w", port.Source, err)
+		return fmt.Errorf("failed to start TCP listener on %s: %w", listenAddr, err)
 	}
 
 	ctx, cancel := context.WithCancel(p.ctx)
@@ -1071,13 +1081,11 @@ func (p *Proxy) startTCPListener(port PortMapping, key string) error {
 
 	p.tcpListeners[key] = info
 
-	info.wg.Add(1)
-	go func() {
-		defer info.wg.Done()
+	info.wg.Go(func() {
 		p.forwardTCP(ctx, dialer, port, listener, &info.wg)
-	}()
+	})
 
-	log.Printf("TCP listener started on port %d for tailnet %s", port.Source, port.Tailnet)
+	log.Printf("TCP listener started on %s for tailnet %s", listenAddr, port.Tailnet)
 	return nil
 }
 
@@ -1087,9 +1095,10 @@ func (p *Proxy) startUDPListener(port PortMapping, key string) error {
 		return fmt.Errorf("tailnet server '%s' not found for port %d", port.Tailnet, port.Source)
 	}
 
-	conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port.Source))
+	listenAddr := port.ListenAddr()
+	conn, err := net.ListenPacket("udp", listenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to start UDP listener on port %d: %w", port.Source, err)
+		return fmt.Errorf("failed to start UDP listener on %s: %w", listenAddr, err)
 	}
 
 	ctx, cancel := context.WithCancel(p.ctx)
@@ -1101,13 +1110,11 @@ func (p *Proxy) startUDPListener(port PortMapping, key string) error {
 
 	p.udpConns[key] = info
 
-	info.wg.Add(1)
-	go func() {
-		defer info.wg.Done()
+	info.wg.Go(func() {
 		p.forwardUDP(ctx, dialer, port, conn, &info.wg)
-	}()
+	})
 
-	log.Printf("UDP listener started on port %d for tailnet %s", port.Source, port.Tailnet)
+	log.Printf("UDP listener started on %s for tailnet %s", listenAddr, port.Tailnet)
 	return nil
 }
 

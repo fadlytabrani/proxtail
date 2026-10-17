@@ -157,9 +157,12 @@ tailnets:
 | `name` | `string` | `"default"` *(if 1 tailnet)* | Unique identifier for the tailnet. Required when configuring multiple tailnets. |
 | `ports` | `list` | *(required)* | List of TCP/UDP port forwarding rules for this tailnet. |
 | `hostname` | `string` | `<system-hostname>-<name>` | Hostname registered in the Tailscale admin console for this node. |
-| `auth_key` | `string` | `TS_AUTHKEY_<NAME>` *(or `TS_AUTHKEY`)* | Name of the environment variable holding the auth key (or a literal `tskey-...` key). |
+| `auth_key` | `string` | `TS_AUTHKEY_<NAME>` *(or `TS_AUTHKEY`)* | Env var name (or literal `tskey-auth-...` / OAuth `tskey-client-...` secret). Also checks `TS_CLIENT_SECRET_<NAME>`. |
+| `tags` | `list` | `[]` | Tailscale ACL tags to advertise (e.g., `["tag:proxy"]` or `["proxy"]`). Required when using OAuth client secrets. |
 | `ephemeral` | `bool` | `true` | If `true`, keeps state in memory and removes the node when disconnected. If `false`, persists state to `TS_STATE_DIR`. |
 | `control_url` | `string` | Tailscale Control Plane | Custom coordination server URL (e.g., for Headscale). |
+| `wireguard_port` | `int` | `0` *(auto)* | Optional fixed UDP port for direct peer-to-peer WireGuard traffic. |
+| `web_client` | `bool` | `false` | Expose Tailscale's built-in node management web UI on port `5252` inside the tailnet. |
 
 ### `tailnets[].ports[]` Settings
 
@@ -168,29 +171,41 @@ tailnets:
 | `port` *(or `source_port`)* | `int` | *(required)* | Local port for `proxtail` to listen on (`1`–`65535`). |
 | `destination` | `string` | *(required)* | Target `host:port` or `host` inside the tailnet. If `:port` is omitted, reuses `port`. |
 | `protocol` | `string` | `"tcp"` | Layer 4 protocol: `"tcp"` or `"udp"`. |
+| `listen_address` | `string` | `proxy.listen_address` *(all interfaces)* | Optional local IP to bind on (e.g., `"127.0.0.1"` for localhost-only). |
 | `timeout` | `int` | `30` | Idle connection/session timeout in seconds (`1`–`3600`). |
 
 ### `proxy` Settings *(Optional)*
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `listen_address` | `string` | `""` *(all interfaces)* | Default local bind IP for all forwarded ports and the health server (e.g., `"127.0.0.1"`). |
+| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz` (JSON status + Tailscale IPs) and `/metrics` (Prometheus exposition format). |
 | `metrics_interval` | `int` | Disabled (`60` if enabled) | Log `METRICS:` summary every `N` seconds (`1`–`3600`). Setting this automatically enables metrics. |
 | `enable_metrics` | `bool` | `false` | Explicitly enable/disable periodic metrics logging. |
 | `buffer_size` | `int` | `512` | Per-connection I/O buffer size in KB (`1`–`8192`). |
 | `worker_pool_size` | `int` | `200` | Maximum concurrent forwarding workers (`1`–`10000`). |
 
-### Environment Variables
+### Environment Variables & CLI Flags
 
-| Variable | Description |
+| Variable / Flag | Description |
 | :--- | :--- |
-| `TS_AUTHKEY` | Default Tailscale auth key used in single-tailnet mode when `TS_AUTHKEY_<NAME>` is unset. |
-| `TS_AUTHKEY_<NAME>` | Per-tailnet auth key. `<NAME>` is uppercase with hyphens/dots replaced by `_` (e.g., `name: prod-us` → `TS_AUTHKEY_PROD_US`). |
+| `-c`, `-config <path>` | Path to the YAML configuration file. |
+| `-validate`, `-check` | Validate configuration syntax and port rules, then exit (`0` if valid, `1` on error). |
+| `TS_AUTHKEY` / `TS_CLIENT_SECRET` | Default Tailscale auth key or OAuth client secret used in single-tailnet mode. |
+| `TS_AUTHKEY_<NAME>` | Per-tailnet auth key (`<NAME>` is uppercase with hyphens/dots replaced by `_`). |
+| `TS_CLIENT_SECRET_<NAME>` | Per-tailnet OAuth client secret (`tskey-client-...`) for non-expiring node registration. |
 | `PROXTAIL_CONFIG` | Path to the YAML configuration file. |
 | `TS_STATE_DIR` | Directory used to persist Tailscale state when `ephemeral: false` (default in Docker: `/var/lib/tsnet`). |
 
 ---
 
 ## Day-2 Operations
+
+### Validating Config Before Deployment
+Validate `config.yaml` in CI/CD or before triggering a reload:
+```bash
+proxtail -validate -c config.yaml
+```
 
 ### Zero-Downtime Hot Reload
 You can add, remove, or update ports and tailnets without restarting `proxtail`:
@@ -205,15 +220,15 @@ You can add, remove, or update ports and tailnets without restarting `proxtail`:
   ```
 - **Safe Rollback**: If a modified `config.yaml` contains a syntax or validation error, `proxtail` logs the error and keeps the existing configuration and active connections running uninterrupted.
 
-### Monitoring & Metrics
-When `metrics_interval` is set (e.g., `metrics_interval: 30`), `proxtail` logs live traffic counters:
+### Health Checks & Prometheus Metrics
+When `health_port` is configured (e.g., `health_port: 9090` under `proxy:`):
+- **`GET /healthz`**: Returns JSON health status, active counters, and each tailnet's assigned Tailscale IPv4/IPv6 addresses.
+- **`GET /metrics`**: Exposes Prometheus metrics (`proxtail_tcp_connections_active`, `proxtail_udp_packets_total`, `proxtail_bytes_transferred_total`, `proxtail_errors_total`, `proxtail_tailnets_configured`).
+
+When `metrics_interval` is set (e.g., `metrics_interval: 30`), `proxtail` also logs periodic traffic summaries:
 ```text
 METRICS: TCP_Connections=4, UDP_Packets=1280, Bytes_Transferred=10485760, Errors=0
 ```
-- `TCP_Connections`: Currently active TCP connections.
-- `UDP_Packets`: Cumulative UDP packets forwarded.
-- `Bytes_Transferred`: Cumulative bytes transferred across all TCP and UDP flows.
-- `Errors`: Cumulative dial or forwarding errors.
 
 ---
 
