@@ -1744,5 +1744,3 @@ func BenchmarkRealTSNetWireGuardUDPParallelThroughput(b *testing.B) {
 		}
 	})
 }
-
-

@@ -2,15 +2,20 @@ BINARY_NAME := proxtail
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GO          := GOTOOLCHAIN=auto go
 LDFLAGS     := -s -w -X main.version=$(VERSION)
+PGO_PROFILE := $(CURDIR)/cmd/proxtail/default.pgo
 IMAGE_REPO  ?= ghcr.io/fadlytabrani/proxtail
 
-.PHONY: all build test race bench bench-real vet fmt check validate docker-build clean help
+.PHONY: all build pgo test race bench bench-real vet fmt check validate docker-build clean help
 
 all: check build
 
-## build: Compile the proxtail binary with embedded version
+## build: Compile the proxtail binary with embedded version and PGO (cmd/proxtail/default.pgo)
 build:
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(BINARY_NAME) ./cmd/proxtail
+	CGO_ENABLED=0 $(GO) build -pgo=auto -trimpath -ldflags="$(LDFLAGS)" -o $(BINARY_NAME) ./cmd/proxtail
+
+## pgo: Regenerate cmd/proxtail/default.pgo from real end-to-end tsnet + WireGuard benchmarks
+pgo:
+	$(GO) test -run=^$$ -bench='^BenchmarkRealTSNet' -benchmem -benchtime=3s -cpuprofile=$(PGO_PROFILE) ./internal/proxy
 
 ## test: Run unit and integration tests
 test:
@@ -20,13 +25,13 @@ test:
 race:
 	$(GO) test -v -race ./...
 
-## bench: Run synthetic socket TCP and UDP throughput benchmarks
+## bench: Run synthetic socket TCP and UDP throughput benchmarks (with PGO)
 bench:
-	$(GO) test -run=^$$ -bench='^Benchmark(TCP|UDP|Multi)' -benchmem ./internal/proxy
+	$(GO) test -pgo=$(PGO_PROFILE) -run=^$$ -bench='^Benchmark(TCP|UDP|Multi)' -benchmem ./internal/proxy
 
-## bench-real: Run real end-to-end tsnet + WireGuard (ChaCha20-Poly1305 + gVisor) throughput benchmarks
+## bench-real: Run real end-to-end tsnet + WireGuard (ChaCha20-Poly1305 + gVisor) throughput benchmarks (with PGO)
 bench-real:
-	$(GO) test -run=^$$ -bench='^BenchmarkRealTSNet' -benchmem -benchtime=3s ./internal/proxy
+	$(GO) test -pgo=$(PGO_PROFILE) -run=^$$ -bench='^BenchmarkRealTSNet' -benchmem -benchtime=3s ./internal/proxy
 
 ## vet: Run go vet static analysis
 vet:

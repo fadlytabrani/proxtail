@@ -86,7 +86,9 @@ type udpSessionShard struct {
 }
 
 type udpSessionTable struct {
-	shards [udpSessionShardCount]udpSessionShard
+	shards                    [udpSessionShardCount]udpSessionShard
+	lastConnWriteDeadlineNano atomic.Int64
+	_                         [56]byte
 }
 
 func newUDPSessionTable() *udpSessionTable {
@@ -97,19 +99,33 @@ func newUDPSessionTable() *udpSessionTable {
 	return t
 }
 
-func (t *udpSessionTable) shardFor(key udpSessionKey) *udpSessionShard {
+func (t *udpSessionTable) refreshConnWriteDeadline(conn net.PacketConn, timeout, refreshStep time.Duration) {
+	nowNano := time.Now().UnixNano()
+	last := t.lastConnWriteDeadlineNano.Load()
+	if nowNano-last >= int64(refreshStep) {
+		if t.lastConnWriteDeadlineNano.CompareAndSwap(last, nowNano) {
+			_ = conn.SetWriteDeadline(time.Unix(0, nowNano).Add(timeout))
+		}
+	}
+}
+
+func (t *udpSessionTable) shardIndexFor(key udpSessionKey) uint32 {
 	if key.addrPort.IsValid() {
 		p := uint32(key.addrPort.Port())
 		b := key.addrPort.Addr().As16()
 		h := (p * 2654435761) ^ uint32(b[15]) ^ (uint32(b[14]) << 8)
-		return &t.shards[h&(udpSessionShardCount-1)]
+		return h & (udpSessionShardCount - 1)
 	}
 	var h uint32 = 2166136261
 	for i := 0; i < len(key.fallback); i++ {
 		h ^= uint32(key.fallback[i])
 		h *= 16777619
 	}
-	return &t.shards[h&(udpSessionShardCount-1)]
+	return h & (udpSessionShardCount - 1)
+}
+
+func (t *udpSessionTable) shardFor(key udpSessionKey) *udpSessionShard {
+	return &t.shards[t.shardIndexFor(key)]
 }
 
 func (t *udpSessionTable) get(key udpSessionKey) *udpSession {
@@ -279,17 +295,24 @@ type ProxyStats struct {
 	ErrorCount       int64 // Total errors
 }
 
-// proxyStatsCounters pads hot atomic counters onto separate 64-byte cache lines
-// to prevent false sharing across CPU cores under high concurrency.
+const statsShardCount = 16
+
+type paddedAtomicInt64 struct {
+	val atomic.Int64
+	_   [56]byte
+}
+
+// proxyStatsCounters pads and stripes hot atomic counters across separate 64-byte cache lines
+// to eliminate cross-core false sharing and atomic contention under high concurrency.
 type proxyStatsCounters struct {
 	tcpConnections   atomic.Int64
 	_                [56]byte
-	udpPackets       atomic.Int64
-	_                [56]byte
-	bytesTransferred atomic.Int64
-	_                [56]byte
 	errorCount       atomic.Int64
 	_                [56]byte
+	nextShard        atomic.Uint32
+	_                [60]byte
+	udpPackets       [statsShardCount]paddedAtomicInt64
+	bytesTransferred [statsShardCount]paddedAtomicInt64
 }
 
 // Proxy manages TCP and UDP listeners and forwards traffic across configured tailnets.
@@ -583,18 +606,16 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 	var wg sync.WaitGroup
 
 	wg.Go(func() {
-		p.forwardStream(conn, destConn, port.Source, timeout)
+		p.forwardStreamBuffered(conn, destConn, port.Source, timeout)
 		if cw, ok := destConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 	})
 
-	wg.Go(func() {
-		p.forwardStream(destConn, conn, port.Source, timeout)
-		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-	})
+	p.forwardStreamBuffered(destConn, conn, port.Source, timeout)
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
 
 	wg.Wait()
 }
@@ -631,7 +652,11 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 	var closeLogOnce sync.Once
 	var readerWg sync.WaitGroup
 
-	for range numReaders {
+	for readerIdx := range numReaders {
+		shardIdx := uint32(readerIdx) & (statsShardCount - 1)
+		pktCounter := &p.stats.udpPackets[shardIdx].val
+		bytesCounter := &p.stats.bytesTransferred[shardIdx].val
+
 		readerWg.Go(func() {
 			readBuf := make([]byte, maxUDPBufferSize)
 			var pktCount uint32
@@ -674,7 +699,7 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 					continue
 				}
 
-				p.stats.udpPackets.Add(1)
+				pktCounter.Add(1)
 
 				var key udpSessionKey
 				if hasAddrPort {
@@ -691,7 +716,7 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 					pktCount++
 					written, writeErr := sess.destConn.Write(readBuf[:n])
 					if written > 0 {
-						p.stats.bytesTransferred.Add(int64(written))
+						bytesCounter.Add(int64(written))
 					}
 					if writeErr != nil {
 						table.remove(key, sess)
@@ -787,7 +812,8 @@ func (p *Proxy) handleUDPSessionSlowPath(
 	sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
 	bytesWritten, err := buf.WriteTo(sess.destConn)
 	if bytesWritten > 0 {
-		p.stats.bytesTransferred.Add(bytesWritten)
+		shardIdx := table.shardIndexFor(key) & (statsShardCount - 1)
+		p.stats.bytesTransferred[shardIdx].val.Add(bytesWritten)
 	}
 	if err != nil {
 		table.remove(key, sess)
@@ -827,7 +853,8 @@ func (p *Proxy) readUDPBackendSession(
 	defer respBuffer.Release()
 
 	data := respBuffer.data
-	var lastWriteDeadlineNano int64
+	shardIdx := (table.shardIndexFor(sess.key) + 8) & (statsShardCount - 1)
+	bytesCounter := &p.stats.bytesTransferred[shardIdx].val
 	var iter uint32
 
 	for {
@@ -839,11 +866,7 @@ func (p *Proxy) readUDPBackendSession(
 		bytesRead, err := sess.destConn.Read(data)
 		if bytesRead > 0 {
 			if iter&7 == 1 {
-				nowNano := time.Now().UnixNano()
-				if nowNano-lastWriteDeadlineNano >= int64(refreshStep) {
-					lastWriteDeadlineNano = nowNano
-					_ = conn.SetWriteDeadline(time.Unix(0, nowNano).Add(timeout))
-				}
+				table.refreshConnWriteDeadline(conn, timeout, refreshStep)
 			}
 
 			payload := data[:bytesRead]
@@ -860,7 +883,7 @@ func (p *Proxy) readUDPBackendSession(
 			}
 
 			if written > 0 {
-				p.stats.bytesTransferred.Add(int64(written))
+				bytesCounter.Add(int64(written))
 			}
 			if writeErr != nil {
 				if !isConnectionClosed(writeErr) {
@@ -894,6 +917,8 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 
 	data := buf.data
 	refreshStep := deadlineRefreshStep(timeout)
+	shardIdx := p.stats.nextShard.Add(1) & (statsShardCount - 1)
+	bytesCounter := &p.stats.bytesTransferred[shardIdx].val
 	var lastReadDeadlineNano int64
 	var lastWriteDeadlineNano int64
 	var iter uint32
@@ -920,9 +945,11 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 				n, writeErr := dst.Write(data[writtenTotal:bytesRead])
 				if n > 0 {
 					writtenTotal += n
-					p.stats.bytesTransferred.Add(int64(n))
 				}
 				if writeErr != nil {
+					if writtenTotal > 0 {
+						bytesCounter.Add(int64(writtenTotal))
+					}
 					if !isConnectionClosed(writeErr) {
 						p.stats.errorCount.Add(1)
 						log.Printf("Stream write error on port %d: %v", port, writeErr)
@@ -930,10 +957,14 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 					return
 				}
 				if n == 0 {
+					if writtenTotal > 0 {
+						bytesCounter.Add(int64(writtenTotal))
+					}
 					p.stats.errorCount.Add(1)
 					return
 				}
 			}
+			bytesCounter.Add(int64(writtenTotal))
 		}
 
 		if err != nil {
@@ -948,10 +979,15 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 
 // GetStats returns a snapshot of the proxy's performance statistics.
 func (p *Proxy) GetStats() ProxyStats {
+	var totalUDP, totalBytes int64
+	for i := range statsShardCount {
+		totalUDP += p.stats.udpPackets[i].val.Load()
+		totalBytes += p.stats.bytesTransferred[i].val.Load()
+	}
 	return ProxyStats{
 		TCPConnections:   p.stats.tcpConnections.Load(),
-		UDPPackets:       p.stats.udpPackets.Load(),
-		BytesTransferred: p.stats.bytesTransferred.Load(),
+		UDPPackets:       totalUDP,
+		BytesTransferred: totalBytes,
 		ErrorCount:       p.stats.errorCount.Load(),
 	}
 }
@@ -1116,7 +1152,10 @@ func (p *Proxy) startTCPListener(port PortMapping, key string) error {
 	}
 
 	listenAddr := port.ListenAddr()
-	listener, err := net.Listen("tcp", listenAddr)
+	lc := net.ListenConfig{
+		KeepAlive: 30 * time.Second,
+	}
+	listener, err := lc.Listen(p.ctx, "tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start TCP listener on %s: %w", listenAddr, err)
 	}
