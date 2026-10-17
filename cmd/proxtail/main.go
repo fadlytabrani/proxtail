@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -41,14 +41,9 @@ func newTailnetManager() *tailnetManager {
 
 // initializeServer creates and starts a tsnet.Server for a specific tailnet configuration.
 func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
-	authKeyEnvVar := tailnetCfg.AuthKey
-	if authKeyEnvVar == "" {
-		authKeyEnvVar = fmt.Sprintf("TS_AUTHKEY_%s", strings.ToUpper(tailnetCfg.Name))
-	}
-
-	authKey := os.Getenv(authKeyEnvVar)
-	if authKey == "" {
-		return nil, fmt.Errorf("environment variable %s not set", authKeyEnvVar)
+	authKey, err := tailnetCfg.ResolveAuthKey(tailnetCfg.Name == "default")
+	if err != nil {
+		return nil, err
 	}
 
 	ephemeral := tailnetCfg.IsEphemeral()
@@ -290,19 +285,31 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 	}
 }
 
-// resolveConfigPath determines the configuration file path from environment variables or defaults.
-func resolveConfigPath() string {
+// resolveConfigPath determines the configuration file path from CLI flag, environment variables,
+// a local ./config.yaml in the current working directory, or /etc/proxtail/config.yaml.
+func resolveConfigPath(flagConfig string) string {
+	if flagConfig != "" {
+		return flagConfig
+	}
 	if p := os.Getenv("PROXTAIL_CONFIG"); p != "" {
 		return p
 	}
 	if p := os.Getenv("TSNET_PROXY_CONFIG"); p != "" {
 		return p
 	}
+	if _, err := os.Stat("config.yaml"); err == nil {
+		return "config.yaml"
+	}
 	return "/etc/proxtail/config.yaml"
 }
 
 func main() {
-	configFile := resolveConfigPath()
+	var flagConfig string
+	flag.StringVar(&flagConfig, "config", "", "Path to configuration file")
+	flag.StringVar(&flagConfig, "c", "", "Path to configuration file (shorthand)")
+	flag.Parse()
+
+	configFile := resolveConfigPath(flagConfig)
 
 	cfg, err := config.Load(configFile)
 	if err != nil {
@@ -359,7 +366,6 @@ func main() {
 		portMappings,
 		tailnetServers,
 		cfg.Proxy.BufferSize*1024,
-		cfg.Proxy.QueueSize,
 		cfg.Proxy.WorkerPoolSize,
 	)
 
@@ -399,8 +405,8 @@ func main() {
 		}()
 	}
 
-	fmt.Printf("Starting proxtail with %d tailnets, %d workers, %dKB buffers, queue size %d...\n",
-		len(tailnetServers), cfg.Proxy.WorkerPoolSize, cfg.Proxy.BufferSize, cfg.Proxy.QueueSize)
+	fmt.Printf("Starting proxtail with %d tailnets, %d workers, %dKB buffers...\n",
+		len(tailnetServers), cfg.Proxy.WorkerPoolSize, cfg.Proxy.BufferSize)
 	fmt.Printf("Hot reload enabled - watching for config changes in: %s\n", configFile)
 	fmt.Printf("Manual reload available - send SIGHUP signal to trigger config reload\n")
 

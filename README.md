@@ -13,16 +13,11 @@ A high-performance Layer 4 (TCP/UDP) reverse proxy for Tailscale networks, writt
 
 ## Configuration Path
 
-By default, `proxtail` loads its configuration from `/etc/proxtail/config.yaml`.
-
-To specify a custom configuration file path, set `PROXTAIL_CONFIG` (or `TSNET_PROXY_CONFIG` for backward compatibility):
-
-```bash
-docker run -d \
-  -e PROXTAIL_CONFIG=/custom/path/config.yaml \
-  -p 8080:8080 -p 8081:8081 \
-  proxtail
-```
+`proxtail` resolves its configuration file in the following order:
+1. `-config` / `-c` command-line flag (`proxtail -c /path/to/config.yaml`)
+2. `PROXTAIL_CONFIG` (or `TSNET_PROXY_CONFIG`) environment variable
+3. `./config.yaml` in the current working directory (if present)
+4. `/etc/proxtail/config.yaml` (default in Docker)
 
 ## Hot Reload
 
@@ -32,45 +27,61 @@ docker run -d \
 
 During a reload:
 - The new configuration is parsed and validated before applying any changes.
-- Newly added tailnets are initialized, modified tailnets (`hostname`, `auth_key`, `ephemeral`) are reinitialized, and removed tailnets are gracefully closed.
+- Newly added tailnets are initialized, modified tailnets (`hostname`, `auth_key`, `control_url`, `ephemeral`) are reinitialized, and removed tailnets are gracefully closed.
 - Added, removed, and modified port listeners are updated incrementally while unaffected active connections continue uninterrupted.
-- Process-level `proxy` tuning parameters (`buffer_size`, `queue_size`, `worker_pool_size`, `enable_metrics`, `metrics_interval`) are initialized at startup and require a process restart to change.
+- Process-level `proxy` tuning parameters (`buffer_size`, `worker_pool_size`, `metrics_interval`) are initialized at startup and require a process restart to change.
 
 ## Configuration
+
+`proxtail` uses convention over configuration so most fields can be omitted:
+
+### Minimal Single-Tailnet Example
+
+```yaml
+tailnets:
+  - ports:
+      - port: 8080
+        destination: 'web-server' # Automatically forwards TCP :8080 -> web-server:8080
+```
+With a single tailnet, set `export TS_AUTHKEY="tskey-auth-xxxxx"` and run `proxtail`.
+
+### Multi-Tailnet & Full Options Example
 
 ```yaml
 tailnets:
   - name: 'production'
-    hostname: 'proxy-prod'       # Optional, defaults to <system-hostname>-<name>
-    auth_key: 'TS_AUTHKEY_PROD'  # Optional, defaults to TS_AUTHKEY_<UPPERCASE_NAME>
-    ephemeral: true              # Optional, defaults to true
+    hostname: 'proxy-prod'             # Optional, defaults to <system-hostname>-<name>
+    auth_key: 'TS_AUTHKEY_PRODUCTION'  # Optional, defaults to TS_AUTHKEY_<UPPERCASE_NAME> (or literal tskey-*)
+    control_url: ''                    # Optional, custom coordination server URL (e.g. Headscale)
+    ephemeral: true                    # Optional, defaults to true
     ports:
-      - protocol: 'tcp'
-        source_port: 8080
-        destination: 'web-server:8080'
-        timeout: 30              # Optional, defaults to 30 seconds
+      - port: 8080                     # Alias for source_port
+        destination: 'web-server'      # Omitting :port reuses source port (web-server:8080)
+      - port: 8443
+        destination: 'api-server:443'  # Explicit destination port
+        timeout: 45                    # Optional, defaults to 30 seconds
+      - port: 12345
+        destination: 'game-server'
+        protocol: 'udp'                # Optional, defaults to 'tcp'
 
   - name: 'staging'
     ports:
-      - protocol: 'udp'
-        source_port: 12345
-        destination: 'game-server:12345'
+      - port: 9080
+        destination: 'staging-web:8080'
 
 proxy:
-  buffer_size: 512      # Buffer size in KB (default: 512, valid: 1-8192)
-  queue_size: 100       # Queue size for connections/packets (default: 100, valid: 1-10000)
-  worker_pool_size: 200 # Max concurrent workers (default: 2x queue_size, valid: 1-10000)
-  enable_metrics: true  # Enable performance metrics logging (default: false)
-  metrics_interval: 30  # Metrics interval in seconds (default: 60, valid: 1-3600)
+  buffer_size: 512      # Optional: Buffer size in KB (default: 512, valid: 1-8192)
+  worker_pool_size: 200 # Optional: Max concurrent workers (default: 200, valid: 1-10000)
+  metrics_interval: 30  # Optional: Log metrics every N seconds (auto-enables metrics; omit to disable)
 ```
 
 ### Environment Variables
 
 ```bash
-export PROXTAIL_CONFIG="/path/to/config.yaml"
-export TS_AUTHKEY_PRODUCTION="tskey-auth-xxxxx"
+export TS_AUTHKEY="tskey-auth-xxxxx"            # Used automatically in single-tailnet mode
+export TS_AUTHKEY_PRODUCTION="tskey-auth-xxxxx" # Per-tailnet auth key (hyphens normalized to '_')
 export TS_AUTHKEY_STAGING="tskey-auth-yyyyy"
-export TS_STATE_DIR="/var/lib/tsnet" # Used when ephemeral: false
+export TS_STATE_DIR="/var/lib/tsnet"            # Used when ephemeral: false
 ```
 
 ## Building & Testing

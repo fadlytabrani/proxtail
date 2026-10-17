@@ -141,7 +141,6 @@ tailnets:
 		cfg.ToProxyPortMappings(),
 		servers,
 		64*1024,
-		50,
 		100,
 	)
 
@@ -239,17 +238,21 @@ func TestConfigWatcherDebouncedReloadSignal(t *testing.T) {
 func TestResolveConfigPath(t *testing.T) {
 	t.Setenv("PROXTAIL_CONFIG", "")
 	t.Setenv("TSNET_PROXY_CONFIG", "")
-	if got := resolveConfigPath(); got != "/etc/proxtail/config.yaml" {
+	if got := resolveConfigPath(""); got != "/etc/proxtail/config.yaml" {
 		t.Errorf("expected default path, got %q", got)
 	}
 
 	t.Setenv("TSNET_PROXY_CONFIG", "/legacy/config.yaml")
-	if got := resolveConfigPath(); got != "/legacy/config.yaml" {
+	if got := resolveConfigPath(""); got != "/legacy/config.yaml" {
 		t.Errorf("expected legacy path, got %q", got)
 	}
 
 	t.Setenv("PROXTAIL_CONFIG", "/custom/config.yaml")
-	if got := resolveConfigPath(); got != "/custom/config.yaml" {
+	if got := resolveConfigPath(""); got != "/custom/config.yaml" {
 		t.Errorf("expected custom path, got %q", got)
+	}
+
+	if got := resolveConfigPath("/flag/config.yaml"); got != "/flag/config.yaml" {
+		t.Errorf("expected CLI flag path to take precedence, got %q", got)
 	}
 }

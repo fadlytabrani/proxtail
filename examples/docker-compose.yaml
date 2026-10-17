@@ -7,12 +7,9 @@ services:
     container_name: proxtail
     restart: unless-stopped
 
-    # Environment variables for Tailscale configuration
+    # Tailscale auth keys (PROXTAIL_CONFIG and TS_STATE_DIR are preconfigured in the image)
     environment:
-      - PROXTAIL_CONFIG=/etc/proxtail/config.yaml
-      - TS_STATE_DIR=/var/lib/tsnet
-      # Add your Tailscale auth keys here:
-      - TS_AUTHKEY_PROD=tskey-auth-xxxxx
+      - TS_AUTHKEY_PRODUCTION=tskey-auth-xxxxx
       - TS_AUTHKEY_STAGING=tskey-auth-yyyyy
       - TS_AUTHKEY_DEVELOPMENT=tskey-auth-zzzzz
 

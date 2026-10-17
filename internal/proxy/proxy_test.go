@@ -75,7 +75,7 @@ func TestTCPForwardingAndHotReload(t *testing.T) {
 		"test-tailnet": &localDialer{},
 	}
 
-	p := NewProxyWithDialers(initialPorts, dialers, 64*1024, 50, 100)
+	p := NewProxyWithDialers(initialPorts, dialers, 64*1024, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -174,7 +174,7 @@ func TestUDPForwarding(t *testing.T) {
 		"test-tailnet": &localDialer{},
 	}
 
-	p := NewProxyWithDialers(ports, dialers, 64*1024, 50, 100)
+	p := NewProxyWithDialers(ports, dialers, 64*1024, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -255,7 +255,7 @@ func TestUDPConcurrentClientsAndMultiPacket(t *testing.T) {
 		"test-tailnet": &localDialer{},
 	}
 
-	p := NewProxyWithDialers(ports, dialers, 64*1024, 50, 100)
+	p := NewProxyWithDialers(ports, dialers, 64*1024, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -392,7 +392,7 @@ func TestStartRollbackOnPortConflict(t *testing.T) {
 		"test-tailnet": &localDialer{},
 	}
 
-	p := NewProxyWithDialers(ports, dialers, 64*1024, 50, 100)
+	p := NewProxyWithDialers(ports, dialers, 64*1024, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -476,7 +476,7 @@ func TestMultiTailnetRoutingAndLargePayload(t *testing.T) {
 	}
 
 	// Use a small 16KB buffer to exercise multi-chunk streaming with a 512KB payload
-	p := NewProxyWithDialers(ports, dialers, 16*1024, 50, 100)
+	p := NewProxyWithDialers(ports, dialers, 16*1024, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -606,7 +606,7 @@ func TestZeroDowntimeHotReloadModifyRemoveAndTailnetRestart(t *testing.T) {
 	}
 
 	dialers := map[string]Dialer{"t1": &localDialer{}}
-	p := NewProxyWithDialers(initialPorts, dialers, 32*1024, 50, 100)
+	p := NewProxyWithDialers(initialPorts, dialers, 32*1024, 100)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -701,7 +701,7 @@ func TestDialFailureIncrementsErrorStats(t *testing.T) {
 		},
 	}
 
-	p := NewProxyWithDialers(ports, map[string]Dialer{"t1": &localDialer{}}, 16*1024, 50, 100)
+	p := NewProxyWithDialers(ports, map[string]Dialer{"t1": &localDialer{}}, 16*1024, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = p.Start(ctx) }()
@@ -862,7 +862,7 @@ func TestMultiTailnetIsolationOverlappingDestinationsAndDynamicLifecycle(t *test
 		"tailnet-beta":  betaDialerV1,
 	}
 
-	p := NewProxyWithDialers(initialPorts, dialers, 32*1024, 50, 100)
+	p := NewProxyWithDialers(initialPorts, dialers, 32*1024, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = p.Start(ctx) }()
@@ -1018,7 +1018,7 @@ func BenchmarkTCPThroughput(b *testing.B) {
 		},
 	}
 
-	p := NewProxyWithDialers(ports, map[string]Dialer{"bench": &localDialer{}}, 256*1024, 200, 400)
+	p := NewProxyWithDialers(ports, map[string]Dialer{"bench": &localDialer{}}, 256*1024, 400)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = p.Start(ctx) }()
@@ -1085,7 +1085,7 @@ func BenchmarkUDPThroughput(b *testing.B) {
 		},
 	}
 
-	p := NewProxyWithDialers(ports, map[string]Dialer{"bench": &localDialer{}}, 256*1024, 500, 1000)
+	p := NewProxyWithDialers(ports, map[string]Dialer{"bench": &localDialer{}}, 256*1024, 1000)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = p.Start(ctx) }()

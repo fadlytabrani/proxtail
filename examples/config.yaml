@@ -1,63 +1,45 @@
 # Multi-tailnet proxtail configuration example
-# This file demonstrates all available configuration options
+# Convention over configuration:
+#   - hostname defaults to "<system-hostname>-<name>"
+#   - auth_key defaults to "TS_AUTHKEY_<NAME>" (or "TS_AUTHKEY" for a single tailnet)
+#   - ephemeral defaults to true
+#   - protocol defaults to "tcp"
+#   - destination port defaults to source_port/port if omitted (e.g., "web-server" -> "web-server:8080")
+#   - timeout defaults to 30 seconds
 
-# Define the tailnets you want to connect to
 tailnets:
-  - name: 'production' # Tailnet identifier (used in port mappings)
-    hostname: 'proxy-prod' # Custom hostname for this node
-    auth_key: 'TS_AUTHKEY_PROD' # Environment variable name for auth key
-    ephemeral: true # Ephemeral node (default: true)
+  - name: 'production'
     ports:
-      # Production web service (TCP with custom timeout)
-      - protocol: 'tcp' # Protocol (tcp or udp)
-        source_port: 8080 # Port to listen on
-        destination: 'web-server:8080' # Target service in Tailscale
-        timeout: 30 # Connection timeout in seconds
+      # Same port on proxy and target ("web-server" -> "web-server:8080", protocol defaults to tcp)
+      - port: 8080
+        destination: 'web-server'
 
-      # Production HTTPS service (longer timeout for SSL)
-      - protocol: 'tcp'
-        source_port: 8443 # HTTPS port
+      # Different target port with custom timeout
+      - port: 8443
         destination: 'api-server:443'
-        timeout: 45 # Longer timeout for SSL handshake
+        timeout: 45
 
-      # UDP service in production (gaming, streaming, etc.)
-      - protocol: 'udp'
-        source_port: 12345 # UDP port
-        destination: 'game-server:12345'
-        timeout: 10 # Short timeout for UDP
+      # UDP service (gaming, DNS, streaming, etc.)
+      - port: 12345
+        destination: 'game-server'
+        protocol: 'udp'
+        timeout: 10
 
-  - name: 'staging' # Second tailnet
-    hostname: 'proxy-staging'
-    auth_key: 'TS_AUTHKEY_STAGING'
-    ephemeral: true
+  - name: 'staging'
     ports:
-      # Staging service (uses defaults)
-      - protocol: 'tcp'
-        source_port: 9080 # Staging port
+      - port: 9080
         destination: 'staging-web:8080'
-        # timeout defaults to 30 seconds
 
-  - name: 'development' # Third tailnet
-    # hostname defaults to "$(hostname)-development" if not specified
-    # auth_key defaults to "TS_AUTHKEY_DEVELOPMENT" if not specified
-    # ephemeral defaults to true if not specified
+  - name: 'development'
     ports:
-      # Development service (minimal config)
-      - protocol: 'tcp'
-        source_port: 3000 # Development port
-        destination: 'dev-server:3000'
-        # All other options use defaults
+      - port: 3000
+        destination: 'dev-server'
 
-# Proxy performance and monitoring settings
+# Optional proxy tuning & monitoring (omit entirely to use defaults: 512KB buffer, 200 workers)
 proxy:
-  buffer_size: 512 # Buffer size in KB (default: 512)
-  queue_size: 100 # Queue size for connections/packets (default: 100)
-  worker_pool_size: 200 # Max concurrent workers (default: auto-calculated)
-  enable_metrics: true # Enable performance metrics logging (default: false)
-  metrics_interval: 30 # Metrics logging interval in seconds (default: 60)
+  metrics_interval: 30 # Log performance metrics every 30s (omit or set 0 to disable)
 
-# Environment variables needed for this configuration:
-# PROXTAIL_CONFIG=/path/to/config.yaml # Path to this config file
-# TS_AUTHKEY_PROD=tskey-auth-xxxxx # Production tailnet auth key
-# TS_AUTHKEY_STAGING=tskey-auth-yyyyy # Staging tailnet auth key
-# TS_AUTHKEY_DEVELOPMENT=tskey-auth-zzzzz # Development tailnet auth key
+# Environment variables for this configuration:
+#   TS_AUTHKEY_PRODUCTION=tskey-auth-xxxxx
+#   TS_AUTHKEY_STAGING=tskey-auth-yyyyy
+#   TS_AUTHKEY_DEVELOPMENT=tskey-auth-zzzzz

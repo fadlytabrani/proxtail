@@ -254,7 +254,6 @@ type proxyStatsCounters struct {
 type Proxy struct {
 	Ports          []PortMapping
 	BufferSize     int
-	QueueSize      int
 	bufPool        *sync.Pool
 	udpBufPool     *sync.Pool
 	tailnetDialers map[string]Dialer
@@ -273,42 +272,33 @@ type Proxy struct {
 }
 
 // NewProxy creates a new Proxy instance with default worker pool sizing.
-func NewProxy(ports []PortMapping, bufferSize int, queueSize int) *Proxy {
-	return NewProxyWithWorkerPool(ports, bufferSize, queueSize, 0)
+func NewProxy(ports []PortMapping, bufferSize int) *Proxy {
+	return NewProxyWithWorkerPool(ports, bufferSize, 0)
 }
 
 // NewProxyWithWorkerPool creates a new Proxy instance with custom worker pool size.
-func NewProxyWithWorkerPool(ports []PortMapping, bufferSize int, queueSize int, workerPoolSize int) *Proxy {
-	return NewProxyWithDialers(ports, nil, bufferSize, queueSize, workerPoolSize)
+func NewProxyWithWorkerPool(ports []PortMapping, bufferSize int, workerPoolSize int) *Proxy {
+	return NewProxyWithDialers(ports, nil, bufferSize, workerPoolSize)
 }
 
 // NewProxyWithMultiTailnet creates a new Proxy instance backed by a map of *tsnet.Server instances.
-func NewProxyWithMultiTailnet(ports []PortMapping, tailnetServers map[string]*tsnet.Server, bufferSize int, queueSize int, workerPoolSize int) *Proxy {
+func NewProxyWithMultiTailnet(ports []PortMapping, tailnetServers map[string]*tsnet.Server, bufferSize int, workerPoolSize int) *Proxy {
 	dialers := make(map[string]Dialer, len(tailnetServers))
 	for name, srv := range tailnetServers {
 		if srv != nil {
 			dialers[name] = srv
 		}
 	}
-	return NewProxyWithDialers(ports, dialers, bufferSize, queueSize, workerPoolSize)
+	return NewProxyWithDialers(ports, dialers, bufferSize, workerPoolSize)
 }
 
 // NewProxyWithDialers creates a new Proxy instance with custom Dialer implementations per tailnet.
-func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, bufferSize int, queueSize int, workerPoolSize int) *Proxy {
+func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, bufferSize int, workerPoolSize int) *Proxy {
 	if bufferSize <= 0 {
 		bufferSize = 512 * 1024
 	}
-	if queueSize <= 0 {
-		queueSize = 100
-	}
 	if workerPoolSize <= 0 {
-		workerPoolSize = queueSize * 2
-		if workerPoolSize < 50 {
-			workerPoolSize = 50
-		}
-		if workerPoolSize > 1000 {
-			workerPoolSize = 1000
-		}
+		workerPoolSize = 200
 	}
 
 	if tailnetDialers == nil {
@@ -338,7 +328,6 @@ func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, 
 	return &Proxy{
 		Ports:          ports,
 		BufferSize:     bufferSize,
-		QueueSize:      queueSize,
 		bufPool:        bufPool,
 		udpBufPool:     udpBufPool,
 		tailnetDialers: tailnetDialers,

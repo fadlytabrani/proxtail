@@ -40,28 +40,66 @@ func (t TailnetConfig) ConnectionSettingsEqual(other TailnetConfig) bool {
 		t.IsEphemeral() == other.IsEphemeral()
 }
 
+// ResolveAuthKey resolves the Tailscale auth key for this tailnet from:
+//  1. The environment variable named by AuthKey (or TS_AUTHKEY_<NAME> if unset),
+//  2. A literal "tskey-..." string if AuthKey was provided directly in YAML, or
+//  3. The standard TS_AUTHKEY environment variable when allowGlobalFallback is true (single-tailnet mode).
+func (t TailnetConfig) ResolveAuthKey(allowGlobalFallback bool) (string, error) {
+	keySpec := strings.TrimSpace(t.AuthKey)
+	if keySpec == "" {
+		keySpec = DefaultAuthKeyEnv(t.Name)
+	}
+	if val := strings.TrimSpace(os.Getenv(keySpec)); val != "" {
+		return val, nil
+	}
+	if strings.HasPrefix(keySpec, "tskey-") {
+		return keySpec, nil
+	}
+	if allowGlobalFallback {
+		if val := strings.TrimSpace(os.Getenv("TS_AUTHKEY")); val != "" {
+			return val, nil
+		}
+	}
+	return "", fmt.Errorf("environment variable %s not set", keySpec)
+}
+
 // PortMapping defines a port forwarding rule under a tailnet.
 type PortMapping struct {
-	Source            int    `yaml:"source_port"`       // Local source port to listen on (1-65535)
-	Destination       string `yaml:"destination"`       // Destination address in tailnet (e.g., "backend:8080")
-	Tailnet           string `yaml:"tailnet,omitempty"` // Populated automatically from parent TailnetConfig
-	Protocol          string `yaml:"protocol"`          // Protocol: "tcp" or "udp"
-	ConnectionTimeout int    `yaml:"timeout,omitempty"` // Connection timeout in seconds (default: 30)
+	Source            int    `yaml:"source_port,omitempty"` // Local source port to listen on (1-65535)
+	Port              int    `yaml:"port,omitempty"`        // Alias for source_port
+	Destination       string `yaml:"destination"`           // Destination in tailnet ("host:port" or "host" to reuse source_port)
+	Tailnet           string `yaml:"-"`                     // Populated automatically from parent TailnetConfig
+	Protocol          string `yaml:"protocol,omitempty"`    // Protocol: "tcp" or "udp" (default: "tcp")
+	ConnectionTimeout int    `yaml:"timeout,omitempty"`     // Connection timeout in seconds (default: 30)
 }
 
 // ProxySettings defines performance and monitoring settings for the proxy server.
 type ProxySettings struct {
 	BufferSize      int  `yaml:"buffer_size,omitempty"`      // Buffer size in KB (default: 512)
-	QueueSize       int  `yaml:"queue_size,omitempty"`       // Queue size for connections/packets (default: 100)
-	WorkerPoolSize  int  `yaml:"worker_pool_size,omitempty"` // Max concurrent workers (default: 2x queue_size)
-	EnableMetrics   bool `yaml:"enable_metrics,omitempty"`   // Enable performance metrics logging (default: false)
-	MetricsInterval int  `yaml:"metrics_interval,omitempty"` // Metrics logging interval in seconds (default: 60)
+	WorkerPoolSize  int  `yaml:"worker_pool_size,omitempty"` // Max concurrent workers (default: 200)
+	EnableMetrics   bool `yaml:"enable_metrics,omitempty"`   // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
+	MetricsInterval int  `yaml:"metrics_interval,omitempty"` // Metrics logging interval in seconds (default: 60 when metrics enabled)
 }
 
 // Config defines the structure for the YAML configuration file.
 type Config struct {
 	Tailnets []TailnetConfig `yaml:"tailnets"`
 	Proxy    ProxySettings   `yaml:"proxy"`
+}
+
+// DefaultAuthKeyEnv returns the canonical environment variable name for a tailnet's auth key,
+// normalizing hyphens and non-alphanumeric characters to underscores (e.g., "prod-us" -> "TS_AUTHKEY_PROD_US").
+func DefaultAuthKeyEnv(tailnetName string) string {
+	var b strings.Builder
+	b.WriteString("TS_AUTHKEY_")
+	for _, r := range strings.ToUpper(strings.TrimSpace(tailnetName)) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // Load reads, parses, applies defaults, and validates the YAML configuration file.
@@ -94,13 +132,12 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.Proxy.BufferSize <= 0 {
 		cfg.Proxy.BufferSize = 512 // Default: 512 KB
 	}
-	if cfg.Proxy.QueueSize <= 0 {
-		cfg.Proxy.QueueSize = 100 // Default: 100 connections/packets
-	}
 	if cfg.Proxy.WorkerPoolSize <= 0 {
-		cfg.Proxy.WorkerPoolSize = cfg.Proxy.QueueSize * 2 // Default: 2x queue size
+		cfg.Proxy.WorkerPoolSize = 200 // Default: 200 concurrent workers
 	}
-	if cfg.Proxy.MetricsInterval <= 0 {
+	if cfg.Proxy.MetricsInterval > 0 {
+		cfg.Proxy.EnableMetrics = true
+	} else {
 		cfg.Proxy.MetricsInterval = 60 // Default: 60 seconds
 	}
 
@@ -109,8 +146,13 @@ func ApplyDefaults(cfg *Config) {
 		sysHostname = "proxtail"
 	}
 
+	// If only a single tailnet is configured and its name is omitted, default to "default".
+	if len(cfg.Tailnets) == 1 && strings.TrimSpace(cfg.Tailnets[0].Name) == "" {
+		cfg.Tailnets[0].Name = "default"
+	}
+
 	for i := range cfg.Tailnets {
-		if cfg.Tailnets[i].Hostname == "" {
+		if cfg.Tailnets[i].Hostname == "" && cfg.Tailnets[i].Name != "" {
 			cfg.Tailnets[i].Hostname = fmt.Sprintf("%s-%s", sysHostname, cfg.Tailnets[i].Name)
 		}
 		if cfg.Tailnets[i].Ephemeral == nil {
@@ -118,12 +160,36 @@ func ApplyDefaults(cfg *Config) {
 			cfg.Tailnets[i].Ephemeral = &defaultEphemeral
 		}
 		if cfg.Tailnets[i].AuthKey == "" && cfg.Tailnets[i].Name != "" {
-			cfg.Tailnets[i].AuthKey = fmt.Sprintf("TS_AUTHKEY_%s", strings.ToUpper(cfg.Tailnets[i].Name))
+			defaultEnv := DefaultAuthKeyEnv(cfg.Tailnets[i].Name)
+			if len(cfg.Tailnets) == 1 && os.Getenv(defaultEnv) == "" && os.Getenv("TS_AUTHKEY") != "" {
+				cfg.Tailnets[i].AuthKey = "TS_AUTHKEY"
+			} else {
+				cfg.Tailnets[i].AuthKey = defaultEnv
+			}
 		}
 		for j := range cfg.Tailnets[i].Ports {
-			cfg.Tailnets[i].Ports[j].Tailnet = cfg.Tailnets[i].Name
-			if cfg.Tailnets[i].Ports[j].ConnectionTimeout <= 0 {
-				cfg.Tailnets[i].Ports[j].ConnectionTimeout = 30 // Default: 30 seconds
+			p := &cfg.Tailnets[i].Ports[j]
+			p.Tailnet = cfg.Tailnets[i].Name
+			if p.Source == 0 && p.Port != 0 {
+				p.Source = p.Port
+			}
+			if strings.TrimSpace(p.Protocol) == "" {
+				p.Protocol = "tcp"
+			} else {
+				p.Protocol = strings.ToLower(strings.TrimSpace(p.Protocol))
+			}
+			dest := strings.TrimSpace(p.Destination)
+			if dest != "" && p.Source > 0 && p.Source <= 65535 {
+				// If destination is a hostname/IP without a ":port" suffix (or bracketed IPv6 without port),
+				// default the destination port to the source port.
+				if !strings.Contains(dest, ":") || (strings.HasPrefix(dest, "[") && strings.HasSuffix(dest, "]")) {
+					p.Destination = fmt.Sprintf("%s:%d", dest, p.Source)
+				} else {
+					p.Destination = dest
+				}
+			}
+			if p.ConnectionTimeout <= 0 {
+				p.ConnectionTimeout = 30 // Default: 30 seconds
 			}
 		}
 	}
@@ -152,6 +218,9 @@ func Validate(cfg *Config) error {
 	for _, tailnet := range cfg.Tailnets {
 		for _, port := range tailnet.Ports {
 			totalPorts++
+			if port.Port != 0 && port.Source != port.Port {
+				return fmt.Errorf("conflicting source_port (%d) and port (%d) in tailnet %s", port.Source, port.Port, tailnet.Name)
+			}
 			if port.Source <= 0 || port.Source > 65535 {
 				return fmt.Errorf("invalid source port %d in tailnet %s: must be between 1 and 65535", port.Source, tailnet.Name)
 			}
@@ -161,7 +230,7 @@ func Validate(cfg *Config) error {
 			}
 			destHost, destPortStr, err := net.SplitHostPort(dest)
 			if err != nil || strings.TrimSpace(destHost) == "" {
-				return fmt.Errorf("invalid destination '%s' in tailnet %s, port %d: must be in host:port format", port.Destination, tailnet.Name, port.Source)
+				return fmt.Errorf("invalid destination '%s' in tailnet %s, port %d: must be in host:port or host format", port.Destination, tailnet.Name, port.Source)
 			}
 			destPort, err := strconv.Atoi(destPortStr)
 			if err != nil || destPort <= 0 || destPort > 65535 {
@@ -197,9 +266,6 @@ func Validate(cfg *Config) error {
 	if cfg.Proxy.BufferSize < 1 || cfg.Proxy.BufferSize > 8192 {
 		return fmt.Errorf("invalid buffer_size %d: must be between 1 and 8192 KB", cfg.Proxy.BufferSize)
 	}
-	if cfg.Proxy.QueueSize < 1 || cfg.Proxy.QueueSize > 10000 {
-		return fmt.Errorf("invalid queue_size %d: must be between 1 and 10000", cfg.Proxy.QueueSize)
-	}
 	if cfg.Proxy.WorkerPoolSize < 1 || cfg.Proxy.WorkerPoolSize > 10000 {
 		return fmt.Errorf("invalid worker_pool_size %d: must be between 1 and 10000", cfg.Proxy.WorkerPoolSize)
 	}
@@ -219,10 +285,14 @@ func (c *Config) ToProxyPortMappings() []proxy.PortMapping {
 			if timeout <= 0 {
 				timeout = 30
 			}
+			protocol := strings.ToLower(strings.TrimSpace(port.Protocol))
+			if protocol == "" {
+				protocol = "tcp"
+			}
 			mappings = append(mappings, proxy.PortMapping{
 				Source:            port.Source,
 				Destination:       port.Destination,
-				Protocol:          strings.ToLower(port.Protocol),
+				Protocol:          protocol,
 				Tailnet:           tailnet.Name,
 				ConnectionTimeout: timeout,
 			})
