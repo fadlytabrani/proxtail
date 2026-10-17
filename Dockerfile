@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage: Cross-compile natively on the host build platform for fast multi-arch builds
-FROM --platform=$BUILDPLATFORM golang:1.25.1-alpine3.22 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.24 AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH
@@ -21,7 +21,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o proxtail ./cmd/proxtail
 
 # Runtime stage: Lightweight Alpine image running as an unprivileged user
-FROM alpine:3.22
+FROM alpine:3.24
 
 # Install CA certificates for Tailscale control plane TLS verification
 RUN apk add --no-cache ca-certificates
