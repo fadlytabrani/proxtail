@@ -22,7 +22,7 @@ race:
 
 ## bench: Run synthetic socket TCP and UDP throughput benchmarks
 bench:
-	$(GO) test -run=^$$ -bench='^Benchmark(TCP|UDP|MultiTailnet)' -benchmem ./internal/proxy
+	$(GO) test -run=^$$ -bench='^Benchmark(TCP|UDP|Multi)' -benchmem ./internal/proxy
 
 ## bench-real: Run real end-to-end tsnet + WireGuard (ChaCha20-Poly1305 + gVisor) throughput benchmarks
 bench-real:

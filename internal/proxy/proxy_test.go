@@ -33,7 +33,7 @@ func (d *localDialer) Dial(ctx context.Context, network, address string) (net.Co
 
 func getFreeTCPPort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("failed to get free TCP port: %v", err)
 	}
@@ -43,7 +43,7 @@ func getFreeTCPPort(t *testing.T) int {
 
 func getFreeUDPPort(t *testing.T) int {
 	t.Helper()
-	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	c, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		t.Fatalf("failed to get free UDP port: %v", err)
 	}
@@ -1134,6 +1134,85 @@ func BenchmarkUDPThroughput(b *testing.B) {
 	}
 }
 
+func BenchmarkMultiClientParallelUDPThroughput(b *testing.B) {
+	backendConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to start backend UDP server: %v", err)
+	}
+	defer backendConn.Close()
+
+	backendUDP := backendConn.(*net.UDPConn)
+	_ = backendUDP.SetReadBuffer(4 * 1024 * 1024)
+	_ = backendUDP.SetWriteBuffer(4 * 1024 * 1024)
+
+	var readerWg sync.WaitGroup
+	for range 8 {
+		readerWg.Go(func() {
+			buf := make([]byte, 64*1024)
+			for {
+				n, addrPort, err := backendUDP.ReadFromUDPAddrPort(buf)
+				if err != nil {
+					return
+				}
+				_, _ = backendUDP.WriteToUDPAddrPort(buf[:n], addrPort)
+			}
+		})
+	}
+
+	u, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to get free UDP port: %v", err)
+	}
+	proxyUDPPort := u.LocalAddr().(*net.UDPAddr).Port
+	_ = u.Close()
+
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendConn.LocalAddr().String(),
+			Protocol:          "udp",
+			Tailnet:           "bench",
+			ConnectionTimeout: 30,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"bench": &localDialer{}}, 256*1024, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	payload := bytes.Repeat([]byte("U"), 1024)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		clientConn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort), 2*time.Second)
+		if err != nil {
+			b.Fatalf("failed to dial UDP proxy: %v", err)
+		}
+		defer clientConn.Close()
+
+		recvBuf := make([]byte, len(payload))
+		// Warm up session
+		_, _ = clientConn.Write(payload)
+		_, _ = io.ReadFull(clientConn, recvBuf)
+
+		for pb.Next() {
+			if _, err := clientConn.Write(payload); err != nil {
+				b.Fatalf("parallel udp write failed: %v", err)
+			}
+			if _, err := io.ReadFull(clientConn, recvBuf); err != nil {
+				b.Fatalf("parallel udp read failed: %v", err)
+			}
+		}
+	})
+}
+
 func BenchmarkMultiTailnetParallelTCPThroughput(b *testing.B) {
 	const numTailnets = 3
 	dialers := make(map[string]Dialer, numTailnets)
@@ -1574,4 +1653,96 @@ func BenchmarkRealTSNetWireGuardUDPThroughput(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkRealTSNetWireGuardUDPParallelThroughput measures multi-client concurrent UDP
+// datagram forwarding across a real encrypted tsnet WireGuard tunnel using the multi-core reader pool.
+func BenchmarkRealTSNetWireGuardUDPParallelThroughput(b *testing.B) {
+	proxyNode, backendNode, backendIP := startRealTSNetPair(b)
+
+	backendAddr := net.JoinHostPort(backendIP.String(), "5353")
+	backendPC, err := backendNode.ListenPacket("udp", backendAddr)
+	if err != nil {
+		b.Fatalf("backendNode.ListenPacket failed: %v", err)
+	}
+	defer backendPC.Close()
+
+	for range 8 {
+		go func() {
+			buf := make([]byte, 64*1024)
+			for {
+				n, addr, err := backendPC.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				_, _ = backendPC.WriteTo(buf[:n], addr)
+			}
+		}()
+	}
+
+	u, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to get free UDP port: %v", err)
+	}
+	proxyUDPPort := u.LocalAddr().(*net.UDPAddr).Port
+	_ = u.Close()
+
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "udp",
+			Tailnet:           "real-tsnet",
+			ConnectionTimeout: 60,
+		},
+	}
+
+	p := NewProxyWithMultiTailnet(ports, map[string]*tsnet.Server{"real-tsnet": proxyNode}, 512*1024, 200)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	payload := bytes.Repeat([]byte("U"), 1024)
+
+	// Warm up WireGuard tunnel with one UDP client before starting parallel workers
+	warmConn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort), 5*time.Second)
+	if err != nil {
+		b.Fatalf("warmup dial failed: %v", err)
+	}
+	warmBuf := make([]byte, len(payload))
+	for range 10 {
+		_ = warmConn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = warmConn.Write(payload)
+		if _, err := io.ReadFull(warmConn, warmBuf); err == nil {
+			break
+		}
+	}
+	_ = warmConn.Close()
+
+	b.SetBytes(int64(2 * len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		clientConn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort), 5*time.Second)
+		if err != nil {
+			b.Fatalf("parallel udp dial failed: %v", err)
+		}
+		defer clientConn.Close()
+
+		recvBuf := make([]byte, len(payload))
+		for pb.Next() {
+			if _, err := clientConn.Write(payload); err != nil {
+				b.Fatalf("parallel udp write failed: %v", err)
+			}
+			if _, err := io.ReadFull(clientConn, recvBuf); err != nil {
+				b.Fatalf("parallel udp read failed: %v", err)
+			}
+		}
+	})
+}
+
 

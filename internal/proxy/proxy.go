@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,28 +77,54 @@ func (s *udpSession) refreshDeadlinesIfNeeded(timeout, refreshStep time.Duration
 	}
 }
 
-type udpSessionTable struct {
+const udpSessionShardCount = 16
+
+type udpSessionShard struct {
 	mu       sync.RWMutex
 	sessions map[udpSessionKey]*udpSession
+	_        [32]byte // Pad shard to prevent false sharing across CPU cores
+}
+
+type udpSessionTable struct {
+	shards [udpSessionShardCount]udpSessionShard
 }
 
 func newUDPSessionTable() *udpSessionTable {
-	return &udpSessionTable{
-		sessions: make(map[udpSessionKey]*udpSession, 64),
+	t := &udpSessionTable{}
+	for i := range t.shards {
+		t.shards[i].sessions = make(map[udpSessionKey]*udpSession, 16)
 	}
+	return t
+}
+
+func (t *udpSessionTable) shardFor(key udpSessionKey) *udpSessionShard {
+	if key.addrPort.IsValid() {
+		p := uint32(key.addrPort.Port())
+		b := key.addrPort.Addr().As16()
+		h := (p * 2654435761) ^ uint32(b[15]) ^ (uint32(b[14]) << 8)
+		return &t.shards[h&(udpSessionShardCount-1)]
+	}
+	var h uint32 = 2166136261
+	for i := 0; i < len(key.fallback); i++ {
+		h ^= uint32(key.fallback[i])
+		h *= 16777619
+	}
+	return &t.shards[h&(udpSessionShardCount-1)]
 }
 
 func (t *udpSessionTable) get(key udpSessionKey) *udpSession {
-	t.mu.RLock()
-	s := t.sessions[key]
-	t.mu.RUnlock()
+	sh := t.shardFor(key)
+	sh.mu.RLock()
+	s := sh.sessions[key]
+	sh.mu.RUnlock()
 	return s
 }
 
 func (t *udpSessionTable) getOrCreate(key udpSessionKey, addrPort netip.AddrPort, hasAddrPort bool, clientAddr net.Addr) (*udpSession, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if existing, ok := t.sessions[key]; ok {
+	sh := t.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if existing, ok := sh.sessions[key]; ok {
 		return existing, false
 	}
 	sess := &udpSession{
@@ -107,26 +134,30 @@ func (t *udpSessionTable) getOrCreate(key udpSessionKey, addrPort netip.AddrPort
 		clientAddr:  clientAddr,
 		ready:       make(chan struct{}),
 	}
-	t.sessions[key] = sess
+	sh.sessions[key] = sess
 	return sess, true
 }
 
 func (t *udpSessionTable) remove(key udpSessionKey, target *udpSession) {
-	t.mu.Lock()
-	if current, ok := t.sessions[key]; ok && current == target {
-		delete(t.sessions, key)
+	sh := t.shardFor(key)
+	sh.mu.Lock()
+	if current, ok := sh.sessions[key]; ok && current == target {
+		delete(sh.sessions, key)
 	}
-	t.mu.Unlock()
+	sh.mu.Unlock()
 }
 
 func (t *udpSessionTable) closeAll() {
-	t.mu.Lock()
-	all := make([]*udpSession, 0, len(t.sessions))
-	for k, s := range t.sessions {
-		all = append(all, s)
-		delete(t.sessions, k)
+	var all []*udpSession
+	for i := range t.shards {
+		sh := &t.shards[i]
+		sh.mu.Lock()
+		for k, s := range sh.sessions {
+			all = append(all, s)
+			delete(sh.sessions, k)
+		}
+		sh.mu.Unlock()
 	}
-	t.mu.Unlock()
 
 	for _, s := range all {
 		s.close()
@@ -568,8 +599,9 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 	wg.Wait()
 }
 
-// forwardUDP reads UDP datagrams using zero-allocation ReadFromUDPAddrPort when available
-// and forwards packets inline for established sessions or dispatches new sessions to the worker pool.
+// forwardUDP reads UDP datagrams across a multi-core reader pool using zero-allocation
+// ReadFromUDPAddrPort when available, forwarding packets inline for established sessions
+// and dispatching new sessions to the bounded worker pool.
 func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping, conn net.PacketConn, sessionWg *sync.WaitGroup) {
 	timeoutSec := port.ConnectionTimeout
 	if timeoutSec <= 0 {
@@ -578,8 +610,9 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 	timeout := time.Duration(timeoutSec) * time.Second
 	refreshStep := deadlineRefreshStep(timeout)
 
-	log.Printf("UDP listening on %d and forwarding to %s (tailnet: %s) with connection timeout %ds",
-		port.Source, port.Destination, port.Tailnet, timeoutSec)
+	numReaders := min(max(runtime.GOMAXPROCS(0), 1), 8)
+	log.Printf("UDP listening on %d (%d reader workers) and forwarding to %s (tailnet: %s) with connection timeout %ds",
+		port.Source, numReaders, port.Destination, port.Tailnet, timeoutSec)
 
 	table := newUDPSessionTable()
 	defer table.closeAll()
@@ -590,89 +623,105 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 	defer stopClose()
 
 	udpConn, isUDPConn := conn.(*net.UDPConn)
-	readBuf := make([]byte, maxUDPBufferSize)
-	var pktCount uint32
-
-	for {
-		var (
-			n           int
-			addrPort    netip.AddrPort
-			hasAddrPort bool
-			clientAddr  net.Addr
-			err         error
-		)
-
-		if isUDPConn {
-			n, addrPort, err = udpConn.ReadFromUDPAddrPort(readBuf)
-			hasAddrPort = true
-		} else {
-			n, clientAddr, err = conn.ReadFrom(readBuf)
-			if uaddr, ok := clientAddr.(*net.UDPAddr); ok {
-				addrPort = uaddr.AddrPort()
-				hasAddrPort = true
-			}
-		}
-
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
-				log.Printf("UDP connection closed for port %d, exiting read loop", port.Source)
-				return
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			log.Printf("UDP read error on port %d: %v", port.Source, err)
-			continue
-		}
-
-		if n <= 0 {
-			continue
-		}
-
-		p.stats.udpPackets.Add(1)
-
-		var key udpSessionKey
-		if hasAddrPort {
-			key.addrPort = addrPort
-		} else {
-			key.fallback = clientAddr.String()
-		}
-
-		// Fast path: established UDP session forwards inline with zero allocations and zero goroutine spawns.
-		if sess := table.get(key); sess != nil && sess.readyOK.Load() {
-			if pktCount&7 == 0 {
-				sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
-			}
-			pktCount++
-			written, writeErr := sess.destConn.Write(readBuf[:n])
-			if written > 0 {
-				p.stats.bytesTransferred.Add(int64(written))
-			}
-			if writeErr != nil {
-				table.remove(key, sess)
-				sess.close()
-				if !isConnectionClosed(writeErr) {
-					p.stats.errorCount.Add(1)
-					log.Printf("UDP write to destination error on port %d: %v", port.Source, writeErr)
-				}
-			}
-			continue
-		}
-
-		// Slow path: new session (or session still dialing) is dispatched to the bounded worker pool.
-		pktBuf := p.udpBufPool.Get().(*OptimizedBuffer)
-		pktBuf.pool = p.udpBufPool
-		pktBuf.Reset()
-		_, _ = pktBuf.Write(readBuf[:n])
-
-		sessionWg.Add(1)
-		go func(buf *OptimizedBuffer, k udpSessionKey, ap netip.AddrPort, hasAP bool, cAddr net.Addr) {
-			defer sessionWg.Done()
-			p.acquireWorker()
-			defer p.releaseWorker()
-			p.handleUDPSessionSlowPath(ctx, dialer, port, conn, udpConn, isUDPConn, buf, k, ap, hasAP, cAddr, table, sessionWg, timeout, refreshStep)
-		}(pktBuf, key, addrPort, hasAddrPort, clientAddr)
+	if isUDPConn {
+		_ = udpConn.SetReadBuffer(4 * 1024 * 1024)
+		_ = udpConn.SetWriteBuffer(4 * 1024 * 1024)
 	}
+
+	var closeLogOnce sync.Once
+	var readerWg sync.WaitGroup
+
+	for range numReaders {
+		readerWg.Go(func() {
+			readBuf := make([]byte, maxUDPBufferSize)
+			var pktCount uint32
+
+			for {
+				var (
+					n           int
+					addrPort    netip.AddrPort
+					hasAddrPort bool
+					clientAddr  net.Addr
+					err         error
+				)
+
+				if isUDPConn {
+					n, addrPort, err = udpConn.ReadFromUDPAddrPort(readBuf)
+					hasAddrPort = true
+				} else {
+					n, clientAddr, err = conn.ReadFrom(readBuf)
+					if uaddr, ok := clientAddr.(*net.UDPAddr); ok {
+						addrPort = uaddr.AddrPort()
+						hasAddrPort = true
+					}
+				}
+
+				if err != nil {
+					if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+						closeLogOnce.Do(func() {
+							log.Printf("UDP connection closed for port %d, exiting read loop", port.Source)
+						})
+						return
+					}
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					}
+					log.Printf("UDP read error on port %d: %v", port.Source, err)
+					continue
+				}
+
+				if n <= 0 {
+					continue
+				}
+
+				p.stats.udpPackets.Add(1)
+
+				var key udpSessionKey
+				if hasAddrPort {
+					key.addrPort = addrPort
+				} else {
+					key.fallback = clientAddr.String()
+				}
+
+				// Fast path: established UDP session forwards inline with zero allocations and zero goroutine spawns.
+				if sess := table.get(key); sess != nil && sess.readyOK.Load() {
+					if pktCount&7 == 0 {
+						sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
+					}
+					pktCount++
+					written, writeErr := sess.destConn.Write(readBuf[:n])
+					if written > 0 {
+						p.stats.bytesTransferred.Add(int64(written))
+					}
+					if writeErr != nil {
+						table.remove(key, sess)
+						sess.close()
+						if !isConnectionClosed(writeErr) {
+							p.stats.errorCount.Add(1)
+							log.Printf("UDP write to destination error on port %d: %v", port.Source, writeErr)
+						}
+					}
+					continue
+				}
+
+				// Slow path: new session (or session still dialing) is dispatched to the bounded worker pool.
+				pktBuf := p.udpBufPool.Get().(*OptimizedBuffer)
+				pktBuf.pool = p.udpBufPool
+				pktBuf.Reset()
+				_, _ = pktBuf.Write(readBuf[:n])
+
+				sessionWg.Add(1)
+				go func(buf *OptimizedBuffer, k udpSessionKey, ap netip.AddrPort, hasAP bool, cAddr net.Addr) {
+					defer sessionWg.Done()
+					p.acquireWorker()
+					defer p.releaseWorker()
+					p.handleUDPSessionSlowPath(ctx, dialer, port, conn, udpConn, isUDPConn, buf, k, ap, hasAP, cAddr, table, sessionWg, timeout, refreshStep)
+				}(pktBuf, key, addrPort, hasAddrPort, clientAddr)
+			}
+		})
+	}
+
+	readerWg.Wait()
 }
 
 // handleUDPSessionSlowPath establishes a new UDP session (or waits for an in-flight dial) and writes the packet.
