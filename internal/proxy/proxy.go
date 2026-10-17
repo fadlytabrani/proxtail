@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,8 @@ import (
 
 	"tailscale.com/tsnet"
 )
+
+const maxUDPBufferSize = 64 * 1024
 
 // Dialer abstracts establishing outbound network connections over a tailnet.
 // *tsnet.Server implements this interface directly.
@@ -31,12 +34,24 @@ type listenerInfo struct {
 	wg       sync.WaitGroup
 }
 
+// udpSessionKey identifies a client UDP endpoint without heap allocations when using UDPAddrPort.
+type udpSessionKey struct {
+	addrPort netip.AddrPort
+	fallback string
+}
+
 // udpSession represents a per-client-address UDP flow to a tailnet destination.
 type udpSession struct {
-	key        string
-	clientAddr net.Addr
-	destConn   net.Conn
-	closeOnce  sync.Once
+	key              udpSessionKey
+	addrPort         netip.AddrPort
+	hasAddrPort      bool
+	clientAddr       net.Addr
+	destConn         net.Conn
+	ready            chan struct{}
+	readyOK          atomic.Bool
+	failed           atomic.Bool
+	lastDeadlineNano atomic.Int64
+	closeOnce        sync.Once
 }
 
 func (s *udpSession) close() {
@@ -45,6 +60,76 @@ func (s *udpSession) close() {
 			_ = s.destConn.Close()
 		}
 	})
+}
+
+func (s *udpSession) refreshDeadlinesIfNeeded(timeout, refreshStep time.Duration) {
+	now := time.Now()
+	nowNano := now.UnixNano()
+	last := s.lastDeadlineNano.Load()
+	if nowNano-last >= int64(refreshStep) {
+		if s.lastDeadlineNano.CompareAndSwap(last, nowNano) {
+			deadline := now.Add(timeout)
+			_ = s.destConn.SetWriteDeadline(deadline)
+			_ = s.destConn.SetReadDeadline(deadline)
+		}
+	}
+}
+
+type udpSessionTable struct {
+	mu       sync.RWMutex
+	sessions map[udpSessionKey]*udpSession
+}
+
+func newUDPSessionTable() *udpSessionTable {
+	return &udpSessionTable{
+		sessions: make(map[udpSessionKey]*udpSession, 64),
+	}
+}
+
+func (t *udpSessionTable) get(key udpSessionKey) *udpSession {
+	t.mu.RLock()
+	s := t.sessions[key]
+	t.mu.RUnlock()
+	return s
+}
+
+func (t *udpSessionTable) getOrCreate(key udpSessionKey, addrPort netip.AddrPort, hasAddrPort bool, clientAddr net.Addr) (*udpSession, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if existing, ok := t.sessions[key]; ok {
+		return existing, false
+	}
+	sess := &udpSession{
+		key:         key,
+		addrPort:    addrPort,
+		hasAddrPort: hasAddrPort,
+		clientAddr:  clientAddr,
+		ready:       make(chan struct{}),
+	}
+	t.sessions[key] = sess
+	return sess, true
+}
+
+func (t *udpSessionTable) remove(key udpSessionKey, target *udpSession) {
+	t.mu.Lock()
+	if current, ok := t.sessions[key]; ok && current == target {
+		delete(t.sessions, key)
+	}
+	t.mu.Unlock()
+}
+
+func (t *udpSessionTable) closeAll() {
+	t.mu.Lock()
+	all := make([]*udpSession, 0, len(t.sessions))
+	for k, s := range t.sessions {
+		all = append(all, s)
+		delete(t.sessions, k)
+	}
+	t.mu.Unlock()
+
+	for _, s := range all {
+		s.close()
+	}
 }
 
 // OptimizedBuffer provides efficient buffer management with pooling.
@@ -144,12 +229,25 @@ type PortMapping struct {
 	ConnectionTimeout int
 }
 
-// ProxyStats holds performance counters.
+// ProxyStats holds a snapshot of performance counters.
 type ProxyStats struct {
 	TCPConnections   int64 // Active TCP connections
 	UDPPackets       int64 // Total UDP packets processed
 	BytesTransferred int64 // Total bytes transferred
 	ErrorCount       int64 // Total errors
+}
+
+// proxyStatsCounters pads hot atomic counters onto separate 64-byte cache lines
+// to prevent false sharing across CPU cores under high concurrency.
+type proxyStatsCounters struct {
+	tcpConnections   atomic.Int64
+	_                [56]byte
+	udpPackets       atomic.Int64
+	_                [56]byte
+	bytesTransferred atomic.Int64
+	_                [56]byte
+	errorCount       atomic.Int64
+	_                [56]byte
 }
 
 // Proxy manages TCP and UDP listeners and forwards traffic across configured tailnets.
@@ -158,11 +256,12 @@ type Proxy struct {
 	BufferSize     int
 	QueueSize      int
 	bufPool        *sync.Pool
+	udpBufPool     *sync.Pool
 	tailnetDialers map[string]Dialer
 
 	// Performance optimization fields
 	workerPool chan struct{}
-	stats      *ProxyStats
+	stats      proxyStatsCounters
 
 	// Hot reload and lifecycle management
 	mu           sync.RWMutex
@@ -216,9 +315,21 @@ func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, 
 		tailnetDialers = make(map[string]Dialer)
 	}
 
-	bufPool := &sync.Pool{
+	var bufPool *sync.Pool
+	bufPool = &sync.Pool{
 		New: func() interface{} {
-			return NewOptimizedBuffer(bufferSize, nil)
+			return NewOptimizedBuffer(bufferSize, bufPool)
+		},
+	}
+
+	udpBufSize := bufferSize
+	if udpBufSize > maxUDPBufferSize {
+		udpBufSize = maxUDPBufferSize
+	}
+	var udpBufPool *sync.Pool
+	udpBufPool = &sync.Pool{
+		New: func() interface{} {
+			return NewOptimizedBuffer(udpBufSize, udpBufPool)
 		},
 	}
 
@@ -229,9 +340,9 @@ func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, 
 		BufferSize:     bufferSize,
 		QueueSize:      queueSize,
 		bufPool:        bufPool,
+		udpBufPool:     udpBufPool,
 		tailnetDialers: tailnetDialers,
 		workerPool:     make(chan struct{}, workerPoolSize),
-		stats:          &ProxyStats{},
 		tcpListeners:   make(map[string]*listenerInfo),
 		udpConns:       make(map[string]*listenerInfo),
 		ctx:            ctx,
@@ -278,6 +389,18 @@ func optimizeTCPConn(conn net.Conn) error {
 		}
 	}
 	return nil
+}
+
+// deadlineRefreshStep returns the coalesced interval at which socket deadlines should be refreshed.
+func deadlineRefreshStep(timeout time.Duration) time.Duration {
+	step := timeout / 4
+	if step < 100*time.Millisecond {
+		step = 100 * time.Millisecond
+	}
+	if step > timeout {
+		step = timeout
+	}
+	return step
 }
 
 // isConnectionClosed checks if an error represents a normal connection closure or idle timeout.
@@ -351,7 +474,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 	return nil
 }
 
-// forwardTCP accepts incoming TCP connections and dispatches them to the worker pool.
+// forwardTCP accepts incoming TCP connections and dispatches them directly to the worker pool.
 func (p *Proxy) forwardTCP(ctx context.Context, dialer Dialer, port PortMapping, listener net.Listener, connWg *sync.WaitGroup) {
 	timeoutSec := port.ConnectionTimeout
 	if timeoutSec <= 0 {
@@ -360,78 +483,43 @@ func (p *Proxy) forwardTCP(ctx context.Context, dialer Dialer, port PortMapping,
 	log.Printf("TCP listening on %d and forwarding to %s (tailnet: %s) with connection timeout %ds",
 		port.Source, port.Destination, port.Tailnet, timeoutSec)
 
-	connChan := make(chan net.Conn, p.QueueSize)
-
-	go func() {
-		defer close(connChan)
-		for {
-			select {
-			case <-ctx.Done():
-				log.Printf("TCP accept loop stopping for port %d due to context cancellation", port.Source)
-				return
-			default:
-				if tcpListener, ok := listener.(*net.TCPListener); ok {
-					_ = tcpListener.SetDeadline(time.Now().Add(100 * time.Millisecond))
-				}
-
-				conn, err := listener.Accept()
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue
-					}
-					if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
-						log.Printf("TCP listener closed for port %d, exiting accept loop", port.Source)
-						return
-					}
-					log.Printf("TCP accept error on port %d: %v", port.Source, err)
-					continue
-				}
-
-				select {
-				case connChan <- conn:
-				case <-ctx.Done():
-					_ = conn.Close()
-					return
-				default:
-					log.Printf("TCP queue full on port %d, dropping connection", port.Source)
-					_ = conn.Close()
-				}
-			}
-		}
-	}()
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = listener.Close()
+	})
+	defer stopClose()
 
 	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Stopping TCP listener on port %d", port.Source)
-			for c := range connChan {
-				_ = c.Close()
-			}
-			return
-		case conn, ok := <-connChan:
-			if !ok {
-				log.Printf("TCP accept loop exited for port %d", port.Source)
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+				log.Printf("TCP listener closed for port %d, exiting accept loop", port.Source)
 				return
 			}
-			connWg.Add(1)
-			go func(c net.Conn) {
-				defer connWg.Done()
-				p.acquireWorker()
-				defer p.releaseWorker()
-				p.handleTCPConnection(ctx, dialer, port, c)
-			}(conn)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			log.Printf("TCP accept error on port %d: %v", port.Source, err)
+			continue
 		}
+
+		connWg.Add(1)
+		go func(c net.Conn) {
+			defer connWg.Done()
+			p.acquireWorker()
+			defer p.releaseWorker()
+			p.handleTCPConnection(ctx, dialer, port, c)
+		}(conn)
 	}
 }
 
 // handleTCPConnection dials the destination over Tailscale and bridges both streams.
 func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port PortMapping, conn net.Conn) {
-	atomic.AddInt64(&p.stats.TCPConnections, 1)
-	defer atomic.AddInt64(&p.stats.TCPConnections, -1)
+	p.stats.tcpConnections.Add(1)
+	defer p.stats.tcpConnections.Add(-1)
 	defer conn.Close()
 
 	if err := optimizeTCPConn(conn); err != nil {
-		atomic.AddInt64(&p.stats.ErrorCount, 1)
+		p.stats.errorCount.Add(1)
 		log.Printf("TCP optimization error for port %d: %v", port.Source, err)
 	}
 
@@ -445,7 +533,7 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 	destConn, err := dialer.Dial(dialCtx, "tcp", port.Destination)
 	dialCancel()
 	if err != nil {
-		atomic.AddInt64(&p.stats.ErrorCount, 1)
+		p.stats.errorCount.Add(1)
 		log.Printf("TCP dial error to %s (tailnet %s): %v", port.Destination, port.Tailnet, err)
 		return
 	}
@@ -455,16 +543,11 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 		log.Printf("TCP optimization error for destination %s: %v", port.Destination, err)
 	}
 
-	connDone := make(chan struct{})
-	defer close(connDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-			_ = destConn.Close()
-		case <-connDone:
-		}
-	}()
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		_ = destConn.Close()
+	})
+	defer stopCancel()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -488,218 +571,254 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 	wg.Wait()
 }
 
-// forwardUDP reads UDP datagrams and dispatches them to the worker pool using a per-client session table.
+// forwardUDP reads UDP datagrams using zero-allocation ReadFromUDPAddrPort when available
+// and forwards packets inline for established sessions or dispatches new sessions to the worker pool.
 func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping, conn net.PacketConn, sessionWg *sync.WaitGroup) {
 	timeoutSec := port.ConnectionTimeout
 	if timeoutSec <= 0 {
 		timeoutSec = 30
 	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	refreshStep := deadlineRefreshStep(timeout)
+
 	log.Printf("UDP listening on %d and forwarding to %s (tailnet: %s) with connection timeout %ds",
 		port.Source, port.Destination, port.Tailnet, timeoutSec)
 
-	var sessions sync.Map // map[string]*udpSession
-	defer func() {
-		sessions.Range(func(key, value interface{}) bool {
-			if sess, ok := value.(*udpSession); ok {
-				sess.close()
-			}
-			sessions.Delete(key)
-			return true
-		})
-	}()
+	table := newUDPSessionTable()
+	defer table.closeAll()
 
-	type udpPacket struct {
-		buf  *OptimizedBuffer
-		addr net.Addr
-	}
-	packetChan := make(chan udpPacket, p.QueueSize)
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopClose()
 
-	go func() {
-		defer close(packetChan)
-		for {
-			select {
-			case <-ctx.Done():
-				log.Printf("UDP read loop stopping for port %d due to context cancellation", port.Source)
-				return
-			default:
-				_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-
-				buf := p.bufPool.Get().(*OptimizedBuffer)
-				buf.pool = p.bufPool
-
-				n, addr, err := conn.ReadFrom(buf.data)
-				if n > 0 {
-					buf.offset = 0
-					buf.length = n
-				}
-
-				if err != nil {
-					buf.Release()
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue
-					}
-					if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
-						log.Printf("UDP connection closed for port %d, exiting read loop", port.Source)
-						return
-					}
-					log.Printf("UDP read error on port %d: %v", port.Source, err)
-					continue
-				}
-
-				if n > 0 {
-					select {
-					case packetChan <- udpPacket{buf, addr}:
-					case <-ctx.Done():
-						buf.Release()
-						return
-					default:
-						log.Printf("UDP queue full on port %d, dropping packet", port.Source)
-						buf.Release()
-					}
-				} else {
-					buf.Release()
-				}
-			}
-		}
-	}()
+	udpConn, isUDPConn := conn.(*net.UDPConn)
+	readBuf := make([]byte, maxUDPBufferSize)
+	var pktCount uint32
 
 	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Stopping UDP listener on port %d", port.Source)
-			for pkt := range packetChan {
-				pkt.buf.Release()
+		var (
+			n           int
+			addrPort    netip.AddrPort
+			hasAddrPort bool
+			clientAddr  net.Addr
+			err         error
+		)
+
+		if isUDPConn {
+			n, addrPort, err = udpConn.ReadFromUDPAddrPort(readBuf)
+			hasAddrPort = true
+		} else {
+			n, clientAddr, err = conn.ReadFrom(readBuf)
+			if uaddr, ok := clientAddr.(*net.UDPAddr); ok {
+				addrPort = uaddr.AddrPort()
+				hasAddrPort = true
 			}
-			return
-		case pkt, ok := <-packetChan:
-			if !ok {
-				log.Printf("UDP read loop exited for port %d", port.Source)
+		}
+
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+				log.Printf("UDP connection closed for port %d, exiting read loop", port.Source)
 				return
 			}
-			sessionWg.Add(1)
-			go func(buf *OptimizedBuffer, addr net.Addr) {
-				defer sessionWg.Done()
-				p.acquireWorker()
-				defer p.releaseWorker()
-				p.handleUDPPacketOptimized(ctx, dialer, port, conn, buf, addr, &sessions, sessionWg)
-			}(pkt.buf, pkt.addr)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			log.Printf("UDP read error on port %d: %v", port.Source, err)
+			continue
 		}
+
+		if n <= 0 {
+			continue
+		}
+
+		p.stats.udpPackets.Add(1)
+
+		var key udpSessionKey
+		if hasAddrPort {
+			key.addrPort = addrPort
+		} else {
+			key.fallback = clientAddr.String()
+		}
+
+		// Fast path: established UDP session forwards inline with zero allocations and zero goroutine spawns.
+		if sess := table.get(key); sess != nil && sess.readyOK.Load() {
+			if pktCount&7 == 0 {
+				sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
+			}
+			pktCount++
+			written, writeErr := sess.destConn.Write(readBuf[:n])
+			if written > 0 {
+				p.stats.bytesTransferred.Add(int64(written))
+			}
+			if writeErr != nil {
+				table.remove(key, sess)
+				sess.close()
+				if !isConnectionClosed(writeErr) {
+					p.stats.errorCount.Add(1)
+					log.Printf("UDP write to destination error on port %d: %v", port.Source, writeErr)
+				}
+			}
+			continue
+		}
+
+		// Slow path: new session (or session still dialing) is dispatched to the bounded worker pool.
+		pktBuf := p.udpBufPool.Get().(*OptimizedBuffer)
+		pktBuf.pool = p.udpBufPool
+		pktBuf.Reset()
+		_, _ = pktBuf.Write(readBuf[:n])
+
+		sessionWg.Add(1)
+		go func(buf *OptimizedBuffer, k udpSessionKey, ap netip.AddrPort, hasAP bool, cAddr net.Addr) {
+			defer sessionWg.Done()
+			p.acquireWorker()
+			defer p.releaseWorker()
+			p.handleUDPSessionSlowPath(ctx, dialer, port, conn, udpConn, isUDPConn, buf, k, ap, hasAP, cAddr, table, sessionWg, timeout, refreshStep)
+		}(pktBuf, key, addrPort, hasAddrPort, clientAddr)
 	}
 }
 
-// handleUDPPacketOptimized forwards a UDP datagram to the destination using a dedicated per-client session.
-func (p *Proxy) handleUDPPacketOptimized(
+// handleUDPSessionSlowPath establishes a new UDP session (or waits for an in-flight dial) and writes the packet.
+func (p *Proxy) handleUDPSessionSlowPath(
 	ctx context.Context,
 	dialer Dialer,
 	port PortMapping,
 	conn net.PacketConn,
+	udpConn *net.UDPConn,
+	isUDPConn bool,
 	buf *OptimizedBuffer,
-	addr net.Addr,
-	sessions *sync.Map,
+	key udpSessionKey,
+	addrPort netip.AddrPort,
+	hasAddrPort bool,
+	clientAddr net.Addr,
+	table *udpSessionTable,
 	sessionWg *sync.WaitGroup,
+	timeout time.Duration,
+	refreshStep time.Duration,
 ) {
 	defer buf.Release()
 
-	atomic.AddInt64(&p.stats.UDPPackets, 1)
-
-	timeoutSec := port.ConnectionTimeout
-	if timeoutSec <= 0 {
-		timeoutSec = 30
-	}
-	timeout := time.Duration(timeoutSec) * time.Second
-
-	clientKey := addr.String()
-	var sess *udpSession
-
-	if existing, ok := sessions.Load(clientKey); ok {
-		sess = existing.(*udpSession)
-	} else {
+	sess, created := table.getOrCreate(key, addrPort, hasAddrPort, clientAddr)
+	if created {
 		dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 		destConn, err := dialer.Dial(dialCtx, "udp", port.Destination)
 		dialCancel()
 		if err != nil {
-			atomic.AddInt64(&p.stats.ErrorCount, 1)
+			sess.failed.Store(true)
+			close(sess.ready)
+			table.remove(key, sess)
+			p.stats.errorCount.Add(1)
 			log.Printf("UDP dial error to %s (tailnet %s): %v", port.Destination, port.Tailnet, err)
 			return
 		}
 
-		newSess := &udpSession{
-			key:        clientKey,
-			clientAddr: addr,
-			destConn:   destConn,
-		}
+		sess.destConn = destConn
+		now := time.Now()
+		sess.lastDeadlineNano.Store(now.UnixNano())
+		deadline := now.Add(timeout)
+		_ = destConn.SetWriteDeadline(deadline)
+		_ = destConn.SetReadDeadline(deadline)
 
-		actual, loaded := sessions.LoadOrStore(clientKey, newSess)
-		if loaded {
-			newSess.close()
-			sess = actual.(*udpSession)
-		} else {
-			sess = newSess
-			sessionWg.Add(1)
-			go func() {
-				defer sessionWg.Done()
-				p.readUDPBackendSession(ctx, port, conn, sess, sessions, timeout)
-			}()
+		sess.readyOK.Store(true)
+		close(sess.ready)
+
+		sessionWg.Add(1)
+		go func() {
+			defer sessionWg.Done()
+			p.readUDPBackendSession(ctx, port, conn, udpConn, isUDPConn, sess, table, timeout, refreshStep)
+		}()
+	} else {
+		select {
+		case <-sess.ready:
+			if sess.failed.Load() {
+				return
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 
-	now := time.Now()
-	_ = sess.destConn.SetWriteDeadline(now.Add(timeout))
-	_ = sess.destConn.SetReadDeadline(now.Add(timeout))
-
+	sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
 	bytesWritten, err := buf.WriteTo(sess.destConn)
 	if bytesWritten > 0 {
-		atomic.AddInt64(&p.stats.BytesTransferred, bytesWritten)
+		p.stats.bytesTransferred.Add(bytesWritten)
 	}
 	if err != nil {
-		sessions.CompareAndDelete(clientKey, sess)
+		table.remove(key, sess)
 		sess.close()
 		if !isConnectionClosed(err) {
-			atomic.AddInt64(&p.stats.ErrorCount, 1)
+			p.stats.errorCount.Add(1)
 			log.Printf("UDP write to destination error on port %d: %v", port.Source, err)
 		}
-		return
 	}
 }
 
 // readUDPBackendSession continuously reads backend UDP responses for a specific client session
-// and forwards them back to the client until the session times out or the listener stops.
+// and forwards them back to the client using zero-alloc WriteToUDPAddrPort when available.
 func (p *Proxy) readUDPBackendSession(
 	ctx context.Context,
 	port PortMapping,
 	conn net.PacketConn,
+	udpConn *net.UDPConn,
+	isUDPConn bool,
 	sess *udpSession,
-	sessions *sync.Map,
+	table *udpSessionTable,
 	timeout time.Duration,
+	refreshStep time.Duration,
 ) {
 	defer func() {
-		sessions.CompareAndDelete(sess.key, sess)
+		table.remove(sess.key, sess)
 		sess.close()
 	}()
 
-	respBuffer := p.bufPool.Get().(*OptimizedBuffer)
-	respBuffer.pool = p.bufPool
+	stopSession := context.AfterFunc(ctx, func() {
+		sess.close()
+	})
+	defer stopSession()
+
+	respBuffer := p.udpBufPool.Get().(*OptimizedBuffer)
+	respBuffer.pool = p.udpBufPool
 	defer respBuffer.Release()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+	data := respBuffer.data
+	var lastWriteDeadlineNano int64
+	var iter uint32
 
-		_ = sess.destConn.SetReadDeadline(time.Now().Add(timeout))
-		bytesRead, err := respBuffer.ReadFrom(sess.destConn)
+	for {
+		if iter&7 == 0 {
+			sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
+		}
+		iter++
+
+		bytesRead, err := sess.destConn.Read(data)
 		if bytesRead > 0 {
-			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-			written, writeErr := conn.WriteTo(respBuffer.Bytes(), sess.clientAddr)
-			if written > 0 {
-				atomic.AddInt64(&p.stats.BytesTransferred, int64(written))
+			if iter&7 == 1 {
+				nowNano := time.Now().UnixNano()
+				if nowNano-lastWriteDeadlineNano >= int64(refreshStep) {
+					lastWriteDeadlineNano = nowNano
+					_ = conn.SetWriteDeadline(time.Unix(0, nowNano).Add(timeout))
+				}
 			}
-			respBuffer.Reset()
+
+			payload := data[:bytesRead]
+			var (
+				written  int
+				writeErr error
+			)
+			if isUDPConn && sess.hasAddrPort {
+				written, writeErr = udpConn.WriteToUDPAddrPort(payload, sess.addrPort)
+			} else if sess.clientAddr != nil {
+				written, writeErr = conn.WriteTo(payload, sess.clientAddr)
+			} else {
+				written, writeErr = conn.WriteTo(payload, net.UDPAddrFromAddrPort(sess.addrPort))
+			}
+
+			if written > 0 {
+				p.stats.bytesTransferred.Add(int64(written))
+			}
 			if writeErr != nil {
 				if !isConnectionClosed(writeErr) {
-					atomic.AddInt64(&p.stats.ErrorCount, 1)
+					p.stats.errorCount.Add(1)
 					log.Printf("UDP write back to source error on port %d: %v", port.Source, writeErr)
 				}
 				return
@@ -708,7 +827,7 @@ func (p *Proxy) readUDPBackendSession(
 
 		if err != nil {
 			if !isConnectionClosed(err) {
-				atomic.AddInt64(&p.stats.ErrorCount, 1)
+				p.stats.errorCount.Add(1)
 				log.Printf("UDP read from destination error on port %d: %v", port.Source, err)
 			}
 			return
@@ -717,7 +836,7 @@ func (p *Proxy) readUDPBackendSession(
 }
 
 // forwardStream transfers data from src to dst using pooled OptimizedBuffers,
-// refreshing idle deadlines on each read/write and updating BytesTransferred in real time.
+// coalescing deadline refreshes and updating BytesTransferred in real time.
 func (p *Proxy) forwardStream(src, dst net.Conn, port int, timeout time.Duration) {
 	p.forwardStreamBuffered(src, dst, port, timeout)
 }
@@ -727,31 +846,53 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 	buf.pool = p.bufPool
 	defer buf.Release()
 
+	data := buf.data
+	refreshStep := deadlineRefreshStep(timeout)
+	var lastReadDeadlineNano int64
+	var lastWriteDeadlineNano int64
+	var iter uint32
+
 	for {
-		_ = src.SetReadDeadline(time.Now().Add(timeout))
-		bytesRead, err := buf.ReadFrom(src)
+		if iter&7 == 0 {
+			nowNano := time.Now().UnixNano()
+			if nowNano-lastReadDeadlineNano >= int64(refreshStep) {
+				lastReadDeadlineNano = nowNano
+				_ = src.SetReadDeadline(time.Unix(0, nowNano).Add(timeout))
+			}
+			if nowNano-lastWriteDeadlineNano >= int64(refreshStep) {
+				lastWriteDeadlineNano = nowNano
+				_ = dst.SetWriteDeadline(time.Unix(0, nowNano).Add(timeout))
+			}
+		}
+		iter++
+
+		bytesRead, err := src.Read(data)
 
 		if bytesRead > 0 {
-			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
-
-			bytesWritten, writeErr := buf.WriteTo(dst)
-			if bytesWritten > 0 {
-				atomic.AddInt64(&p.stats.BytesTransferred, bytesWritten)
-			}
-			if writeErr != nil {
-				if !isConnectionClosed(writeErr) {
-					atomic.AddInt64(&p.stats.ErrorCount, 1)
-					log.Printf("Stream write error on port %d: %v", port, writeErr)
+			writtenTotal := 0
+			for writtenTotal < bytesRead {
+				n, writeErr := dst.Write(data[writtenTotal:bytesRead])
+				if n > 0 {
+					writtenTotal += n
+					p.stats.bytesTransferred.Add(int64(n))
 				}
-				return
+				if writeErr != nil {
+					if !isConnectionClosed(writeErr) {
+						p.stats.errorCount.Add(1)
+						log.Printf("Stream write error on port %d: %v", port, writeErr)
+					}
+					return
+				}
+				if n == 0 {
+					p.stats.errorCount.Add(1)
+					return
+				}
 			}
-
-			buf.Reset()
 		}
 
 		if err != nil {
 			if !isConnectionClosed(err) {
-				atomic.AddInt64(&p.stats.ErrorCount, 1)
+				p.stats.errorCount.Add(1)
 				log.Printf("Stream read error on port %d: %v", port, err)
 			}
 			break
@@ -762,10 +903,10 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 // GetStats returns a snapshot of the proxy's performance statistics.
 func (p *Proxy) GetStats() ProxyStats {
 	return ProxyStats{
-		TCPConnections:   atomic.LoadInt64(&p.stats.TCPConnections),
-		UDPPackets:       atomic.LoadInt64(&p.stats.UDPPackets),
-		BytesTransferred: atomic.LoadInt64(&p.stats.BytesTransferred),
-		ErrorCount:       atomic.LoadInt64(&p.stats.ErrorCount),
+		TCPConnections:   p.stats.tcpConnections.Load(),
+		UDPPackets:       p.stats.udpPackets.Load(),
+		BytesTransferred: p.stats.bytesTransferred.Load(),
+		ErrorCount:       p.stats.errorCount.Load(),
 	}
 }
 
@@ -778,8 +919,8 @@ func (p *Proxy) ReloadConfig(newPorts []PortMapping) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	oldPortsMap := make(map[string]PortMapping)
-	newPortsMap := make(map[string]PortMapping)
+	oldPortsMap := make(map[string]PortMapping, len(p.Ports))
+	newPortsMap := make(map[string]PortMapping, len(newPorts))
 
 	for _, port := range p.Ports {
 		key := fmt.Sprintf("%d-%s", port.Source, strings.ToLower(port.Protocol))
@@ -850,7 +991,7 @@ func (p *Proxy) ReloadConfig(newPorts []PortMapping) error {
 	return nil
 }
 
-// StopTailnetPorts stops and restarts any active port listeners bound to the specified tailnets
+// RestartTailnetPorts stops and restarts any active port listeners bound to the specified tailnets
 // so they pick up newly replaced tailnet dialers.
 func (p *Proxy) RestartTailnetPorts(tailnetNames map[string]bool) error {
 	if len(tailnetNames) == 0 {

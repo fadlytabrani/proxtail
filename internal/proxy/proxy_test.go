@@ -726,3 +726,142 @@ func TestDialFailureIncrementsErrorStats(t *testing.T) {
 		t.Errorf("expected active TCPConnections to return to 0 after failed dial, got %d", stats.TCPConnections)
 	}
 }
+
+func BenchmarkTCPThroughput(b *testing.B) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendListener.Close()
+
+	go func() {
+		for {
+			conn, err := backendListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to get free port: %v", err)
+	}
+	proxyPort := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			Destination:       backendListener.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           "bench",
+			ConnectionTimeout: 30,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"bench": &localDialer{}}, 256*1024, 200, 400)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	clientConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+	if err != nil {
+		b.Fatalf("failed to dial proxy: %v", err)
+	}
+	defer clientConn.Close()
+
+	chunk := bytes.Repeat([]byte("X"), 64*1024)
+	recvBuf := make([]byte, len(chunk))
+
+	b.SetBytes(int64(len(chunk)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := clientConn.Write(chunk); err != nil {
+			b.Fatalf("write failed: %v", err)
+		}
+		if _, err := io.ReadFull(clientConn, recvBuf); err != nil {
+			b.Fatalf("read failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkUDPThroughput(b *testing.B) {
+	backendConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to start backend UDP server: %v", err)
+	}
+	defer backendConn.Close()
+
+	backendUDP := backendConn.(*net.UDPConn)
+	go func() {
+		buf := make([]byte, 64*1024)
+		for {
+			n, addrPort, err := backendUDP.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			_, _ = backendUDP.WriteToUDPAddrPort(buf[:n], addrPort)
+		}
+	}()
+
+	u, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("failed to get free UDP port: %v", err)
+	}
+	proxyUDPPort := u.LocalAddr().(*net.UDPAddr).Port
+	_ = u.Close()
+
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			Destination:       backendConn.LocalAddr().String(),
+			Protocol:          "udp",
+			Tailnet:           "bench",
+			ConnectionTimeout: 30,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"bench": &localDialer{}}, 256*1024, 500, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	clientConn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort), 2*time.Second)
+	if err != nil {
+		b.Fatalf("failed to dial UDP proxy: %v", err)
+	}
+	defer clientConn.Close()
+
+	payload := bytes.Repeat([]byte("U"), 1024)
+	recvBuf := make([]byte, len(payload))
+
+	// Warm up the UDP session before timing
+	_, _ = clientConn.Write(payload)
+	_, _ = io.ReadFull(clientConn, recvBuf)
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := clientConn.Write(payload); err != nil {
+			b.Fatalf("udp write failed: %v", err)
+		}
+		if _, err := io.ReadFull(clientConn, recvBuf); err != nil {
+			b.Fatalf("udp read failed: %v", err)
+		}
+	}
+}
