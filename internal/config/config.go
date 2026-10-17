@@ -192,6 +192,18 @@ func ApplyDefaults(cfg *Config) {
 		cfg.Proxy.MetricsInterval = 60 // Default: 60 seconds
 	}
 	cfg.Proxy.ListenAddress = strings.TrimSpace(cfg.Proxy.ListenAddress)
+	if cfg.Proxy.ListenAddress == "" {
+		cfg.Proxy.ListenAddress = strings.TrimSpace(os.Getenv("PROXTAIL_LISTEN_ADDRESS"))
+	}
+	if cfg.Proxy.HealthPort == 0 {
+		if hpStr := strings.TrimSpace(os.Getenv("PROXTAIL_HEALTH_PORT")); hpStr != "" {
+			if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
+				cfg.Proxy.HealthPort = hp
+			} else {
+				cfg.Proxy.HealthPort = -1 // Trigger validation error in Validate
+			}
+		}
+	}
 
 	sysHostname, err := os.Hostname()
 	if err != nil || sysHostname == "" {

@@ -47,18 +47,47 @@ func newTailnetManager() *tailnetManager {
 	}
 }
 
+// resolveTailnetDir determines a writable per-tailnet working directory for tsnet.Server
+// and reports whether a persisted tailscaled.state file already exists.
+// Even in ephemeral mode (which uses mem.Store for state), tsnet writes log configuration
+// and buffer files to Server.Dir (falling back to os.UserConfigDir() if Dir is empty, which
+// fails in Kubernetes when running with readOnlyRootFilesystem: true or without a HOME dir).
+func resolveTailnetDir(tailnetName string, ephemeral bool) (string, bool, error) {
+	stateDir := strings.TrimSpace(os.Getenv("TS_STATE_DIR"))
+	if stateDir != "" {
+		candidate := filepath.Join(stateDir, tailnetName)
+		if !ephemeral {
+			hasPersistedState := false
+			if _, err := os.Stat(filepath.Join(candidate, "tailscaled.state")); err == nil {
+				hasPersistedState = true
+			}
+			if err := os.MkdirAll(candidate, 0o700); err != nil {
+				return "", false, fmt.Errorf("creating tailnet state dir %s: %w", candidate, err)
+			}
+			return candidate, hasPersistedState, nil
+		}
+		if err := os.MkdirAll(candidate, 0o700); err == nil {
+			return candidate, false, nil
+		}
+	}
+
+	if ephemeral {
+		tmpCandidate := filepath.Join(os.TempDir(), "proxtail-tsnet", tailnetName)
+		if err := os.MkdirAll(tmpCandidate, 0o700); err != nil {
+			return "", false, fmt.Errorf("creating ephemeral tailnet dir %s: %w", tmpCandidate, err)
+		}
+		return tmpCandidate, false, nil
+	}
+
+	return "", false, nil
+}
+
 // initializeServer creates and starts a tsnet.Server for a specific tailnet configuration.
 func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 	ephemeral := tailnetCfg.IsEphemeral()
-	stateDir := os.Getenv("TS_STATE_DIR")
-	var tailnetDir string
-	hasPersistedState := false
-
-	if !ephemeral && stateDir != "" {
-		tailnetDir = filepath.Join(stateDir, tailnetCfg.Name)
-		if _, err := os.Stat(filepath.Join(tailnetDir, "tailscaled.state")); err == nil {
-			hasPersistedState = true
-		}
+	tailnetDir, hasPersistedState, err := resolveTailnetDir(tailnetCfg.Name, ephemeral)
+	if err != nil {
+		return nil, err
 	}
 
 	authKey, clientSecret, err := tailnetCfg.ResolveCredentials(tailnetCfg.Name == "default")
@@ -67,6 +96,7 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 	}
 
 	server := &tsnet.Server{
+		Dir:           tailnetDir,
 		Hostname:      tailnetCfg.Hostname,
 		AuthKey:       authKey,
 		ClientSecret:  clientSecret,
@@ -77,14 +107,9 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 		RunWebClient:  tailnetCfg.WebClient,
 	}
 
-	// Use in-memory store for ephemeral nodes, or persistent state directory for non-ephemeral nodes.
+	// Use in-memory store for ephemeral nodes so node state is never persisted across restarts.
 	if ephemeral {
 		server.Store = &mem.Store{}
-	} else if tailnetDir != "" {
-		if err := os.MkdirAll(tailnetDir, 0o700); err != nil {
-			return nil, fmt.Errorf("creating tailnet state dir %s: %w", tailnetDir, err)
-		}
-		server.Dir = tailnetDir
 	}
 
 	if err := server.Start(); err != nil {
@@ -318,9 +343,11 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 			if !ok {
 				return
 			}
-			if filepath.Base(event.Name) == configBase &&
-				event.Has(fsnotify.Write|fsnotify.Create|fsnotify.Rename) {
-				log.Printf("Config file change detected (%s), scheduling reload...", event.Op)
+			// Trigger reload on direct config file modifications or Kubernetes ConfigMap symlink swaps ("..data")
+			base := filepath.Base(event.Name)
+			if (base == configBase || base == "..data") &&
+				event.Has(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) {
+				log.Printf("Config file change detected (%s on %s), scheduling reload...", event.Op, base)
 				if debounceTimer == nil {
 					debounceTimer = time.NewTimer(100 * time.Millisecond)
 					debounceC = debounceTimer.C
@@ -367,7 +394,14 @@ type healthResponse struct {
 	Errors           int64                 `json:"errors"`
 }
 
-// newHealthHandler constructs an http.Handler serving /healthz (JSON) and /metrics (Prometheus text format).
+// readyResponse is the JSON payload returned by GET /readyz.
+type readyResponse struct {
+	Status          string `json:"status"`
+	ActiveListeners int    `json:"active_listeners"`
+	Tailnets        int    `json:"tailnets"`
+}
+
+// newHealthHandler constructs an http.Handler serving /healthz (liveness), /readyz (readiness), and /metrics (Prometheus).
 func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler {
 	mux := http.NewServeMux()
 
@@ -410,6 +444,24 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		})
 	})
 
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		servers := tm.snapshotServers()
+		activeListeners := proxyServer.ActiveListenerCount()
+		ready := proxyServer.IsReady() && (len(proxyServer.Ports) == 0 || len(servers) > 0)
+
+		w.Header().Set("Content-Type", "application/json")
+		status := "ready"
+		if !ready {
+			status = "not_ready"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(readyResponse{
+			Status:          status,
+			ActiveListeners: activeListeners,
+			Tailnets:        len(servers),
+		})
+	})
+
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		stats := proxyServer.GetStats()
 		servers := tm.snapshotServers()
@@ -431,6 +483,9 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		fmt.Fprintf(&b, "# HELP proxtail_tailnets_configured Number of currently active tailnet instances.\n")
 		fmt.Fprintf(&b, "# TYPE proxtail_tailnets_configured gauge\n")
 		fmt.Fprintf(&b, "proxtail_tailnets_configured %d\n", len(servers))
+		fmt.Fprintf(&b, "# HELP proxtail_listeners_active Number of currently bound local TCP and UDP listeners.\n")
+		fmt.Fprintf(&b, "# TYPE proxtail_listeners_active gauge\n")
+		fmt.Fprintf(&b, "proxtail_listeners_active %d\n", proxyServer.ActiveListenerCount())
 		_, _ = w.Write([]byte(b.String()))
 	})
 
@@ -461,11 +516,52 @@ func startHealthServer(ctx context.Context, listenAddress string, port int, prox
 	})
 
 	go func() {
-		log.Printf("Health & metrics server listening on %s (/healthz, /metrics)", addr)
+		log.Printf("Health & metrics server listening on %s (/healthz, /readyz, /metrics)", addr)
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("Health server error: %v", err)
 		}
 	}()
+
+	return nil
+}
+
+// runHealthCheck probes the running proxtail instance via its configured health port or TCP listeners.
+func runHealthCheck(cfg *config.Config) error {
+	probeHost := strings.TrimSpace(cfg.Proxy.ListenAddress)
+	if probeHost == "" || probeHost == "0.0.0.0" || probeHost == "::" {
+		probeHost = "127.0.0.1"
+	}
+
+	if cfg.Proxy.HealthPort > 0 {
+		url := fmt.Sprintf("http://%s/readyz", net.JoinHostPort(probeHost, strconv.Itoa(cfg.Proxy.HealthPort)))
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			return fmt.Errorf("health check request to %s failed: %w", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("health check endpoint %s returned status %d", url, resp.StatusCode)
+		}
+		return nil
+	}
+
+	// If health_port is not enabled, verify that at least one configured TCP listener is accepting connections.
+	for _, mapping := range cfg.ToProxyPortMappings() {
+		if mapping.Protocol == "tcp" {
+			host := strings.TrimSpace(mapping.ListenAddress)
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = "127.0.0.1"
+			}
+			target := net.JoinHostPort(host, strconv.Itoa(mapping.Source))
+			conn, err := net.DialTimeout("tcp", target, 2*time.Second)
+			if err != nil {
+				return fmt.Errorf("TCP listener probe on %s failed: %w", target, err)
+			}
+			_ = conn.Close()
+			return nil
+		}
+	}
 
 	return nil
 }
@@ -491,10 +587,12 @@ func resolveConfigPath(flagConfig string) string {
 func main() {
 	var flagConfig string
 	var flagValidate bool
+	var flagHealthCheck bool
 	flag.StringVar(&flagConfig, "config", "", "Path to configuration file")
 	flag.StringVar(&flagConfig, "c", "", "Path to configuration file (shorthand)")
 	flag.BoolVar(&flagValidate, "validate", false, "Validate configuration file and exit")
 	flag.BoolVar(&flagValidate, "check", false, "Validate configuration file and exit (shorthand)")
+	flag.BoolVar(&flagHealthCheck, "healthcheck", false, "Probe running proxtail instance health and exit")
 	flag.Parse()
 
 	configFile := resolveConfigPath(flagConfig)
@@ -502,6 +600,13 @@ func main() {
 	cfg, err := config.Load(configFile)
 	if err != nil {
 		log.Fatalf("Failed to load config from %s: %v", configFile, err)
+	}
+
+	if flagHealthCheck {
+		if err := runHealthCheck(cfg); err != nil {
+			log.Fatalf("Health check failed: %v", err)
+		}
+		return
 	}
 
 	portMappings := cfg.ToProxyPortMappings()

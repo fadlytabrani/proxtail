@@ -313,5 +313,134 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	if !strings.Contains(body, "proxtail_tailnets_configured 2") || !strings.Contains(body, "proxtail_tcp_connections_active 0") {
 		t.Errorf("unexpected /metrics output:\n%s", body)
 	}
+
+	// 3. Verify /readyz lifecycle (503 before Start when ports configured, 200 after Start, 503 after Stop)
+	freePort := getFreePort(t)
+	readyProxy := proxy.NewProxyWithMultiTailnet(
+		[]proxy.PortMapping{{Source: freePort, ListenAddress: "127.0.0.1", Destination: "100.64.0.1:8080", Protocol: "tcp", Tailnet: "production"}},
+		servers,
+		64*1024,
+		50,
+	)
+	readyHandler := newHealthHandler(readyProxy, tm)
+
+	// Before Start: not ready (503)
+	recNotReady := httptest.NewRecorder()
+	readyHandler.ServeHTTP(recNotReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recNotReady.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected /readyz 503 before listeners start, got %d", recNotReady.Code)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = readyProxy.Start(ctx) }()
+	defer readyProxy.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// After Start: ready (200)
+	recReady := httptest.NewRecorder()
+	readyHandler.ServeHTTP(recReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recReady.Code != http.StatusOK {
+		t.Fatalf("expected /readyz 200 OK after listeners start, got %d", recReady.Code)
+	}
+
+	// Verify runHealthCheck against running HTTP health server and TCP listener
+	healthPort := getFreePort(t)
+	if err := startHealthServer(ctx, "127.0.0.1", healthPort, readyProxy, tm); err != nil {
+		t.Fatalf("startHealthServer failed: %v", err)
+	}
+	cfgWithHealth := &config.Config{
+		Proxy: config.ProxySettings{ListenAddress: "127.0.0.1", HealthPort: healthPort},
+	}
+	if err := runHealthCheck(cfgWithHealth); err != nil {
+		t.Errorf("runHealthCheck with HealthPort failed: %v", err)
+	}
+
+	// After Stop: not ready (503)
+	readyProxy.Stop()
+	recStopped := httptest.NewRecorder()
+	readyHandler.ServeHTTP(recStopped, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recStopped.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected /readyz 503 after Stop, got %d", recStopped.Code)
+	}
 }
+
+func TestConfigWatcherKubernetesConfigMapSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	v1Dir := filepath.Join(tmpDir, "..2026_10_17_01")
+	v2Dir := filepath.Join(tmpDir, "..2026_10_17_02")
+	if err := os.MkdirAll(v1Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(v2Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(v1Dir, "config.yaml"), []byte("v: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(v2Dir, "config.yaml"), []byte("v: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dataLink := filepath.Join(tmpDir, "..data")
+	cfgLink := filepath.Join(tmpDir, "config.yaml")
+	if err := os.Symlink(v1Dir, dataLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..data", "config.yaml"), cfgLink); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reloadChan := make(chan struct{}, 1)
+	go startConfigWatcher(ctx, cfgLink, reloadChan)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Simulate Kubernetes AtomicWriter: create ..data_tmp, rename over ..data, and remove old version dir
+	tmpLink := filepath.Join(tmpDir, "..data_tmp")
+	if err := os.Symlink(v2Dir, tmpLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpLink, dataLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(v1Dir); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-reloadChan:
+		// Success: Kubernetes ConfigMap ..data atomic swap triggered reload
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reload signal after Kubernetes ..data symlink swap")
+	}
+}
+
+func TestResolveTailnetDirReadOnlyFallback(t *testing.T) {
+	// Point TS_STATE_DIR at a non-writable path (e.g. a file instead of a directory) to simulate readOnlyRootFilesystem
+	tmpFile := filepath.Join(t.TempDir(), "unwritable-file")
+	if err := os.WriteFile(tmpFile, []byte("x"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TS_STATE_DIR", tmpFile)
+
+	// Ephemeral mode should gracefully fall back to os.TempDir()
+	dir, hasState, err := resolveTailnetDir("prod", true)
+	if err != nil {
+		t.Fatalf("expected ephemeral resolveTailnetDir to fall back to TempDir, got error: %v", err)
+	}
+	if hasState || dir == "" {
+		t.Errorf("unexpected result from resolveTailnetDir: dir=%q hasState=%v", dir, hasState)
+	}
+
+	// Non-ephemeral mode must fail when TS_STATE_DIR is not writable
+	if _, _, err := resolveTailnetDir("prod", false); err == nil {
+		t.Errorf("expected non-ephemeral resolveTailnetDir to fail when TS_STATE_DIR is unwritable")
+	}
+}
+
 

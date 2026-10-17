@@ -26,19 +26,24 @@ FROM alpine:3.24
 # Install CA certificates for Tailscale control plane TLS verification
 RUN apk add --no-cache ca-certificates
 
-# Create non-root user and directories for configuration and persistent Tailscale state
-RUN addgroup -S proxtail && adduser -S -G proxtail proxtail && \
+# Create non-root user with fixed numeric UID/GID (10001:10001) for Kubernetes runAsNonRoot compatibility
+RUN addgroup -g 10001 -S proxtail && \
+    adduser -u 10001 -S -G proxtail -h /var/lib/tsnet proxtail && \
     mkdir -p /etc/proxtail /var/lib/tsnet && \
-    chown -R proxtail:proxtail /etc/proxtail /var/lib/tsnet
+    chown -R 10001:10001 /etc/proxtail /var/lib/tsnet
 
 ENV TS_STATE_DIR=/var/lib/tsnet
 ENV PROXTAIL_CONFIG=/etc/proxtail/config.yaml
 
 # Copy compiled binary and default example configuration
 COPY --from=builder /app/proxtail /usr/local/bin/proxtail
-COPY --from=builder --chown=proxtail:proxtail /app/examples/config.yaml /etc/proxtail/config.yaml
+COPY --from=builder --chown=10001:10001 /app/examples/config.yaml /etc/proxtail/config.yaml
 
-USER proxtail
+# Numeric UID:GID required by Kubernetes securityContext.runAsNonRoot: true
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/proxtail", "-healthcheck"]
 
 # Exec form ensures SIGTERM and SIGHUP reach proxtail directly for graceful shutdown and hot reload
 CMD ["/usr/local/bin/proxtail"]

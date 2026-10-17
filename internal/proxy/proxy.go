@@ -1138,6 +1138,23 @@ func (p *Proxy) stopAllListenersLocked() {
 	}
 }
 
+// ActiveListenerCount returns the total number of currently bound TCP and UDP listeners.
+func (p *Proxy) ActiveListenerCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.tcpListeners) + len(p.udpConns)
+}
+
+// IsReady reports whether the proxy is running and all configured port listeners are bound.
+func (p *Proxy) IsReady() bool {
+	if p.ctx.Err() != nil {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.Ports) == 0 || (len(p.tcpListeners)+len(p.udpConns) >= len(p.Ports))
+}
+
 // Stop gracefully stops the proxy and all active TCP/UDP listeners.
 // Calling Stop multiple times is safe and idempotent.
 func (p *Proxy) Stop() {

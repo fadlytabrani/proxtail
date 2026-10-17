@@ -381,3 +381,32 @@ proxy:
 	}
 }
 
+func TestProxyEnvOverrides(t *testing.T) {
+	t.Setenv("PROXTAIL_HEALTH_PORT", "9091")
+	t.Setenv("PROXTAIL_LISTEN_ADDRESS", "127.0.0.1")
+
+	yamlData := []byte(`
+tailnets:
+  - ports:
+      - port: 8080
+        destination: 'web-server'
+`)
+	cfg, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if cfg.Proxy.HealthPort != 9091 {
+		t.Errorf("expected HealthPort=9091 from PROXTAIL_HEALTH_PORT, got %d", cfg.Proxy.HealthPort)
+	}
+	if cfg.Proxy.ListenAddress != "127.0.0.1" {
+		t.Errorf("expected ListenAddress='127.0.0.1' from PROXTAIL_LISTEN_ADDRESS, got %q", cfg.Proxy.ListenAddress)
+	}
+
+	// Verify invalid PROXTAIL_HEALTH_PORT fails validation
+	t.Setenv("PROXTAIL_HEALTH_PORT", "not-a-port")
+	if _, err := Parse(yamlData); err == nil {
+		t.Errorf("expected Parse to fail on invalid PROXTAIL_HEALTH_PORT")
+	}
+}
+
+

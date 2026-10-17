@@ -179,7 +179,7 @@ tailnets:
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `listen_address` | `string` | `""` *(all interfaces)* | Default local bind IP for all forwarded ports and the health server (e.g., `"127.0.0.1"`). |
-| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz` (JSON status + Tailscale IPs) and `/metrics` (Prometheus exposition format). |
+| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz` (liveness), `/readyz` (readiness), and `/metrics` (Prometheus). |
 | `metrics_interval` | `int` | Disabled (`60` if enabled) | Log `METRICS:` summary every `N` seconds (`1`–`3600`). Setting this automatically enables metrics. |
 | `enable_metrics` | `bool` | `false` | Explicitly enable/disable periodic metrics logging. |
 | `buffer_size` | `int` | `512` | Per-connection I/O buffer size in KB (`1`–`8192`). |
@@ -191,11 +191,40 @@ tailnets:
 | :--- | :--- |
 | `-c`, `-config <path>` | Path to the YAML configuration file. |
 | `-validate`, `-check` | Validate configuration syntax and port rules, then exit (`0` if valid, `1` on error). |
+| `-healthcheck` | Probe the running `proxtail` instance (`/readyz` or TCP listener) and exit (`0` if healthy, `1` on error). |
 | `TS_AUTHKEY` / `TS_CLIENT_SECRET` | Default Tailscale auth key or OAuth client secret used in single-tailnet mode. |
 | `TS_AUTHKEY_<NAME>` | Per-tailnet auth key (`<NAME>` is uppercase with hyphens/dots replaced by `_`). |
 | `TS_CLIENT_SECRET_<NAME>` | Per-tailnet OAuth client secret (`tskey-client-...`) for non-expiring node registration. |
 | `PROXTAIL_CONFIG` | Path to the YAML configuration file. |
-| `TS_STATE_DIR` | Directory used to persist Tailscale state when `ephemeral: false` (default in Docker: `/var/lib/tsnet`). |
+| `PROXTAIL_HEALTH_PORT` | Enables `/healthz`, `/readyz`, and `/metrics` on the specified TCP port when `health_port` is omitted in YAML. |
+| `PROXTAIL_LISTEN_ADDRESS` | Sets the default `proxy.listen_address` when omitted in YAML. |
+| `TS_STATE_DIR` | Directory used for Tailscale state/logs (default in container: `/var/lib/tsnet`). |
+
+---
+
+## Kubernetes Deployment
+
+`proxtail` is purpose-built for Kubernetes and complies out of the box with the **Kubernetes Pod Security Standards `restricted` profile**:
+- **Numeric Non-Root User (`10001:10001`)**: Runs with `USER 10001:10001` so `securityContext.runAsNonRoot: true` works without requiring root privileges or `CAP_NET_ADMIN`.
+- **Read-Only Root Filesystem (`readOnlyRootFilesystem: true`)**: Works cleanly with an `emptyDir` mounted at `/var/lib/tsnet` and `/tmp` (or a `PersistentVolumeClaim` when `ephemeral: false`).
+- **ConfigMap Hot Reload**: Mounting a `ConfigMap` at `/etc/proxtail` automatically triggers a zero-downtime configuration reload whenever Kubernetes swaps the `..data` symlink after a `kubectl apply`.
+- **Native Liveness, Readiness & Prometheus Endpoints**:
+  - `GET /healthz`: Liveness probe returning JSON status and Tailscale IPs.
+  - `GET /readyz`: Readiness probe returning `200 OK` only when all configured listeners are bound and active (`503 Service Unavailable` during startup and graceful `SIGTERM` drain).
+  - `GET /metrics`: Prometheus metrics endpoint (`proxtail_tcp_connections_active`, `proxtail_udp_packets_total`, `proxtail_bytes_transferred_total`, `proxtail_errors_total`, `proxtail_tailnets_configured`, `proxtail_listeners_active`).
+
+A complete production manifest (`ConfigMap`, `Secret`, `Deployment`, and `Service`) is included in [`examples/kubernetes.yaml`](examples/kubernetes.yaml):
+
+```bash
+# 1. Edit examples/kubernetes.yaml or create your Secret with Tailscale auth keys / OAuth secrets
+kubectl apply -f examples/kubernetes.yaml
+
+# 2. Check rollout status and readiness
+kubectl rollout status deployment/proxtail
+
+# 3. Update port mappings at any time — Kubernetes ConfigMap sync triggers automatic hot reload
+kubectl apply -f examples/kubernetes.yaml
+```
 
 ---
 
@@ -209,7 +238,7 @@ proxtail -validate -c config.yaml
 
 ### Zero-Downtime Hot Reload
 You can add, remove, or update ports and tailnets without restarting `proxtail`:
-- **Automatic**: `proxtail` watches the configuration directory and automatically reloads within 100ms when `config.yaml` is saved or atomically replaced.
+- **Automatic**: `proxtail` watches the configuration directory and automatically reloads within 100ms when `config.yaml` is saved, atomically replaced, or updated via a Kubernetes `ConfigMap` volume.
 - **Manual Signal (`SIGHUP`)**:
   ```bash
   # Docker
@@ -220,10 +249,11 @@ You can add, remove, or update ports and tailnets without restarting `proxtail`:
   ```
 - **Safe Rollback**: If a modified `config.yaml` contains a syntax or validation error, `proxtail` logs the error and keeps the existing configuration and active connections running uninterrupted.
 
-### Health Checks & Prometheus Metrics
-When `health_port` is configured (e.g., `health_port: 9090` under `proxy:`):
-- **`GET /healthz`**: Returns JSON health status, active counters, and each tailnet's assigned Tailscale IPv4/IPv6 addresses.
-- **`GET /metrics`**: Exposes Prometheus metrics (`proxtail_tcp_connections_active`, `proxtail_udp_packets_total`, `proxtail_bytes_transferred_total`, `proxtail_errors_total`, `proxtail_tailnets_configured`).
+### Health Checks, Readiness & Prometheus Metrics
+When `health_port` is configured (in `config.yaml` or via `PROXTAIL_HEALTH_PORT=9090`):
+- **`GET /healthz`**: Returns JSON liveness status, active counters, and each tailnet's assigned Tailscale IPv4/IPv6 addresses.
+- **`GET /readyz`**: Returns `200 OK` (`{"status":"ready",...}`) when all listeners are bound and ready to accept traffic, or `503 Service Unavailable` during startup/shutdown.
+- **`GET /metrics`**: Exposes Prometheus metrics (`proxtail_tcp_connections_active`, `proxtail_udp_packets_total`, `proxtail_bytes_transferred_total`, `proxtail_errors_total`, `proxtail_tailnets_configured`, `proxtail_listeners_active`).
 
 When `metrics_interval` is set (e.g., `metrics_interval: 30`), `proxtail` also logs periodic traffic summaries:
 ```text

@@ -1,0 +1,169 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxtail-config
+  labels:
+    app.kubernetes.io/name: proxtail
+data:
+  config.yaml: |
+    tailnets:
+      - name: 'production'
+        tags:
+          - 'tag:k8s-proxy'
+        ports:
+          - port: 8080
+            destination: 'web-server'
+          - port: 8443
+            destination: 'api-server:443'
+
+      - name: 'staging'
+        tags:
+          - 'tag:k8s-proxy'
+        ports:
+          - port: 9080
+            destination: 'staging-web:8080'
+
+    proxy:
+      health_port: 9090
+      metrics_interval: 60
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: proxtail-secrets
+  labels:
+    app.kubernetes.io/name: proxtail
+type: Opaque
+stringData:
+  # Provide either Tailscale auth keys (tskey-auth-...) or OAuth client secrets (tskey-client-...)
+  TS_AUTHKEY_PRODUCTION: "tskey-auth-replace-with-production-key"
+  TS_AUTHKEY_STAGING: "tskey-auth-replace-with-staging-key"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxtail
+  labels:
+    app.kubernetes.io/name: proxtail
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: proxtail
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: proxtail
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Complies with Kubernetes Pod Security Standards "restricted" profile
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: proxtail
+          image: ghcr.io/italoag/proxtail:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: proxtail-secrets
+          env:
+            - name: PROXTAIL_CONFIG
+              value: /etc/proxtail/config.yaml
+            - name: PROXTAIL_HEALTH_PORT
+              value: "9090"
+            - name: TS_STATE_DIR
+              value: /var/lib/tsnet
+          ports:
+            - name: prod-http
+              containerPort: 8080
+              protocol: TCP
+            - name: prod-https
+              containerPort: 8443
+              protocol: TCP
+            - name: staging-http
+              containerPort: 9080
+              protocol: TCP
+            - name: health
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # Mounted as a directory (without subPath) so Kubernetes ConfigMap updates trigger automatic hot reload
+            - name: config
+              mountPath: /etc/proxtail
+              readOnly: true
+            # Writable directory for tsnet logs/state (use a PersistentVolumeClaim if ephemeral: false)
+            - name: tsnet-state
+              mountPath: /var/lib/tsnet
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: proxtail-config
+        - name: tsnet-state
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxtail
+  labels:
+    app.kubernetes.io/name: proxtail
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: proxtail
+  ports:
+    - name: prod-http
+      port: 8080
+      targetPort: prod-http
+      protocol: TCP
+    - name: prod-https
+      port: 8443
+      targetPort: prod-https
+      protocol: TCP
+    - name: staging-http
+      port: 9080
+      targetPort: staging-http
+      protocol: TCP
