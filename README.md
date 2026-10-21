@@ -5,9 +5,7 @@
 **Forward local TCP/UDP ports into one or more Tailscale networks—without root privileges, `/dev/net/tun`, or a host Tailscale daemon.**
 
 [![CI & Build](https://github.com/fadlytabrani/proxtail/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/fadlytabrani/proxtail/actions/workflows/docker-publish.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/fadlytabrani/proxtail?include_prereleases&style=flat&logo=github)](https://github.com/fadlytabrani/proxtail/releases)
-[![Go Report Card](https://goreportcard.com/badge/github.com/fadlytabrani/proxtail)](https://goreportcard.com/report/github.com/fadlytabrani/proxtail)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/fadlytabrani/proxtail)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![Docker Image](https://img.shields.io/badge/ghcr.io-proxtail-blue?logo=docker)](https://github.com/fadlytabrani/proxtail/pkgs/container/proxtail)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
