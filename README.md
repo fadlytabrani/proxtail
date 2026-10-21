@@ -77,6 +77,7 @@ curl http://localhost:8080
 - [Day-2 Operations & Observability](#day-2-operations--observability)
 - [Troubleshooting](#troubleshooting)
 - [Building from Source](#building-from-source)
+- [Acknowledgements](#acknowledgements)
 - [Contributing & License](#contributing--license)
 
 ---
@@ -489,6 +490,14 @@ make bench-real
 # Validate example configuration
 make validate
 ```
+
+---
+
+## Acknowledgements
+
+This project was built and optimized with the assistance of advanced coding LLMs:
+- **Gemini 4 Argon**
+- **Gemini 3.8 Flash**
 
 ---
 
