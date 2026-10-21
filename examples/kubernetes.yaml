@@ -9,6 +9,7 @@ data:
   config.yaml: |
     tailnets:
       - name: 'production'
+        hostname: 'proxtail-prod-${HOSTNAME}'
         tags:
           - 'tag:k8s-proxy'
         ports:
@@ -18,6 +19,7 @@ data:
             destination: 'api-server:443'
 
       - name: 'staging'
+        hostname: 'proxtail-staging-${HOSTNAME}'
         tags:
           - 'tag:k8s-proxy'
         ports:

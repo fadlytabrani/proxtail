@@ -22,6 +22,11 @@ go.work.sum
 # Project binaries
 /proxtail
 /proxtail-*
+test_perf*
+
+# Local test configurations
+*test-config*.yaml
+k8s-*.yaml
 
 # Test environment
 test/

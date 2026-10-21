@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Performance & Multiprocessing Optimizations**:
+  - Multi-core UDP ingress reader pool (`min(GOMAXPROCS, 8)` workers) scaling parallel UDP throughput by 3.24x to ~61,000 pkts/s.
+  - 16-shard cache-line-padded `udpSessionTable` and striped atomic counters (`paddedAtomicInt64`), eliminating cross-core false sharing and lock contention.
+  - Reduced per-connection TCP bridging goroutines by 33% (2 goroutines instead of 3 per connection).
+  - Profile-Guided Optimization (PGO) support with `cmd/proxtail/default.pgo` generated from real WireGuard workloads.
+  - Coalesced shared UDP listener write deadlines and socket buffer tuning.
+  - End-to-end real Tailscale WireGuard throughput benchmark suite (`make bench-real`) using `tailscale.com/tstest/integration/testcontrol`.
+- **OAuth & Configuration Enhancements**:
+  - Automatic Tailscale OAuth ACL tag discovery (`resolveOAuthTags`), fetching authorized tags directly from Tailscale's token endpoint when omitted in configuration.
+  - Environment variable expansion (`os.ExpandEnv`) in YAML configurations (e.g. `hostname: proxtail-${HOSTNAME}`).
 - **Kubernetes Support**:
   - Added `GET /readyz` readiness endpoint (`200 OK` when all listeners are bound, `503 Service Unavailable` during startup/shutdown).
   - Added Kubernetes `ConfigMap` symlink (`..data`) atomic swap detection for zero-downtime hot reloads.
@@ -16,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `PROXTAIL_HEALTH_PORT` and `PROXTAIL_LISTEN_ADDRESS` environment variables.
   - Added `-healthcheck` and `-version` (`-v`) CLI flags.
   - Added production-ready Kubernetes manifest (`examples/kubernetes.yaml`).
-- **Tailscale & Proxy Enhancements**:
+- **Tailscale & Proxy Core**:
   - Added OAuth Client Secret (`tskey-client-...` / `TS_CLIENT_SECRET_<NAME>`) support for non-expiring node authentication.
   - Added Tailscale ACL `tags` (`AdvertiseTags`), `wireguard_port`, and `web_client` configuration options.
   - Added global and per-port `listen_address` IP binding support.
