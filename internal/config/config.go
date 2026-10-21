@@ -162,10 +162,11 @@ func Load(file string) (*Config, error) {
 	return Parse(data)
 }
 
-// Parse unmarshals YAML data, applies defaults, and validates the configuration.
+// Parse unmarshals YAML data, expands environment variables, applies defaults, and validates the configuration.
 func Parse(data []byte) (*Config, error) {
+	expanded := os.ExpandEnv(string(data))
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config YAML: %w", err)
 	}
 
