@@ -495,7 +495,7 @@ make validate
 
 ## Acknowledgements
 
-This project was built and optimized with the assistance of advanced coding LLMs:
+This project was built and optimized with the assistance of LLMs:
 - **Gemini 4 Argon**
 - **Gemini 3.8 Flash**
 
