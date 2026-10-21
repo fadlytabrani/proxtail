@@ -15,8 +15,16 @@
 go.work
 go.work.sum
 
-# Environment and OS files
+# Environment, secrets, and OS files
 .env
+.env.*
+*.secret.yaml
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+*.log
 .DS_Store
 
 # Project binaries
