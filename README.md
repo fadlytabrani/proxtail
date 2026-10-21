@@ -2,9 +2,7 @@
 
 <div align="center">
 
-**High-Performance, Unprivileged Multi-Tailnet Layer 4 Reverse Proxy**
-
-*Expose services across one or multiple Tailscale networks on local TCP and UDP ports—without root privileges, `/dev/net/tun`, or a host Tailscale daemon.*
+**Forward local TCP/UDP ports into one or more Tailscale networks—without root privileges, `/dev/net/tun`, or a host Tailscale daemon.**
 
 [![CI & Build](https://github.com/fadlytabrani/proxtail/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/fadlytabrani/proxtail/actions/workflows/docker-publish.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/fadlytabrani/proxtail?include_prereleases&style=flat&logo=github)](https://github.com/fadlytabrani/proxtail/releases)
@@ -17,13 +15,73 @@
 
 ---
 
-`proxtail` is an ultra-lightweight, high-performance Layer 4 (TCP and UDP) reverse proxy powered by Tailscale's userspace networking engine ([`tsnet`](https://pkg.go.dev/tailscale.com/tsnet)). It bridges local applications, Kubernetes ingress controllers (NGINX, Traefik, Envoy, HAProxy), and LAN clients directly to private backends across one or multiple Tailscale tailnets (or self-hosted [Headscale](https://github.com/juanfont/headscale) networks).
+### The Problem
+Running a standard Tailscale daemon requires root privileges, access to the host kernel `/dev/net/tun` device, and modifications to host network routing tables. In locked-down environments—such as **Kubernetes `restricted` pods**, **unprivileged Docker containers**, **AWS ECS/Fargate**, or **shared developer bastion hosts**—this is either impossible or strictly forbidden by security policies.
 
-Unlike traditional Tailscale setups that require root permissions, kernel `/dev/net/tun` devices, and host-level routing changes, `proxtail` runs **100% in userspace** as an unprivileged process.
+Furthermore, if you need to bridge services across **multiple independent tailnets** (such as Production, Staging, and customer VPCs) that share overlapping `100.64.0.0/10` CGNAT address spaces, a single host Tailscale daemon cannot isolate them without IP conflicts.
+
+### The Solution: `proxtail`
+`proxtail` is a lightweight, high-performance Layer 4 (TCP & UDP) reverse proxy powered by Tailscale's userspace networking engine ([`tsnet`](https://pkg.go.dev/tailscale.com/tsnet)). It runs entirely as an unprivileged process (UID `10001`), creates isolated userspace WireGuard network stacks for each configured tailnet, and maps local ports directly to private tailnet backends—delivering **1.0 Gbps WireGuard line-rate throughput** with zero kernel modifications.
 
 ---
 
-## Architecture Overview
+## ⚡ Instant Demo
+
+Forward local port `8080` to `web-server:8080` in your tailnet in three commands:
+
+```bash
+# 1. Create a 4-line configuration
+cat << 'EOF' > config.yaml
+tailnets:
+  - ports:
+      - port: 8080
+        destination: 'web-server'
+EOF
+
+# 2. Run proxtail with your Tailscale auth key (or OAuth client secret)
+export TS_AUTHKEY="tskey-auth-xxxxx"
+proxtail
+```
+
+```text
+2026/10/22 03:20:00 [default] tsnet node started (Tailscale IP: 100.64.1.42, hostname: proxtail-default)
+2026/10/22 03:20:00 [default] TCP listening on :8080 and forwarding to web-server:8080
+2026/10/22 03:20:01 Proxtail is ready to accept traffic (/readyz OK)
+```
+
+```bash
+# 3. Access your private tailnet service directly through localhost
+curl http://localhost:8080
+```
+
+---
+
+## 🎯 Who Is It For?
+
+- **Kubernetes Operators & Platform Engineers**: Route traffic from cluster workloads or ingress controllers (NGINX, Traefik, Kong) into private Tailscale services under the strictest `PodSecurityStandard: restricted` profile.
+- **B2B SaaS Architects**: Bridge your cloud application to multiple customer tailnets simultaneously without IP collisions or cross-tenant traffic leakage.
+- **DevOps & CI/CD Teams**: Enable ephemeral test runners (GitHub Actions, GitLab CI) to connect directly to staging databases (`postgres:5432`) without installing desktop VPN clients or changing host DNS.
+- **Edge & IoT Engineers**: Provide legacy equipment, microcontrollers, or factory PLCs that cannot run modern WireGuard with secure access to cloud tailnets through simple local ports.
+
+---
+
+## 📖 Contents
+
+- [Architecture](#architecture)
+- [Key Features](#key-features)
+- [Performance & Benchmarks](#performance--benchmarks)
+- [60-Second Quick Start](#60-second-quick-start)
+- [Configuration Recipes](#configuration-recipes)
+- [Configuration Reference](#configuration-reference)
+- [Kubernetes Production Guide](#kubernetes-production-guide)
+- [Day-2 Operations & Observability](#day-2-operations--observability)
+- [Troubleshooting](#troubleshooting)
+- [Building from Source](#building-from-source)
+- [Contributing & License](#contributing--license)
+
+---
+
+## Architecture
 
 ### Traditional Host Daemon vs. `proxtail`
 
@@ -50,14 +108,14 @@ TRADITIONAL HOST TAILSCALED                      PROXTAIL (USERSPACE GATEWAY)
                                                └──────────────┘└──────────────┘
 ```
 
-### Visual Traffic Flow
+### End-to-End Traffic Flow
 
 ```mermaid
 flowchart TD
-    subgraph Clients["Local Applications & Ingress"]
-        C1["Local Client / Ingress<br/>:8080 (TCP)"]
+    subgraph Clients["Local Applications & Ingress Controllers"]
+        C1["Local Ingress / App<br/>:8080 (TCP)"]
         C2["Internal DNS Client<br/>:5353 (UDP)"]
-        C3["Staging Test Runner<br/>:9080 (TCP)"]
+        C3["Staging Test Suite<br/>:9080 (TCP)"]
     end
 
     subgraph Proxtail["proxtail Container (Unprivileged / UID 10001)"]
@@ -91,30 +149,30 @@ flowchart TD
     WP --> T1
     WP --> T2
 
-    T1 -- "WireGuard Tunnel" --> P1
-    T1 -- "WireGuard Tunnel" --> P2
-    T2 -- "WireGuard Tunnel" --> S1
+    T1 -- "Encrypted WireGuard" --> P1
+    T1 -- "Encrypted WireGuard" --> P2
+    T2 -- "Encrypted WireGuard" --> S1
 ```
 
 ---
 
-## Why `proxtail`?
+## Key Features
 
-- **Zero Host Privileges Required**: Runs entirely in userspace with non-root user `10001:10001`. No `CAP_NET_ADMIN`, no `/dev/net/tun` device, and zero host network modifications. Complies with the **Kubernetes Pod Security Standards `restricted` profile**.
-- **Multi-Tailnet Gateway**: Connect to multiple independent tailnets (`production`, `staging`, partner tailnets) simultaneously from a single container—even when nodes share overlapping `100.64.x.x` CGNAT IPs or identical MagicDNS names.
-- **WireGuard Line-Rate Performance**: Achieves **1.0 Gbps** encrypted TCP throughput over userspace WireGuard (ChaCha20-Poly1305 + gVisor), with less than **0.01 ms** proxy latency overhead on raw sockets and **~1.1 ms** round-trip overhead through full WireGuard encryption.
+- **Zero Host Privileges**: Runs 100% in userspace with non-root user `10001:10001`. No `CAP_NET_ADMIN`, no `/dev/net/tun` device, and zero host network changes. Fully compliant with Kubernetes Pod Security Standards `restricted` profile.
+- **Multi-Tailnet Isolation**: Connect to multiple independent tailnets (`production`, `staging`, partner networks) simultaneously. Backends with overlapping `100.64.x.x` CGNAT IPs or identical MagicDNS names are completely isolated.
+- **WireGuard Line-Rate Performance**: Up to **1.0 Gbps** encrypted TCP throughput over userspace WireGuard (ChaCha20-Poly1305 + gVisor), with less than **0.01 ms** raw socket proxy overhead and **~1.1 ms** round-trip overhead through full encryption.
 - **Parallel Multi-Core UDP Engine**: Multi-worker reader pool and 16-shard cacheline-padded session table scale parallel UDP traffic by **3.24x** to **~61,000 pkts/s** with zero lock contention.
-- **Horizontal Kubernetes Scaling**: Ephemeral nodes scale linearly across replicas (tested **3.12x** TCP and **3.94x** UDP throughput scaling across 3 pods) using dynamic `${HOSTNAME}` node registration.
-- **Instant Graceful Teardown**: Intercepts `SIGTERM` and triggers an immediate node logout (`b.Logout()`), instantly purging ephemeral nodes from your Tailscale admin console in **< 150 ms** without waiting for 30–60 minute offline timeouts.
-- **Tailscale OAuth & Auto ACL Tag Discovery**: Authenticate seamlessly with reusable non-expiring OAuth client secrets (`tskey-client-...`). When `tags:` are omitted in configuration, `proxtail` queries the Tailscale OAuth API to discover and advertise authorized tags automatically.
-- **Zero-Downtime Hot Reload**: Dynamic file watching and Kubernetes atomic symlink detection (`..data`) reload routes in **< 100 ms** on `config.yaml` changes without dropping existing TCP/UDP connections.
-- **Cloud-Native Observability**: Built-in Prometheus metrics (`/metrics`), Kubernetes liveness (`/healthz`) and readiness (`/readyz`) probes, and optional periodic traffic summaries.
+- **Horizontal Kubernetes Scaling**: Scales linearly across pod replicas (tested **3.12x** TCP and **3.94x** UDP throughput scaling across 3 pods) using dynamic `${HOSTNAME}` node registration.
+- **Instant Clean Teardown**: Ephemeral nodes are deregistered immediately on `SIGTERM` via `b.Logout()`, purging nodes from the Tailscale admin console in **< 150 ms** without waiting for 30–60 minute timeouts.
+- **Tailscale OAuth & Auto ACL Tag Discovery**: Authenticate with non-expiring OAuth client secrets (`tskey-client-...`). When `tags:` are omitted in YAML, `proxtail` automatically queries the Tailscale API to discover and advertise authorized tags.
+- **Zero-Downtime Hot Reload**: Dynamic file watching and Kubernetes atomic symlink detection (`..data`) reload routes in **< 100 ms** without dropping active connections.
+- **Native Observability**: Prometheus metrics (`/metrics`), Kubernetes liveness (`/healthz`) and readiness (`/readyz`) probes, and optional periodic traffic summaries.
 
 ---
 
-## Performance & Live Benchmark Highlights
+## Performance & Benchmarks
 
-All benchmarks were evaluated using both synthetic local loopback tests and end-to-end user-space WireGuard encryption (`tstest/integration/testcontrol`):
+All benchmarks were evaluated using both synthetic local loopback tests and end-to-end userspace WireGuard encryption (`tstest/integration/testcontrol`):
 
 | Test Scenario | Direct Connection | `proxtail` Proxied | Impact / Overhead |
 | :--- | :--- | :--- | :--- |
@@ -127,27 +185,11 @@ All benchmarks were evaluated using both synthetic local loopback tests and end-
 | **Node Deregistration on Pod Exit** | 30–60 min (timeout) | **< 150 ms** | Instant clean teardown |
 
 > [!TIP]
-> You can reproduce these benchmarks on your local machine anytime:
+> Run benchmarks locally:
 > ```bash
-> make bench       # Run synthetic TCP/UDP loopback benchmarks
-> make bench-real  # Run real end-to-end WireGuard ChaCha20-Poly1305 + gVisor benchmarks
+> make bench       # Synthetic TCP/UDP loopback benchmarks
+> make bench-real  # End-to-end WireGuard ChaCha20-Poly1305 + gVisor benchmarks
 > ```
-
----
-
-## Target Use Cases
-
-### 1. Multi-Tenant B2B SaaS Gateways
-SaaS vendors frequently need to connect their cloud workloads to private databases or internal APIs hosted in different customer tailnets. Because each customer network often allocates overlapping `100.64.0.0/10` address spaces, host-level VPN routing fails. `proxtail` encapsulates each customer tailnet in its own isolated `tsnet` network stack, letting your SaaS bridge them on distinct local ports (`:9001` $\rightarrow$ Customer A, `:9002` $\rightarrow$ Customer B).
-
-### 2. Rootless & Hardened Kubernetes Ingress/Egress
-Enterprises enforcing `PodSecurityStandard: restricted` disallow privileged containers, root UIDs, host networking, and `CAP_NET_ADMIN`. `proxtail` runs as UID `10001` with a read-only root filesystem and zero capabilities. Ingress controllers like NGINX or Traefik can point upstream traffic directly at `proxtail`'s ClusterIP service to route incoming traffic into private Tailscale backends.
-
-### 3. Legacy Systems, Industrial & IoT Backhauls
-Legacy factory floor PLCs, medical devices, or mainframe servers often cannot install modern VPN clients. By running `proxtail` on an unprivileged edge gateway or jumpbox, legacy systems communicate with simple local TCP/UDP ports, while `proxtail` securely tunnels the traffic across encrypted Tailscale meshes.
-
-### 4. Developer Workstations & Ephemeral CI/CD Runners
-Developers and CI/CD pipelines (GitHub Actions, GitLab CI) often need access to staging databases (`postgres:5432`) or internal microservices without having to install and log into the Tailscale desktop client or modify system DNS settings (`/etc/resolv.conf`). A single `docker run` or `proxtail` process immediately bridges the needed ports locally.
 
 ---
 
@@ -159,19 +201,17 @@ Developers and CI/CD pipelines (GitHub Actions, GitLab CI) often need access to 
 3. Copy your `tskey-auth-...` key or `tskey-client-...` secret.
 
 ### 2. Create `config.yaml`
-Create a minimal `config.yaml` in your working directory:
-
 ```yaml
 tailnets:
   - ports:
       - port: 8080
-        destination: 'web-server' # Forwards local TCP :8080 -> web-server:8080 in your tailnet
+        destination: 'web-server' # Forwards local TCP :8080 -> web-server:8080
 ```
-*(MagicDNS hostnames like `web-server`, full FQDNs, or Tailscale IPs like `100.64.0.10` are all supported.)*
+*(Supports MagicDNS names like `web-server`, FQDNs, or Tailscale IPs like `100.64.0.10`.)*
 
 ### 3. Run `proxtail`
 
-#### Option A: Prebuilt Multi-Arch Docker Container (`amd64` / `arm64`)
+#### Option A: Prebuilt Docker Container (`amd64` / `arm64`)
 ```bash
 export TS_AUTHKEY="tskey-auth-xxxxx"
 
@@ -188,19 +228,18 @@ go build -o proxtail ./cmd/proxtail
 export TS_AUTHKEY="tskey-auth-xxxxx"
 ./proxtail
 ```
-*(When executed locally, `proxtail` automatically detects `./config.yaml` in the current working directory.)*
 
-### 4. Test Your Connection
+#### Option C: Kubernetes Deployment
 ```bash
-curl http://localhost:8080
+kubectl apply -f examples/kubernetes.yaml
 ```
 
 ---
 
-## Common Configuration Recipes
+## Configuration Recipes
 
 ### Recipe 1: Single Tailnet with Mixed TCP & UDP
-When proxying into a single tailnet, `name` and `auth_key` can be omitted—`proxtail` automatically reads `TS_AUTHKEY` (or `TS_CLIENT_SECRET`) from the environment:
+In single-tailnet mode, `name` and `auth_key` can be omitted—`proxtail` automatically reads `TS_AUTHKEY` (or `TS_CLIENT_SECRET`) from the environment:
 
 ```yaml
 tailnets:
@@ -221,7 +260,7 @@ tailnets:
 ```
 
 ### Recipe 2: Multi-Tailnet Gateway (Production + Staging)
-Connect to multiple tailnets simultaneously. Each tailnet automatically reads its auth key or OAuth secret from `TS_AUTHKEY_<NAME>` or `TS_CLIENT_SECRET_<NAME>`:
+Connect to multiple tailnets simultaneously. Each tailnet automatically reads its credentials from `TS_AUTHKEY_<NAME>` or `TS_CLIENT_SECRET_<NAME>`:
 
 ```yaml
 tailnets:
@@ -249,7 +288,7 @@ Tailscale OAuth client secrets (`tskey-client-...`) never expire. `proxtail` aut
 ```yaml
 tailnets:
   - name: 'production'
-    # Tags can be explicitly declared or omitted for auto-discovery
+    # 'tags:' omitted: proxtail automatically discovers authorized ACL tags
     ports:
       - port: 5432
         destination: 'postgres-db:5432'
@@ -261,7 +300,7 @@ export TS_CLIENT_SECRET_PRODUCTION="tskey-client-khrEZ4..."
 ```
 
 ### Recipe 4: Kubernetes Scaling with Dynamic `${HOSTNAME}`
-When running multiple replicas under a Kubernetes Deployment, each pod can dynamically name its Tailscale node to prevent hostname collisions:
+When running multiple pod replicas in Kubernetes, each pod dynamically names its Tailscale node to prevent hostname collisions:
 
 ```yaml
 tailnets:
@@ -273,7 +312,7 @@ tailnets:
 ```
 
 ### Recipe 5: Persistent Node Identity (`ephemeral: false`)
-By default, `ephemeral: true` keeps state in memory and cleans up on exit. If you want a static, permanent Tailscale IP address across restarts:
+By default, `ephemeral: true` keeps state in memory and cleans up on exit. To maintain a static, permanent Tailscale IP address across restarts:
 
 ```yaml
 tailnets:
@@ -286,7 +325,7 @@ tailnets:
 ```
 
 ### Recipe 6: Self-Hosted Headscale
-Point any tailnet to an open-source [Headscale](https://github.com/juanfont/headscale) server:
+Point any tailnet to an open-source [Headscale](https://github.com/juanfont/headscale) coordination server:
 
 ```yaml
 tailnets:
@@ -306,7 +345,7 @@ tailnets:
 1. **CLI Flag**: `proxtail -c /path/to/config.yaml` (or `-config`)
 2. **Environment Variable**: `PROXTAIL_CONFIG` (or `TSNET_PROXY_CONFIG`)
 3. **Current Working Directory**: `./config.yaml`
-4. **Default System Path**: `/etc/proxtail/config.yaml` (default inside container image)
+4. **Default System Path**: `/etc/proxtail/config.yaml` (default in container)
 
 ### `tailnets[]` Settings
 
@@ -361,7 +400,7 @@ tailnets:
 
 ---
 
-## Kubernetes Production Deployment
+## Kubernetes Production Guide
 
 `proxtail` complies out of the box with the **Kubernetes Pod Security Standards `restricted` profile**:
 - **Numeric Non-Root User (`10001:10001`)**: Runs as `USER 10001:10001` with `securityContext.runAsNonRoot: true`.
@@ -388,7 +427,7 @@ kubectl scale deployment/proxtail --replicas=3
 
 ---
 
-## Day-2 Operations & Monitoring
+## Day-2 Operations & Observability
 
 ### Validating Configuration in CI/CD
 Validate syntax and port rules before deployment:
@@ -432,7 +471,7 @@ Key exported metrics:
 
 ---
 
-## Building & Testing from Source
+## Building from Source
 
 ```bash
 # Build binary with embedded version metadata
@@ -453,14 +492,9 @@ make validate
 
 ---
 
-## Contributing & Security
+## Contributing & License
 
 - **Contributing**: Please review [CONTRIBUTING.md](CONTRIBUTING.md) for architecture guidelines, code standards, and PR workflows.
 - **Security Policy**: See [SECURITY.md](SECURITY.md) for vulnerability disclosure procedures.
 - **Changelog**: See [CHANGELOG.md](CHANGELOG.md) for version history.
-
----
-
-## License
-
-[MIT License](LICENSE) © 2026 Fadly Tabrani
+- **License**: [MIT License](LICENSE) © 2026 Fadly Tabrani
