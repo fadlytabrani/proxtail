@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	_ "tailscale.com/feature/oauthkey"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tsnet"
 
@@ -82,6 +84,60 @@ func resolveTailnetDir(tailnetName string, ephemeral bool) (string, bool, error)
 	return "", false, nil
 }
 
+// resolveOAuthTags attempts to auto-discover required ACL tags from the Tailscale OAuth endpoint
+// if no explicit tags were provided in configuration.
+func resolveOAuthTags(clientSecret, controlURL string) []string {
+	if !strings.HasPrefix(clientSecret, "tskey-client-") {
+		return nil
+	}
+	baseURL := "https://api.tailscale.com"
+	if controlURL != "" {
+		baseURL = strings.TrimRight(controlURL, "/")
+	}
+	tokenURL := baseURL + "/api/v2/oauth/token"
+
+	rawSecret, _, _ := strings.Cut(clientSecret, "?")
+	data := url.Values{}
+	data.Set("client_id", "proxtail")
+	data.Set("client_secret", rawSecret)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	var result struct {
+		Tags string `json:"tags"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.Tags == "" {
+		return nil
+	}
+
+	rawTags := strings.Split(result.Tags, ",")
+	var tags []string
+	for _, t := range rawTags {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			tags = append(tags, t)
+		}
+	}
+	return tags
+}
+
 // initializeServer creates and starts a tsnet.Server for a specific tailnet configuration.
 func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 	ephemeral := tailnetCfg.IsEphemeral()
@@ -95,6 +151,14 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 		return nil, err
 	}
 
+	tags := tailnetCfg.Tags
+	if len(tags) == 0 && clientSecret != "" {
+		if discovered := resolveOAuthTags(clientSecret, tailnetCfg.ControlURL); len(discovered) > 0 {
+			log.Printf("Auto-discovered OAuth ACL tags for tailnet '%s': %v", tailnetCfg.Name, discovered)
+			tags = discovered
+		}
+	}
+
 	server := &tsnet.Server{
 		Dir:           tailnetDir,
 		Hostname:      tailnetCfg.Hostname,
@@ -102,7 +166,7 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 		ClientSecret:  clientSecret,
 		ControlURL:    tailnetCfg.ControlURL,
 		Ephemeral:     ephemeral,
-		AdvertiseTags: tailnetCfg.Tags,
+		AdvertiseTags: tags,
 		Port:          tailnetCfg.WireGuardPort,
 		RunWebClient:  tailnetCfg.WebClient,
 	}
