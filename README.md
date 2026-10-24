@@ -8,7 +8,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/fadlytabrani/proxtail?color=blue&logo=github)](https://github.com/fadlytabrani/proxtail/releases)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/fadlytabrani/proxtail?logo=go&logoColor=white)](https://go.dev/)
 [![Go Reference](https://pkg.go.dev/badge/github.com/fadlytabrani/proxtail.svg)](https://pkg.go.dev/github.com/fadlytabrani/proxtail)
-[![License: MIT](https://img.shields.io/github/license/fadlytabrani/proxtail?color=yellow)](LICENSE)
+[![License: BSD-3-Clause](https://img.shields.io/github/license/fadlytabrani/proxtail?color=blue)](LICENSE)
 
 </div>
 
@@ -505,4 +505,4 @@ This project was built and optimized with the assistance of LLMs:
 - **Contributing**: Please review [CONTRIBUTING.md](CONTRIBUTING.md) for architecture guidelines, code standards, and PR workflows.
 - **Security Policy**: See [SECURITY.md](SECURITY.md) for vulnerability disclosure procedures.
 - **Changelog**: See [CHANGELOG.md](CHANGELOG.md) for version history.
-- **License**: [MIT License](LICENSE) © 2026 Fadly Tabrani
+- **License**: [BSD 3-Clause License](LICENSE) © 2026 Fadly Tabrani
