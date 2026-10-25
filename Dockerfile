@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage: Cross-compile natively on the host build platform for fast multi-arch builds
-FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.24 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24 AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH
