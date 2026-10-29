@@ -10,17 +10,20 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
 
@@ -1844,4 +1847,743 @@ func BenchmarkRealTSNetWireGuardUDPParallelThroughput(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestTCPUpstreamProbeSuspendAndResume(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend TCP listener: %v", err)
+	}
+	backendAddr := backendListener.Addr().String()
+
+	serveEcho := func(ln net.Listener) {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}
+	go serveEcho(backendListener)
+
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 10 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            30 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Initially UP
+	statuses := p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected TCP listener to be initially UP, got %+v", statuses)
+	}
+
+	// 2. Stop backend -> probe detects unreachable upstream and suspends local TCP listener
+	_ = backendListener.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || statuses[0].Up {
+		t.Fatalf("expected TCP listener to be suspended (Up=false) when upstream is down, got %+v", statuses)
+	}
+
+	// Verify local port refuses TCP connections while suspended
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 100*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatalf("expected local TCP listener on port %d to refuse connections while suspended", proxyPort)
+	}
+
+	// 3. Restart backend on the same address -> probe detects recovery and resumes local TCP listener
+	restartedBackend, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatalf("failed to restart backend TCP listener on %s: %v", backendAddr, err)
+	}
+	defer restartedBackend.Close()
+	go serveEcho(restartedBackend)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && st[0].Up {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected TCP listener to resume (Up=true) after upstream recovery, got %+v", statuses)
+	}
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to resumed TCP listener: %v", err)
+	}
+	defer conn.Close()
+	msg := []byte("resumed-tcp")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	reply := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, reply); err != nil || !bytes.Equal(reply, msg) {
+		t.Fatalf("unexpected reply after TCP resume: %q (err=%v)", reply, err)
+	}
+}
+
+func TestUDPUpstreamProbeSuspendAndResume(t *testing.T) {
+	backendConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend UDP server: %v", err)
+	}
+	backendAddr := backendConn.LocalAddr().String()
+
+	serveUDPEcho := func(pc net.PacketConn) {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				_, _ = pc.WriteTo(buf[:n], addr)
+			}
+		}
+	}
+	go serveUDPEcho(backendConn)
+
+	proxyUDPPort := getFreeUDPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "udp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 10 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            30 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Initially UP
+	statuses := p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected UDP socket to be initially UP, got %+v", statuses)
+	}
+
+	// 2. Close backend UDP socket -> probe detects unreachable and suspends local UDP socket
+	_ = backendConn.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || statuses[0].Up {
+		t.Fatalf("expected UDP socket to be suspended (Up=false) when upstream UDP port is closed, got %+v", statuses)
+	}
+
+	// 3. Restart backend UDP socket on the same address -> probe detects recovery and re-binds local UDP socket
+	restartedUDP, err := net.ListenPacket("udp", backendAddr)
+	if err != nil {
+		t.Fatalf("failed to restart backend UDP server on %s: %v", backendAddr, err)
+	}
+	defer restartedUDP.Close()
+	go serveUDPEcho(restartedUDP)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && st[0].Up {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected UDP socket to resume (Up=true) after upstream UDP recovery, got %+v", statuses)
+	}
+
+	// Verify UDP forwarding works after resumption
+	clientConn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial resumed UDP proxy: %v", err)
+	}
+	defer clientConn.Close()
+	msg := []byte("resumed-udp")
+	if _, err := clientConn.Write(msg); err != nil {
+		t.Fatalf("failed writing UDP packet after resume: %v", err)
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	reply := make([]byte, len(msg))
+	if _, err := io.ReadFull(clientConn, reply); err != nil || !bytes.Equal(reply, msg) {
+		t.Fatalf("unexpected UDP reply after resume: %q (err=%v)", reply, err)
+	}
+}
+
+func TestTrafficAwareProbeCooldown(t *testing.T) {
+	info := &listenerInfo{
+		probing: true,
+		up:      true,
+	}
+
+	// 1. Without traffic, isTrafficActive is false
+	if info.isTrafficActive(100 * time.Millisecond) {
+		t.Errorf("expected isTrafficActive to be false before any traffic")
+	}
+
+	// 2. After recordActive, isTrafficActive is true within cooldown window
+	info.recordActive()
+	if !info.isTrafficActive(100 * time.Millisecond) {
+		t.Errorf("expected isTrafficActive to be true immediately after recordActive")
+	}
+
+	// 3. When probing is disabled, recordActive is a no-op
+	disabledInfo := &listenerInfo{probing: false, up: true}
+	disabledInfo.recordActive()
+	if disabledInfo.lastActiveNano.Load() != 0 {
+		t.Errorf("expected recordActive to be a zero-overhead no-op when probing is disabled")
+	}
+
+	// 4. After cooldown window expires, isTrafficActive becomes false
+	time.Sleep(30 * time.Millisecond)
+	if info.isTrafficActive(20 * time.Millisecond) {
+		t.Errorf("expected isTrafficActive to be false after cooldown elapsed")
+	}
+}
+
+func TestConsecutiveFailuresThreshold(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend TCP listener: %v", err)
+	}
+	backendAddr := backendListener.Addr().String()
+	_ = backendListener.Close() // immediately closed
+
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 10 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            25 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 3, // Requires 3 failures before suspending
+		Cooldown:            20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Initially UP
+	statuses := p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected TCP listener to be initially UP, got %+v", statuses)
+	}
+
+	// 2. Wait for 3 consecutive failures to trigger suspension
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || statuses[0].Up {
+		t.Fatalf("expected TCP listener to be suspended after 3 consecutive failures, got %+v", statuses)
+	}
+}
+
+func TestFastPathLiveDialFailure(t *testing.T) {
+	// Destination that refuses connections
+	freePort := getFreeTCPPort(t)
+	destAddr := fmt.Sprintf("127.0.0.1:%d", freePort)
+
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       destAddr,
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 10 * time.Second
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            10 * time.Second,
+		Timeout:             time.Second,
+		ConsecutiveFailures: 5,
+		Cooldown:            time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Initially UP
+	st := p.GetPortStatuses()
+	if len(st) != 1 || !st[0].Up {
+		t.Fatalf("expected initially UP, got %+v", st)
+	}
+
+	// Real client dials proxy -> proxy fails to dial dest -> notifyUpstreamFailure fast-path instantly suspends
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), time.Second)
+	if err == nil {
+		_ = conn.Close()
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		statuses := p.GetPortStatuses()
+		if len(statuses) == 1 && !statuses[0].Up {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	st = p.GetPortStatuses()
+	if len(st) != 1 || st[0].Up {
+		t.Fatalf("expected listener to be immediately suspended on live dial failure, got %+v", st)
+	}
+}
+
+type countingMockPeerDialer struct {
+	localDialer
+	dials       atomic.Int64
+	statusCalls atomic.Int64
+	mu          sync.Mutex
+	peers       map[string]bool
+}
+
+func (d *countingMockPeerDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	d.dials.Add(1)
+	return d.localDialer.Dial(ctx, network, address)
+}
+
+func (d *countingMockPeerDialer) PeerOnlineMap(ctx context.Context) (map[string]bool, error) {
+	d.statusCalls.Add(1)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.peers == nil {
+		return nil, nil
+	}
+	cp := make(map[string]bool, len(d.peers))
+	for k, v := range d.peers {
+		cp[k] = v
+	}
+	return cp, nil
+}
+
+func TestActiveTrafficSkipsBackgroundProbes(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend TCP listener: %v", err)
+	}
+	defer backendListener.Close()
+
+	go func() {
+		for {
+			conn, err := backendListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	dialer := &countingMockPeerDialer{}
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendListener.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 5,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": dialer}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 120 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            40 * time.Millisecond,
+		Timeout:             100 * time.Millisecond,
+		ConsecutiveFailures: 2,
+		Cooldown:            500 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(30 * time.Millisecond)
+
+	// Establish a single live client connection before the initial probe timer fires
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to proxy: %v", err)
+	}
+	defer conn.Close()
+
+	msg := []byte("keepalive-traffic")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	reply := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	// Wait across multiple probe intervals while cooldown (500ms) is active
+	time.Sleep(220 * time.Millisecond)
+
+	if got := dialer.dials.Load(); got != 1 {
+		t.Fatalf("expected active traffic cooldown to skip all background probe dials (want 1 dial total, got %d)", got)
+	}
+}
+
+func TestPeerOfflineCacheSkipsNetworkDial(t *testing.T) {
+	// 1. Verify buildPeerOnlineMap handles duplicate hostnames (stale offline node + active online node) without false-offline
+	k1 := key.NewNode().Public()
+	k2 := key.NewNode().Public()
+	k3 := key.NewNode().Public()
+	st := &ipnstate.Status{
+		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+			k1: {
+				HostName:     "api-server",
+				DNSName:      "api-server-1.example.ts.net.",
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.10")},
+				Online:       false,
+			},
+			k2: {
+				HostName:     "api-server",
+				DNSName:      "api-server.example.ts.net.",
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.11")},
+				Online:       true,
+			},
+			k3: {
+				HostName:     "dead-db",
+				DNSName:      "dead-db.example.ts.net.",
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.99")},
+				Online:       false,
+			},
+		},
+	}
+	peerMap := buildPeerOnlineMap(st)
+	if !peerMap["api-server"] || !peerMap["api-server.example.ts.net"] || !peerMap["100.64.0.11"] {
+		t.Fatalf("expected active duplicate-hostname peer to resolve as online, got %+v", peerMap)
+	}
+	if peerMap["dead-db"] || peerMap["dead-db.example.ts.net"] || peerMap["100.64.0.99"] {
+		t.Fatalf("expected offline peer to resolve as offline, got %+v", peerMap)
+	}
+
+	// 2. Verify two ports sharing a tailnet reuse the 2s cached peer map and make 0 network Dial calls when peer is offline
+	dialer := &countingMockPeerDialer{
+		peers: map[string]bool{
+			"100.64.0.99": false,
+		},
+	}
+	port1 := getFreeTCPPort(t)
+	port2 := getFreeUDPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            port1,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "100.64.0.99:5432",
+			Protocol:          "tcp",
+			Tailnet:           "cached-tailnet",
+			ConnectionTimeout: 2,
+		},
+		{
+			Source:            port2,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "100.64.0.99:5353",
+			Protocol:          "udp",
+			Tailnet:           "cached-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"cached-tailnet": dialer}, 32*1024, 50)
+	p.probeInitialDelay = 10 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            30 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.IsReady() {
+			statuses := p.GetPortStatuses()
+			if len(statuses) == 2 && !statuses[0].Up && !statuses[1].Up &&
+				statuses[0].LastError != "" && statuses[1].LastError != "" {
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	statuses := p.GetPortStatuses()
+	if len(statuses) != 2 || statuses[0].Up || statuses[1].Up {
+		t.Fatalf("expected both TCP and UDP listeners to suspend on offline peer, got %+v", statuses)
+	}
+	if !strings.Contains(statuses[0].LastError, "is offline") {
+		t.Errorf("expected offline peer error message, got %q", statuses[0].LastError)
+	}
+	if gotDials := dialer.dials.Load(); gotDials != 0 {
+		t.Errorf("expected 0 network dials when peer cache reports offline, got %d", gotDials)
+	}
+	if gotStatusCalls := dialer.statusCalls.Load(); gotStatusCalls != 1 {
+		t.Errorf("expected cached peer status map to be fetched once across both ports within TTL, got %d calls", gotStatusCalls)
+	}
+}
+
+func TestUDPClientOnlyTrafficDoesNotSuppressProbe(t *testing.T) {
+	// Closed UDP backend port
+	closedUDP, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate UDP port: %v", err)
+	}
+	backendAddr := closedUDP.LocalAddr().String()
+	_ = closedUDP.Close()
+
+	proxyUDPPort := getFreeUDPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "udp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 40 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            35 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 2,
+		Cooldown:            5 * time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(15 * time.Millisecond)
+
+	// Simulate an ADC continuously sending outbound-only UDP health check packets to proxtail
+	stopSender := make(chan struct{})
+	defer close(stopSender)
+	go func() {
+		c, dialErr := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort))
+		if dialErr != nil {
+			return
+		}
+		defer c.Close()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopSender:
+				return
+			case <-ticker.C:
+				_, _ = c.Write([]byte("adc-udp-ping"))
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.IsReady() {
+			st := p.GetPortStatuses()
+			if len(st) == 1 && !st[0].Up && st[0].LastError != "" {
+				return
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("expected UDP listener to suspend despite client-only outbound UDP traffic, got %+v", p.GetPortStatuses())
+}
+
+func TestHotReloadProbeEnabledToggle(t *testing.T) {
+	freeDest := getFreeTCPPort(t)
+	destAddr := fmt.Sprintf("127.0.0.1:%d", freeDest) // closed destination
+
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       destAddr,
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 10 * time.Millisecond
+	// Start with probing disabled
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             false,
+		Interval:            25 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(60 * time.Millisecond)
+
+	// With probing disabled, local listener stays bound even though destination is closed
+	st := p.GetPortStatuses()
+	if len(st) != 1 || !st[0].Up {
+		t.Fatalf("expected listener to stay UP when probing is disabled, got %+v", st)
+	}
+
+	// Hot-reload to enable global probing (without changing port fields)
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            25 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            20 * time.Millisecond,
+	})
+	if err := p.ReloadConfig(ports); err != nil {
+		t.Fatalf("ReloadConfig failed: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st = p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if len(st) != 1 || st[0].Up {
+		t.Fatalf("expected hot-reloaded probe.enabled=true to suspend unreachable port, got %+v", st)
+	}
+
+	// Hot-reload back to probe.enabled=false -> listener re-binds and stays UP
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             false,
+		Interval:            25 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            20 * time.Millisecond,
+	})
+	if err := p.ReloadConfig(ports); err != nil {
+		t.Fatalf("ReloadConfig back to disabled failed: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	st = p.GetPortStatuses()
+	if len(st) != 1 || !st[0].Up {
+		t.Fatalf("expected hot-reloaded probe.enabled=false to restore unprobed bound listener, got %+v", st)
+	}
 }

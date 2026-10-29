@@ -349,6 +349,17 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		t.Fatalf("expected /readyz 200 OK after listeners start, got %d", recReady.Code)
 	}
 
+	// Verify /healthz exposes ports array
+	recHealthWithPorts := httptest.NewRecorder()
+	readyHandler.ServeHTTP(recHealthWithPorts, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var hrPorts healthResponse
+	if err := json.Unmarshal(recHealthWithPorts.Body.Bytes(), &hrPorts); err != nil {
+		t.Fatalf("failed to decode /healthz JSON with ports: %v", err)
+	}
+	if len(hrPorts.Ports) != 1 || hrPorts.Ports[0].Source != freePort || !hrPorts.Ports[0].Up {
+		t.Errorf("expected /healthz to expose 1 active port mapping on %d, got %+v", freePort, hrPorts.Ports)
+	}
+
 	// Verify runHealthCheck against running HTTP health server and TCP listener
 	healthPort := getFreePort(t)
 	if err := startHealthServer(ctx, "127.0.0.1", healthPort, readyProxy, tm); err != nil {
@@ -555,5 +566,126 @@ func TestNetnsDisabledByDefault(t *testing.T) {
 	_ = netns.FromDialer(logger.Discard, mon, dDisabled)
 	if dDisabled.Control != nil {
 		t.Errorf("expected dDisabled.Control to be nil when netns is disabled")
+	}
+}
+
+type mockPeerDialer struct {
+	mu    sync.Mutex
+	peers map[string]bool
+}
+
+func (d *mockPeerDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, address)
+}
+
+func (d *mockPeerDialer) PeerOnlineMap(ctx context.Context) (map[string]bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cp := make(map[string]bool, len(d.peers))
+	for k, v := range d.peers {
+		cp[k] = v
+	}
+	return cp, nil
+}
+
+func TestHealthzAndReadyzWhenListenersSuspended(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+
+	tm := newTailnetManager()
+	tm.initFunc = func(cfg config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: cfg.Hostname}, nil
+	}
+	tm.cleanupFunc = func(*tsnet.Server, string) {}
+	if _, _, _, err := tm.syncTailnets([]config.TailnetConfig{{Name: "prod", Hostname: "proxy-prod"}}); err != nil {
+		t.Fatalf("syncTailnets failed: %v", err)
+	}
+
+	dialer := &mockPeerDialer{
+		peers: map[string]bool{
+			"100.64.0.99": false, // offline peer
+		},
+	}
+
+	portHealthy := getFreePort(t)
+	portOffline := getFreePort(t)
+	ports := []proxy.PortMapping{
+		{
+			Source:        portHealthy,
+			ListenAddress: "127.0.0.1",
+			Destination:   backendLn.Addr().String(),
+			Protocol:      "tcp",
+			Tailnet:       "prod",
+		},
+		{
+			Source:        portOffline,
+			ListenAddress: "127.0.0.1",
+			Destination:   "100.64.0.99:5432",
+			Protocol:      "tcp",
+			Tailnet:       "prod",
+		},
+	}
+
+	p := proxy.NewProxyWithDialers(ports, map[string]proxy.Dialer{"prod": dialer}, 32*1024, 50)
+	p.SetProbeConfig(proxy.ProbeConfig{
+		Enabled:             true,
+		Interval:            40 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            30 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	handler := newHealthHandler(p, tm)
+
+	// 1. Wait for offline port to suspend while healthy port remains UP
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.ActiveListenerCount() == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Partial outage (1 of 2 ports active): /readyz stays 200 OK
+	recPartialReady := httptest.NewRecorder()
+	handler.ServeHTTP(recPartialReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recPartialReady.Code != http.StatusOK {
+		t.Fatalf("expected /readyz 200 OK when 1 of 2 ports remains active, got %d", recPartialReady.Code)
+	}
+
+	// Verify /healthz reports per-port up status and last_error
+	recHealth := httptest.NewRecorder()
+	handler.ServeHTTP(recHealth, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var hr healthResponse
+	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
+	}
+	if len(hr.Ports) != 2 || !hr.Ports[0].Up || hr.Ports[1].Up || !strings.Contains(hr.Ports[1].LastError, "is offline") {
+		t.Fatalf("unexpected /healthz ports status during partial outage: %+v", hr.Ports)
+	}
+
+	// 2. Close remaining backend -> all ports suspended -> /readyz returns 503 Service Unavailable
+	_ = backendLn.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.ActiveListenerCount() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	recAllDown := httptest.NewRecorder()
+	handler.ServeHTTP(recAllDown, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recAllDown.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected /readyz 503 when all configured port listeners are suspended, got %d", recAllDown.Code)
 	}
 }

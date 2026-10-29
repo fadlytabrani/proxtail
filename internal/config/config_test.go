@@ -469,3 +469,172 @@ tailnets:
 		})
 	}
 }
+
+func TestProbeSettingsAndDefaults(t *testing.T) {
+	// 1. Default config: probe is disabled
+	defaultYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+`)
+	cfgDefault, err := Parse(defaultYAML)
+	if err != nil {
+		t.Fatalf("unexpected error parsing default config: %v", err)
+	}
+	if cfgDefault.Proxy.Probe.Enabled {
+		t.Errorf("expected probe to be disabled by default, got enabled")
+	}
+
+	// 2. Explicit probe enabled with custom and defaulted fields
+	probeYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+        probe: false
+      - port: 9000
+        destination: 'api:9000'
+proxy:
+  probe:
+    enabled: true
+    interval: 5
+`)
+	cfgProbe, err := Parse(probeYAML)
+	if err != nil {
+		t.Fatalf("unexpected error parsing probe config: %v", err)
+	}
+	if !cfgProbe.Proxy.Probe.Enabled {
+		t.Errorf("expected probe enabled=true")
+	}
+	if cfgProbe.Proxy.Probe.Interval != 5 {
+		t.Errorf("expected interval=5, got %d", cfgProbe.Proxy.Probe.Interval)
+	}
+	if cfgProbe.Proxy.Probe.Timeout != 2 {
+		t.Errorf("expected default timeout=2, got %d", cfgProbe.Proxy.Probe.Timeout)
+	}
+	if cfgProbe.Proxy.Probe.ConsecutiveFailures != 2 {
+		t.Errorf("expected default consecutive_failures=2, got %d", cfgProbe.Proxy.Probe.ConsecutiveFailures)
+	}
+	if cfgProbe.Proxy.Probe.Cooldown != 5 {
+		t.Errorf("expected cooldown to default to interval (5), got %d", cfgProbe.Proxy.Probe.Cooldown)
+	}
+
+	mappings := cfgProbe.ToProxyPortMappings()
+	if len(mappings) != 2 {
+		t.Fatalf("expected 2 port mappings, got %d", len(mappings))
+	}
+	if mappings[0].Probe == nil || *mappings[0].Probe != false {
+		t.Errorf("expected port 8080 to have probe override false, got %+v", mappings[0].Probe)
+	}
+	if mappings[1].Probe != nil {
+		t.Errorf("expected port 9000 to inherit global probe, got %+v", mappings[1].Probe)
+	}
+
+	probeCfg := cfgProbe.ToProxyProbeConfig()
+	if !probeCfg.Enabled || probeCfg.Interval.Seconds() != 5 || probeCfg.Timeout.Seconds() != 2 || probeCfg.ConsecutiveFailures != 2 {
+		t.Errorf("unexpected ToProxyProbeConfig output: %+v", probeCfg)
+	}
+
+	// 3. Environment variable override
+	t.Setenv("PROXTAIL_PROBE_ENABLED", "true")
+	cfgEnv, err := Parse(defaultYAML)
+	if err != nil {
+		t.Fatalf("unexpected error with env probe enabled: %v", err)
+	}
+	if !cfgEnv.Proxy.Probe.Enabled {
+		t.Errorf("expected PROXTAIL_PROBE_ENABLED=true to enable probe")
+	}
+
+	t.Setenv("PROXTAIL_PROBE_ENABLED", "not-a-bool")
+	if _, err := Parse(defaultYAML); err == nil {
+		t.Errorf("expected error for invalid PROXTAIL_PROBE_ENABLED value, got nil")
+	}
+	t.Setenv("PROXTAIL_PROBE_ENABLED", "")
+
+	// 4. Per-port probe: true with global enabled: false still populates probe defaults
+	perPortYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+        probe: true
+`)
+	cfgPerPort, err := Parse(perPortYAML)
+	if err != nil {
+		t.Fatalf("unexpected error parsing per-port probe config: %v", err)
+	}
+	if cfgPerPort.Proxy.Probe.Enabled {
+		t.Errorf("expected global probe.enabled to remain false")
+	}
+	if cfgPerPort.Proxy.Probe.Interval != 10 || cfgPerPort.Proxy.Probe.Timeout != 2 || cfgPerPort.Proxy.Probe.ConsecutiveFailures != 2 || cfgPerPort.Proxy.Probe.Cooldown != 10 {
+		t.Errorf("expected probe defaults to be populated for per-port override, got %+v", cfgPerPort.Proxy.Probe)
+	}
+
+	// 5. Invalid validation settings (including negative values and per-port enabled invalid bounds)
+	invalidCases := []string{
+		`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+proxy:
+  probe:
+    enabled: true
+    interval: -5
+`,
+		`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+proxy:
+  probe:
+    enabled: true
+    interval: 5000
+`,
+		`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+proxy:
+  probe:
+    enabled: true
+    timeout: 100
+`,
+		`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+proxy:
+  probe:
+    enabled: true
+    consecutive_failures: 20
+`,
+		`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+        probe: true
+proxy:
+  probe:
+    cooldown: -1
+`,
+	}
+	for idx, inv := range invalidCases {
+		if _, err := Parse([]byte(inv)); err == nil {
+			t.Errorf("case %d: expected validation error for invalid probe config, got nil", idx)
+		}
+	}
+}

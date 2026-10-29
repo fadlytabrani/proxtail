@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -111,16 +112,27 @@ type PortMapping struct {
 	Tailnet           string `yaml:"-"`                        // Populated automatically from parent TailnetConfig
 	Protocol          string `yaml:"protocol,omitempty"`       // Protocol: "tcp" or "udp" (default: "tcp")
 	ConnectionTimeout int    `yaml:"timeout,omitempty"`        // Connection timeout in seconds (default: 30)
+	Probe             *bool  `yaml:"probe,omitempty"`          // Optional per-port override for active upstream reachability probing
+}
+
+// ProbeSettings defines active upstream reachability probing and listener suspension options.
+type ProbeSettings struct {
+	Enabled             bool `yaml:"enabled,omitempty"`              // Enable active upstream reachability probing and listener suspension (default: false)
+	Interval            int  `yaml:"interval,omitempty"`             // Background probe interval in seconds (default: 10)
+	Timeout             int  `yaml:"timeout,omitempty"`              // Probe dial/read timeout in seconds (default: 2)
+	ConsecutiveFailures int  `yaml:"consecutive_failures,omitempty"` // Consecutive failures before suspending listener (default: 2)
+	Cooldown            int  `yaml:"cooldown,omitempty"`             // Traffic-aware activity cooldown in seconds (default: 10)
 }
 
 // ProxySettings defines performance, binding, health check, and monitoring settings for the proxy server.
 type ProxySettings struct {
-	ListenAddress   string `yaml:"listen_address,omitempty"`   // Default local bind IP for all ports (default: all interfaces)
-	BufferSize      int    `yaml:"buffer_size,omitempty"`      // Buffer size in KB (default: 512)
-	WorkerPoolSize  int    `yaml:"worker_pool_size,omitempty"` // Max concurrent workers (default: 200)
-	EnableMetrics   bool   `yaml:"enable_metrics,omitempty"`   // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
-	MetricsInterval int    `yaml:"metrics_interval,omitempty"` // Metrics logging interval in seconds (default: 60 when metrics enabled)
-	HealthPort      int    `yaml:"health_port,omitempty"`      // Optional HTTP port for /healthz and Prometheus /metrics endpoints
+	ListenAddress   string        `yaml:"listen_address,omitempty"`   // Default local bind IP for all ports (default: all interfaces)
+	BufferSize      int           `yaml:"buffer_size,omitempty"`      // Buffer size in KB (default: 512)
+	WorkerPoolSize  int           `yaml:"worker_pool_size,omitempty"` // Max concurrent workers (default: 200)
+	EnableMetrics   bool          `yaml:"enable_metrics,omitempty"`   // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
+	MetricsInterval int           `yaml:"metrics_interval,omitempty"` // Metrics logging interval in seconds (default: 60 when metrics enabled)
+	HealthPort      int           `yaml:"health_port,omitempty"`      // Optional HTTP port for /healthz and Prometheus /metrics endpoints
+	Probe           ProbeSettings `yaml:"probe,omitempty"`            // Active upstream reachability probing and listener suspension
 }
 
 // Config defines the structure for the YAML configuration file.
@@ -203,6 +215,28 @@ func ApplyDefaults(cfg *Config) {
 			} else {
 				cfg.Proxy.HealthPort = -1 // Trigger validation error in Validate
 			}
+		}
+	}
+
+	if val := strings.TrimSpace(os.Getenv("PROXTAIL_PROBE_ENABLED")); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			cfg.Proxy.Probe.Enabled = b
+		}
+	}
+	if cfg.Proxy.Probe.Interval == 0 {
+		cfg.Proxy.Probe.Interval = 10
+	}
+	if cfg.Proxy.Probe.Timeout == 0 {
+		cfg.Proxy.Probe.Timeout = 2
+	}
+	if cfg.Proxy.Probe.ConsecutiveFailures == 0 {
+		cfg.Proxy.Probe.ConsecutiveFailures = 2
+	}
+	if cfg.Proxy.Probe.Cooldown == 0 {
+		if cfg.Proxy.Probe.Interval > 0 {
+			cfg.Proxy.Probe.Cooldown = cfg.Proxy.Probe.Interval
+		} else {
+			cfg.Proxy.Probe.Cooldown = 10
 		}
 	}
 
@@ -340,12 +374,20 @@ func Validate(cfg *Config) error {
 				return fmt.Errorf("invalid protocol '%s' in tailnet %s, port %d: must be 'tcp' or 'udp'", port.Protocol, tailnet.Name, port.Source)
 			}
 
-			if cfg.Proxy.HealthPort > 0 && protocol == "tcp" && port.Source == cfg.Proxy.HealthPort {
-				return fmt.Errorf("port conflict: health_port %d conflicts with TCP source port %d in tailnet '%s'",
-					cfg.Proxy.HealthPort, port.Source, tailnet.Name)
+			portListenAddr := strings.TrimSpace(port.ListenAddress)
+			if portListenAddr == "" {
+				portListenAddr = strings.TrimSpace(cfg.Proxy.ListenAddress)
 			}
 
-			portKey := fmt.Sprintf("%d-%s", port.Source, protocol)
+			if cfg.Proxy.HealthPort > 0 && protocol == "tcp" && port.Source == cfg.Proxy.HealthPort {
+				healthBind := strings.TrimSpace(cfg.Proxy.ListenAddress)
+				if portListenAddr == "" || healthBind == "" || portListenAddr == "0.0.0.0" || healthBind == "0.0.0.0" || portListenAddr == healthBind {
+					return fmt.Errorf("port conflict: health_port %d conflicts with TCP source port %d in tailnet '%s'",
+						cfg.Proxy.HealthPort, port.Source, tailnet.Name)
+				}
+			}
+
+			portKey := fmt.Sprintf("%s:%d-%s", portListenAddr, port.Source, protocol)
 			if existingTailnet, exists := portMap[portKey]; exists {
 				return fmt.Errorf("port conflict: port %d (%s) is used by both tailnet '%s' and tailnet '%s'",
 					port.Source, protocol, existingTailnet, tailnet.Name)
@@ -367,6 +409,40 @@ func Validate(cfg *Config) error {
 	}
 	if cfg.Proxy.MetricsInterval < 1 || cfg.Proxy.MetricsInterval > 3600 {
 		return fmt.Errorf("invalid metrics_interval %d: must be between 1 and 3600 seconds", cfg.Proxy.MetricsInterval)
+	}
+
+	if val := strings.TrimSpace(os.Getenv("PROXTAIL_PROBE_ENABLED")); val != "" {
+		if _, err := strconv.ParseBool(val); err != nil {
+			return fmt.Errorf("invalid PROXTAIL_PROBE_ENABLED '%s': must be a boolean", val)
+		}
+	}
+
+	probeEnabled := cfg.Proxy.Probe.Enabled
+	if !probeEnabled {
+		for _, tailnet := range cfg.Tailnets {
+			for _, port := range tailnet.Ports {
+				if port.Probe != nil && *port.Probe {
+					probeEnabled = true
+					break
+				}
+			}
+			if probeEnabled {
+				break
+			}
+		}
+	}
+
+	if (probeEnabled || cfg.Proxy.Probe.Interval != 0) && (cfg.Proxy.Probe.Interval < 1 || cfg.Proxy.Probe.Interval > 3600) {
+		return fmt.Errorf("invalid probe.interval %d: must be between 1 and 3600 seconds", cfg.Proxy.Probe.Interval)
+	}
+	if (probeEnabled || cfg.Proxy.Probe.Timeout != 0) && (cfg.Proxy.Probe.Timeout < 1 || cfg.Proxy.Probe.Timeout > 60) {
+		return fmt.Errorf("invalid probe.timeout %d: must be between 1 and 60 seconds", cfg.Proxy.Probe.Timeout)
+	}
+	if (probeEnabled || cfg.Proxy.Probe.ConsecutiveFailures != 0) && (cfg.Proxy.Probe.ConsecutiveFailures < 1 || cfg.Proxy.Probe.ConsecutiveFailures > 10) {
+		return fmt.Errorf("invalid probe.consecutive_failures %d: must be between 1 and 10", cfg.Proxy.Probe.ConsecutiveFailures)
+	}
+	if (probeEnabled || cfg.Proxy.Probe.Cooldown != 0) && (cfg.Proxy.Probe.Cooldown < 1 || cfg.Proxy.Probe.Cooldown > 3600) {
+		return fmt.Errorf("invalid probe.cooldown %d: must be between 1 and 3600 seconds", cfg.Proxy.Probe.Cooldown)
 	}
 
 	return nil
@@ -396,8 +472,36 @@ func (c *Config) ToProxyPortMappings() []proxy.PortMapping {
 				Protocol:          protocol,
 				Tailnet:           tailnet.Name,
 				ConnectionTimeout: timeout,
+				Probe:             port.Probe,
 			})
 		}
 	}
 	return mappings
+}
+
+// ToProxyProbeConfig converts Config.Proxy.Probe into a proxy.ProbeConfig.
+func (c *Config) ToProxyProbeConfig() proxy.ProbeConfig {
+	interval := c.Proxy.Probe.Interval
+	if interval <= 0 {
+		interval = 10
+	}
+	timeout := c.Proxy.Probe.Timeout
+	if timeout <= 0 {
+		timeout = 2
+	}
+	consecutiveFailures := c.Proxy.Probe.ConsecutiveFailures
+	if consecutiveFailures <= 0 {
+		consecutiveFailures = 2
+	}
+	cooldown := c.Proxy.Probe.Cooldown
+	if cooldown <= 0 {
+		cooldown = interval
+	}
+	return proxy.ProbeConfig{
+		Enabled:             c.Proxy.Probe.Enabled,
+		Interval:            time.Duration(interval) * time.Second,
+		Timeout:             time.Duration(timeout) * time.Second,
+		ConsecutiveFailures: consecutiveFailures,
+		Cooldown:            time.Duration(cooldown) * time.Second,
+	}
 }

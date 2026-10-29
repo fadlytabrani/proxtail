@@ -38,6 +38,15 @@ tailnets:
 # Optional proxy tuning & monitoring (omit entirely to use defaults: 512KB buffer, 200 workers)
 proxy:
   metrics_interval: 30 # Log performance metrics every 30s (omit or set 0 to disable)
+  health_port: 9090    # Exposes /healthz, /readyz, and /metrics
+
+  # Active upstream reachability probing and local listener suspension (e.g. for F5 BIG-IP / ADC frontends)
+  probe:
+    enabled: true            # Enable active reachability probing (default: false)
+    interval: 10             # Idle check interval in seconds (default: 10)
+    timeout: 2               # Dial probe timeout in seconds (default: 2)
+    consecutive_failures: 2  # Failures before suspending listener (default: 2; dial-failure is instant)
+    cooldown: 10             # Skip probing if client traffic occurred in last 10s (default: 10)
 
 # Environment variables for this configuration:
 #   TS_AUTHKEY_PRODUCTION=tskey-auth-xxxxx

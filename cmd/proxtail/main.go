@@ -377,6 +377,7 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 	}
 
 	proxyServer.UpdateTailnetServers(servers)
+	proxyServer.SetProbeConfig(newCfg.ToProxyProbeConfig())
 
 	if err := proxyServer.ReloadConfig(newPortMappings); err != nil {
 		return fmt.Errorf("failed to apply new config: %w", err)
@@ -472,6 +473,7 @@ type healthTailnetStatus struct {
 type healthResponse struct {
 	Status           string                `json:"status"`
 	Tailnets         []healthTailnetStatus `json:"tailnets"`
+	Ports            []proxy.PortStatus    `json:"ports,omitempty"`
 	TCPConnections   int64                 `json:"tcp_connections"`
 	UDPPackets       int64                 `json:"udp_packets"`
 	BytesTransferred int64                 `json:"bytes_transferred"`
@@ -491,6 +493,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		stats := proxyServer.GetStats()
+		portStatuses := proxyServer.GetPortStatuses()
 		servers := tm.snapshotServers()
 
 		names := make([]string, 0, len(servers))
@@ -522,6 +525,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		_ = json.NewEncoder(w).Encode(healthResponse{
 			Status:           "ok",
 			Tailnets:         tailnets,
+			Ports:            portStatuses,
 			TCPConnections:   stats.TCPConnections,
 			UDPPackets:       stats.UDPPackets,
 			BytesTransferred: stats.BytesTransferred,
@@ -531,8 +535,12 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		servers := tm.snapshotServers()
+		configuredPorts := proxyServer.ConfiguredPortCount()
 		activeListeners := proxyServer.ActiveListenerCount()
-		ready := proxyServer.IsReady() && (len(proxyServer.Ports) == 0 || len(servers) > 0)
+		ready := proxyServer.IsReady() && (configuredPorts == 0 || len(servers) > 0)
+		if configuredPorts > 0 && activeListeners == 0 {
+			ready = false
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		status := "ready"
@@ -768,6 +776,7 @@ func main() {
 		cfg.Proxy.BufferSize*1024,
 		cfg.Proxy.WorkerPoolSize,
 	)
+	proxyServer.SetProbeConfig(cfg.ToProxyProbeConfig())
 
 	if cfg.Proxy.HealthPort > 0 {
 		if err := startHealthServer(ctx, cfg.Proxy.ListenAddress, cfg.Proxy.HealthPort, proxyServer, tm); err != nil {

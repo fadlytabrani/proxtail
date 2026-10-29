@@ -419,6 +419,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `protocol` | `string` | `"tcp"` | Layer 4 protocol: `"tcp"` or `"udp"`. |
 | `listen_address` | `string` | `proxy.listen_address` *(all)* | Local IP to bind on (e.g., `"127.0.0.1"` for loopback only). |
 | `timeout` | `int` | `30` | Idle connection / session timeout in seconds (`1`–`3600`). |
+| `probe` | `bool` | *(inherits global)* | Optional per-port override to enable (`true`) or disable (`false`) active reachability probing. |
 
 ### `proxy` Settings *(Optional)*
 
@@ -430,6 +431,11 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `enable_metrics` | `bool` | `false` | Explicitly enable/disable metrics logging. |
 | `buffer_size` | `int` | `512` | Per-connection I/O copy buffer size in KB (`1`–`8192`). |
 | `worker_pool_size` | `int` | `200` | Maximum concurrent forwarding workers (`1`–`10000`). |
+| `probe.enabled` | `bool` | `false` | Enable active upstream TCP/UDP probing and automatic listener suspension for load balancers. |
+| `probe.interval` | `int` | `10` | Background probe interval in seconds (`1`–`3600`) when idle. |
+| `probe.timeout` | `int` | `2` | Probe dial and read deadline in seconds (`1`–`60`). |
+| `probe.consecutive_failures` | `int` | `2` | Consecutive failures before suspending the local listener (`1`–`10`). |
+| `probe.cooldown` | `int` | `10` | Traffic-aware activity cooldown in seconds; skips background probes when real client traffic is active. |
 
 ### Environment Variables & CLI Flags
 
@@ -445,6 +451,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `PROXTAIL_CONFIG` | Path to configuration file. |
 | `PROXTAIL_HEALTH_PORT` | Sets `proxy.health_port` via environment variable. |
 | `PROXTAIL_LISTEN_ADDRESS` | Sets `proxy.listen_address` via environment variable. |
+| `PROXTAIL_PROBE_ENABLED` | Set to `"true"` to enable active upstream probing and listener suspension via environment variable. |
 | `PROXTAIL_NETNS_ENABLED` | Set to `"true"` to enable `tailscale.com/net/netns` (disabled by default in userspace mode). |
 | `TS_STATE_DIR` | Directory used for Tailscale state storage (default in container: `/var/lib/tsnet`). |
 
@@ -491,10 +498,24 @@ Modify `config.yaml` to add, update, or remove ports on the fly:
 - **Signal**: Trigger manually via `kill -HUP $(pgrep proxtail)` or `docker kill --signal=HUP proxtail`.
 - **Safe Rollback**: If an invalid configuration is introduced, `proxtail` rejects it, logs the validation error, and continues serving active traffic without interruption.
 
-### Tailnet Peer & VIP Service Discovery (`/healthz`)
+### Active Upstream Probing & ADC Listener Suspension
 
-When `health_port` is configured (or via `PROXTAIL_HEALTH_PORT=9090`), the `/healthz` HTTP endpoint returns comprehensive operational health and live network discovery details for each configured tailnet:
+When placing `proxtail` behind an external L4 load balancer or Application Delivery Controller (e.g., **F5 BIG-IP**, **HAProxy**, **Envoy**, or **AWS NLB**), enabling `proxy.probe.enabled: true` (or `PROXTAIL_PROBE_ENABLED=true`) links local socket availability directly to Tailscale upstream reachability:
+
+- **TCP Listener Suspension (`ECONNREFUSED` / `TCP RST`)**: When an upstream TCP destination becomes unreachable, `proxtail` closes the corresponding local `net.Listener` so the host kernel immediately rejects incoming probes—including half-open SYN monitors like F5 BIG-IP `tcp_half_open`—and automatically re-binds the listener once upstream reachability recovers.
+- **UDP Socket Suspension (`ICMP Port Unreachable`)**: When an upstream Tailnet peer goes offline or rejects zero-byte UDP probes with ICMP Port Unreachable, `proxtail` suspends the local `net.PacketConn` so the host OS replies with `ICMP Port Unreachable` to upstream load balancers, re-binding automatically upon recovery.
+- **Low-CPU 5-Point Probing Architecture**:
+  1. **Opt-in Zero Overhead**: Disabled by default (`0` background goroutines or hot-path timers when disabled); overridable per port via `probe: true/false`.
+  2. **Traffic-Aware Cooldown**: Coalesced upstream activity tracking (`cooldown`, default `10s`) skips background probes completely whenever live traffic recently received data or completed a TCP handshake from the upstream backend.
+  3. **Asymmetric Failure Detection**: Live client dial failures trigger instant reactive listener suspension, while background idle probes require `consecutive_failures` (default `2`) to prevent flapping.
+  4. **Cached In-Memory Peer Check**: Inspects a 2-second per-tailnet cached Tailscale peer status map before dialing; offline peers fail immediately with zero WireGuard handshakes or network packets.
+  5. **Staggered Jitter**: Randomized startup delay (`100–500ms`) and `±20%` interval jitter prevent synchronized probe bursts across large port tables.
+
+### Tailnet Peer, VIP & Port Health Discovery (`/healthz`)
+
+When `health_port` is configured (or via `PROXTAIL_HEALTH_PORT=9090`), the `/healthz` HTTP endpoint returns comprehensive operational health, per-port bind status, and live network discovery details for each configured tailnet:
 - **Node Addresses**: Tailscale IPv4 and IPv6 addresses assigned to the `proxtail` node.
+- **Per-Port Reachability (`ports[]`)**: Live local bind state (`up: true/false`), bind address, destination, protocol, tailnet, and `last_error` when suspended by upstream probing.
 - **Active Peers**: Discovered tailnet peer nodes with hostname, MagicDNS names, IP addresses, OS, online status, and network transfer counters.
 - **VIP Services**: Discovered Tailscale Virtual IP (VIP) services with service names, display names, resolved MagicDNS FQDNs (`<service-name>.<magic-dns-suffix>`), VIP addresses, and exposed proto-ports.
 
@@ -505,17 +526,13 @@ curl http://localhost:9090/healthz | jq
 Example JSON response:
 ```json
 {
-  "status": "healthy",
-  "version": "v0.2.0",
-  "uptime": "1h24m10s",
-  "listeners": 2,
+  "status": "ok",
   "tailnets": [
     {
       "name": "production",
-      "addresses": [
-        "100.64.0.42",
-        "fd7a:115c:a1e0::2a"
-      ],
+      "hostname": "proxtail-production",
+      "ipv4": "100.64.0.42",
+      "ipv6": "fd7a:115c:a1e0::2a",
       "vip_services": [
         {
           "name": "svc:api-backend",
@@ -533,9 +550,9 @@ Example JSON response:
       ],
       "peers": [
         {
-          "id": 1048576,
+          "id": "n1048576CNTRL",
           "hostname": "postgres-prod-01",
-          "dns_name": "postgres-prod-01.example-tailnet.ts.net.",
+          "dns_name": "postgres-prod-01.example-tailnet.ts.net",
           "tailscale_ips": [
             "100.64.0.15",
             "fd7a:115c:a1e0::f"
@@ -549,12 +566,26 @@ Example JSON response:
         }
       ]
     }
-  ]
+  ],
+  "ports": [
+    {
+      "source_port": 5432,
+      "listen_addr": ":5432",
+      "destination": "postgres-prod-01:5432",
+      "protocol": "tcp",
+      "tailnet": "production",
+      "up": true
+    }
+  ],
+  "tcp_connections": 4,
+  "udp_packets": 1280,
+  "bytes_transferred": 157286400,
+  "errors": 0
 }
 ```
 
 ### Readiness Probe (`/readyz`)
-Returns `200 OK` once all configured TCP and UDP listeners are actively bound and serving traffic. Returns `503 Service Unavailable` during startup, reconfiguration, or graceful teardown (`SIGTERM`).
+Returns `200 OK` once configured listeners are initialized and at least one configured TCP or UDP listener is actively bound (or immediately in zero-port discovery mode). Returns `503 Service Unavailable` during startup, graceful teardown (`SIGTERM`), or when all configured port listeners are suspended due to unreachable upstreams.
 
 ### Prometheus Metrics
 When `health_port` is enabled (e.g. `PROXTAIL_HEALTH_PORT=9090`):
