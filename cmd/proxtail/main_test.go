@@ -14,7 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/tsnet"
+	"tailscale.com/types/logger"
+	"tailscale.com/util/eventbus"
 
 	"proxtail/internal/config"
 	"proxtail/internal/proxy"
@@ -514,5 +518,42 @@ func TestResolveTailnetDirReadOnlyFallback(t *testing.T) {
 	// Non-ephemeral mode must fail when TS_STATE_DIR is not writable
 	if _, _, err := resolveTailnetDir("prod", false); err == nil {
 		t.Errorf("expected non-ephemeral resolveTailnetDir to fail when TS_STATE_DIR is unwritable")
+	}
+}
+
+func TestNetnsDisabledByDefault(t *testing.T) {
+	mon, err := netmon.New(eventbus.New(), logger.Discard)
+	if err != nil {
+		t.Fatalf("failed to create netmon: %v", err)
+	}
+	defer mon.Close()
+
+	d := &net.Dialer{}
+	dialer := netns.FromDialer(logger.Discard, mon, d)
+	if dialer == nil {
+		t.Fatalf("expected non-nil dialer")
+	}
+	// By default in proxtail init(), netns is disabled, so d.Control is nil (no SO_BINDTODEVICE/SO_MARK hooks)
+	if d.Control != nil {
+		t.Errorf("expected d.Control to be nil when netns is disabled")
+	}
+
+	// Verify that toggling netns works and restore disabled state via Cleanup
+	t.Cleanup(func() {
+		netns.SetEnabled(false)
+	})
+
+	netns.SetEnabled(true)
+	dEnabled := &net.Dialer{}
+	_ = netns.FromDialer(logger.Discard, mon, dEnabled)
+	if dEnabled.Control == nil {
+		t.Errorf("expected dEnabled.Control to be non-nil when netns is enabled")
+	}
+
+	netns.SetEnabled(false)
+	dDisabled := &net.Dialer{}
+	_ = netns.FromDialer(logger.Discard, mon, dDisabled)
+	if dDisabled.Control != nil {
+		t.Errorf("expected dDisabled.Control to be nil when netns is disabled")
 	}
 }

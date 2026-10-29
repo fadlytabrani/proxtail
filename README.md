@@ -445,6 +445,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `PROXTAIL_CONFIG` | Path to configuration file. |
 | `PROXTAIL_HEALTH_PORT` | Sets `proxy.health_port` via environment variable. |
 | `PROXTAIL_LISTEN_ADDRESS` | Sets `proxy.listen_address` via environment variable. |
+| `PROXTAIL_NETNS_ENABLED` | Set to `"true"` to enable `tailscale.com/net/netns` (disabled by default in userspace mode). |
 | `TS_STATE_DIR` | Directory used for Tailscale state storage (default in container: `/var/lib/tsnet`). |
 
 ---

@@ -24,11 +24,22 @@ import (
 	"github.com/fsnotify/fsnotify"
 	_ "tailscale.com/feature/oauthkey"
 	"tailscale.com/ipn/store/mem"
+	"tailscale.com/net/netns"
 	"tailscale.com/tsnet"
 
 	"proxtail/internal/config"
 	"proxtail/internal/proxy"
 )
+
+func init() {
+	// proxtail operates purely in userspace (tsnet + gVisor netstack) without
+	// a host TUN interface or kernel routing table modifications. Disable netns
+	// by default to prevent failed SO_BINDTODEVICE / SO_MARK syscalls and noisy
+	// warnings when running as an unprivileged process (e.g., UID 10001).
+	if os.Getenv("PROXTAIL_NETNS_ENABLED") != "true" {
+		netns.SetEnabled(false)
+	}
+}
 
 // tailnetManager manages the lifecycle of multiple tsnet.Server instances.
 type tailnetManager struct {

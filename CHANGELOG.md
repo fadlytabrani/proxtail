@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Disabled `netns` in Userspace Mode**:
+  - Explicitly disabled `tailscale.com/net/netns` socket binding by default (`netns.SetEnabled(false)`), eliminating `[unexpected] netns: SO_BINDTODEVICE("lo") ... operation not permitted` warnings on Linux and Kubernetes restricted pods without `CAP_NET_RAW`.
+  - Added `PROXTAIL_NETNS_ENABLED=true` environment variable override to re-enable `netns` if ever required.
 - **Zero-Port Discovery Mode**:
   - Allow starting `proxtail` with zero port mappings (`ports: []` or omitted) for initial tailnet peer and Virtual IP (VIP) services discovery via `GET /healthz`.
   - Allow dynamic hot-reload transitions down to 0 ports (`ReloadConfig`), gracefully closing active TCP and UDP listeners without dropping tailnet connectivity.
