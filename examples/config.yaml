@@ -3,12 +3,14 @@
 #   - hostname defaults to "<system-hostname>-<name>"
 #   - auth_key defaults to "TS_AUTHKEY_<NAME>" (or "TS_AUTHKEY" for a single tailnet)
 #   - ephemeral defaults to true
+#   - auto_proxy_vips defaults to true (automatically discovers and proxies Tailscale VIP services into vip_port_range)
 #   - protocol defaults to "tcp"
 #   - destination port defaults to source_port/port if omitted (e.g., "web-server" -> "web-server:8080")
 #   - timeout defaults to 30 seconds
 
 tailnets:
   - name: 'production'
+    auto_proxy_vips: true # Enabled by default: dynamically binds discovered VIP services in vip_port_range
     ports:
       # Same port on proxy and target ("web-server" -> "web-server:8080", protocol defaults to tcp)
       - port: 8080
@@ -31,14 +33,17 @@ tailnets:
         destination: 'staging-web:8080'
 
   - name: 'development'
+    auto_proxy_vips: false # Optional: disable automatic VIP service proxying for a specific tailnet
     ports:
       - port: 3000
         destination: 'dev-server'
 
 # Optional proxy tuning & monitoring (omit entirely to use defaults: 512KB buffer, 200 workers)
 proxy:
-  metrics_interval: 30 # Log performance metrics every 30s (omit or set 0 to disable)
-  health_port: 9090    # Exposes /healthz, /readyz, and /metrics
+  metrics_interval: 30        # Log performance metrics every 30s (omit or set 0 to disable)
+  health_port: 9090           # Exposes /healthz, /readyz, and /metrics
+  vip_port_range: '30000-30999' # Reserved local port range for auto-proxied VIP services (manual ports cannot overlap)
+  vip_refresh_interval: 30    # Fallback VIP discovery refresh interval in seconds (alongside real-time IPN bus events)
 
   # Active upstream reachability probing and local listener suspension (e.g. for F5 BIG-IP / ADC frontends)
   probe:

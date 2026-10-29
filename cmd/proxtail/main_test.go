@@ -95,12 +95,26 @@ func TestTailnetManagerSyncTailnets(t *testing.T) {
 
 func getFreePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to get free port: %v", err)
+	var held []net.Listener
+	defer func() {
+		for _, ln := range held {
+			_ = ln.Close()
+		}
+	}()
+	for range 20 {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to get free port: %v", err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		if port < 30000 || port > 30999 {
+			_ = l.Close()
+			return port
+		}
+		held = append(held, l)
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	t.Fatal("failed to allocate free port outside reserved default vip_port_range 30000-30999")
+	return 0
 }
 
 func TestMultiTailnetReloadConfigEndToEnd(t *testing.T) {

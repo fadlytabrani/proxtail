@@ -164,7 +164,7 @@ flowchart TD
 - **Parallel Multi-Core UDP Engine**: Multi-worker reader pool and 16-shard cacheline-padded session table scale parallel UDP traffic by **3.24x** to **~61,000 pkts/s** with zero lock contention.
 - **Horizontal Kubernetes Scaling**: Scales linearly across pod replicas (tested **3.12x** TCP and **3.94x** UDP throughput scaling across 3 pods) using dynamic `${HOSTNAME}` node registration.
 - **Instant Clean Teardown**: Ephemeral nodes are deregistered immediately on `SIGTERM` via `b.Logout()`, purging nodes from the Tailscale admin console in **< 150 ms** without waiting for 30–60 minute timeouts.
-- **Tailnet Peer & VIP Service Discovery**: Automatic discovery of active tailnet peers and Virtual IP (VIP) services with MagicDNS FQDNs, VIP IPs, and exposed ports via `/healthz`.
+- **Automatic VIP Service Discovery & Dynamic Proxying**: Enabled by default (`auto_proxy_vips: true`), `proxtail` watches Tailscale's IPN bus in real time (`WatchIPNBus`) and automatically binds discovered Virtual IP (VIP) services onto sticky local ports from a reserved range (`proxy.vip_port_range`, default `30000-30999`), dynamically adding and removing listeners with zero restarts and exposing `vip_service` mappings via `/healthz`.
 - **Cross-Platform Standalone Binaries**: Precompiled standalone binaries for Linux, macOS, Windows, and FreeBSD with zero external dependencies.
 - **Tailscale OAuth & Auto ACL Tag Discovery**: Authenticate with non-expiring OAuth client secrets (`tskey-client-...`). When `tags:` are omitted in YAML, `proxtail` automatically queries the Tailscale API to discover and advertise authorized tags.
 - **Zero-Downtime Hot Reload**: Dynamic file watching and Kubernetes atomic symlink detection (`..data`) reload routes in **< 100 ms** without dropping active connections.
@@ -355,16 +355,28 @@ tailnets:
         destination: 'internal-app:8080'
 ```
 
-### Recipe 7: Forwarding to Tailscale Virtual IP (VIP) Services
-Forward local traffic directly to high-availability Tailscale VIP services or `tailscale serve` endpoints using their service name or MagicDNS FQDN:
+### Recipe 7: Automatic Tailscale VIP Service Discovery & Proxying
+By default (`auto_proxy_vips: true`), `proxtail` automatically discovers all Tailscale Virtual IP (VIP) services visible to each tailnet node and proxies their TCP/UDP ports onto sticky local ports from `proxy.vip_port_range` (default `30000-30999`)—updating dynamically in real time via Tailscale's IPN bus whenever VIP services are added, modified, or removed:
 
 ```yaml
 tailnets:
-  - ports:
-      # Resolves via tsnet DNS to VIP service address (discovered in /healthz)
-      - port: 8443
-        destination: 'api-backend:443'
+  - name: 'production'
+    # auto_proxy_vips defaults to true (no manual port entries needed for VIP services!)
+  - name: 'development'
+    auto_proxy_vips: false # Optional: opt out of automatic VIP proxying for a specific tailnet
+
+proxy:
+  health_port: 9090
+  vip_port_range: '30000-30999' # Reserved exclusively for auto-proxied VIP services
+  vip_refresh_interval: 30      # Fallback poll interval in seconds alongside real-time IPN bus events
 ```
+
+Inspect active VIP local port allocations at any time via `/healthz` (`ports[].vip_service`):
+```bash
+curl -s http://localhost:9090/healthz | jq '.ports[] | select(.vip_service != null)'
+```
+
+*(You can also manually map a specific local port outside `vip_port_range`—such as `8443`—to a VIP service hostname or FQDN via `ports:`.)*
 
 ### Recipe 8: Zero-Port Tailnet Discovery Mode
 Start `proxtail` with zero port mappings (`ports: []` or omitted) to discover active tailnet peers and Virtual IP (VIP) services via `/healthz` before defining routes:
@@ -406,6 +418,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `auth_key` | `string` | `TS_AUTHKEY_<NAME>` *(or `TS_AUTHKEY`)* | Env var name or literal auth key (`tskey-auth-...`) / OAuth secret (`tskey-client-...`). |
 | `tags` | `list` | Auto-discovered from OAuth | Tailscale ACL tags to advertise (e.g., `["tag:proxy"]`). Discovered automatically for OAuth secrets. |
 | `ephemeral` | `bool` | `true` | If `true`, state is in-memory and the node deregisters on exit. If `false`, persists to disk. |
+| `auto_proxy_vips` | `bool` | `true` | Automatically discover and proxy Tailscale VIP services in this tailnet onto `proxy.vip_port_range`. |
 | `control_url` | `string` | Tailscale Control Plane | Custom coordination URL (e.g., for Headscale). |
 | `wireguard_port` | `int` | `0` *(auto)* | Optional static UDP port for direct peer-to-peer WireGuard traffic. |
 | `web_client` | `bool` | `false` | Serve Tailscale's built-in node management web UI on port `5252` inside the tailnet. |
@@ -414,7 +427,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `port` *(or `source_port`)* | `int` | *(required)* | Local port `proxtail` listens on (`1`–`65535`). |
+| `port` *(or `source_port`)* | `int` | *(required)* | Local port `proxtail` listens on (`1`–`65535`, must be outside `proxy.vip_port_range`). |
 | `destination` | `string` | *(required)* | Destination `host:port` or `host` inside the tailnet (supports MagicDNS hostnames, VIP services, FQDNs, or Tailscale IPs). If `:port` is omitted, reuses `port`. Supports `${ENV_VAR}`. |
 | `protocol` | `string` | `"tcp"` | Layer 4 protocol: `"tcp"` or `"udp"`. |
 | `listen_address` | `string` | `proxy.listen_address` *(all)* | Local IP to bind on (e.g., `"127.0.0.1"` for loopback only). |
@@ -426,7 +439,9 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `listen_address` | `string` | `""` *(all interfaces)* | Default local bind IP for all ports and health probes (e.g., `"127.0.0.1"`). |
-| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz`, `/readyz`, and `/metrics`. |
+| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz`, `/readyz`, and `/metrics` (must be outside `vip_port_range`). |
+| `vip_port_range` | `string` | `"30000-30999"` | Reserved local `"start-end"` port range allocated exclusively to auto-proxied VIP services. |
+| `vip_refresh_interval` | `int` | `30` | Fallback VIP service discovery refresh interval in seconds (`1`–`3600`), alongside real-time IPN bus events. |
 | `metrics_interval` | `int` | Disabled (`60` if enabled) | Frequency (in seconds) to log periodic `METRICS:` summaries. |
 | `enable_metrics` | `bool` | `false` | Explicitly enable/disable metrics logging. |
 | `buffer_size` | `int` | `512` | Per-connection I/O copy buffer size in KB (`1`–`8192`). |
@@ -451,6 +466,8 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `PROXTAIL_CONFIG` | Path to configuration file. |
 | `PROXTAIL_HEALTH_PORT` | Sets `proxy.health_port` via environment variable. |
 | `PROXTAIL_LISTEN_ADDRESS` | Sets `proxy.listen_address` via environment variable. |
+| `PROXTAIL_VIP_PORT_RANGE` | Sets `proxy.vip_port_range` (e.g., `"30000-30999"`) via environment variable. |
+| `PROXTAIL_VIP_REFRESH_INTERVAL` | Sets `proxy.vip_refresh_interval` (in seconds) via environment variable. |
 | `PROXTAIL_PROBE_ENABLED` | Set to `"true"` to enable active upstream probing and listener suspension via environment variable. |
 | `PROXTAIL_NETNS_ENABLED` | Set to `"true"` to enable `tailscale.com/net/netns` (disabled by default in userspace mode). |
 | `TS_STATE_DIR` | Directory used for Tailscale state storage (default in container: `/var/lib/tsnet`). |
@@ -574,6 +591,15 @@ Example JSON response:
       "destination": "postgres-prod-01:5432",
       "protocol": "tcp",
       "tailnet": "production",
+      "up": true
+    },
+    {
+      "source_port": 30000,
+      "listen_addr": ":30000",
+      "destination": "100.64.0.100:443",
+      "protocol": "tcp",
+      "tailnet": "production",
+      "vip_service": "api-backend",
       "up": true
     }
   ],

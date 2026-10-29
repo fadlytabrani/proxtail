@@ -89,6 +89,7 @@ type PortStatus struct {
 	Destination   string `json:"destination"`
 	Protocol      string `json:"protocol"`
 	Tailnet       string `json:"tailnet"`
+	VIPService    string `json:"vip_service,omitempty"`
 	Up            bool   `json:"up"`
 	LastError     string `json:"last_error,omitempty"`
 }
@@ -341,6 +342,7 @@ type PortMapping struct {
 	Destination       string
 	Protocol          string
 	Tailnet           string
+	VIPService        string
 	ConnectionTimeout int
 	Probe             *bool
 }
@@ -405,6 +407,8 @@ type Proxy struct {
 	udpConns     map[string]*listenerInfo
 	ctx          context.Context
 	cancel       context.CancelFunc
+	startedCh    chan struct{}
+	startedOnce  sync.Once
 	stopOnce     sync.Once
 
 	// Upstream reachability probe settings
@@ -480,6 +484,7 @@ func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, 
 		udpConns:       make(map[string]*listenerInfo),
 		ctx:            ctx,
 		cancel:         cancel,
+		startedCh:      make(chan struct{}),
 		probeConfig: ProbeConfig{
 			Interval:            10 * time.Second,
 			Timeout:             2 * time.Second,
@@ -738,6 +743,11 @@ func (p *Proxy) releaseWorker() {
 	<-p.workerPool
 }
 
+// Started returns a channel that is closed once Start has bound all initial listeners.
+func (p *Proxy) Started() <-chan struct{} {
+	return p.startedCh
+}
+
 // Start initializes and starts all configured TCP and UDP listeners, then blocks until stopped.
 // If any listener fails to bind during startup, all previously started listeners are rolled back.
 func (p *Proxy) Start(ctx context.Context) error {
@@ -766,6 +776,9 @@ func (p *Proxy) Start(ctx context.Context) error {
 		}
 	}
 	p.mu.Unlock()
+	p.startedOnce.Do(func() {
+		close(p.startedCh)
+	})
 
 	select {
 	case <-ctx.Done():
@@ -1375,6 +1388,7 @@ func portsEqual(a, b PortMapping) bool {
 		strings.TrimSpace(a.ListenAddress) == strings.TrimSpace(b.ListenAddress) &&
 		a.Destination == b.Destination &&
 		a.Tailnet == b.Tailnet &&
+		a.VIPService == b.VIPService &&
 		strings.EqualFold(a.Protocol, b.Protocol) &&
 		a.ConnectionTimeout == b.ConnectionTimeout &&
 		probeEqual
@@ -1922,6 +1936,7 @@ func (p *Proxy) GetPortStatuses() []PortStatus {
 			Destination:   port.Destination,
 			Protocol:      strings.ToLower(port.Protocol),
 			Tailnet:       port.Tailnet,
+			VIPService:    port.VIPService,
 		}
 		if info, ok := p.tcpListeners[key]; ok {
 			info.mu.Lock()
@@ -1967,6 +1982,15 @@ func (p *Proxy) ConfiguredPortCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.Ports)
+}
+
+// CurrentPorts returns a snapshot copy of the currently configured port mappings.
+func (p *Proxy) CurrentPorts() []PortMapping {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]PortMapping, len(p.Ports))
+	copy(out, p.Ports)
+	return out
 }
 
 // IsReady reports whether the proxy is running and all configured port listeners are initialized.

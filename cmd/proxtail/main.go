@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	_ "tailscale.com/feature/oauthkey"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 
 	"proxtail/internal/config"
@@ -43,20 +45,41 @@ func init() {
 
 // tailnetManager manages the lifecycle of multiple tsnet.Server instances.
 type tailnetManager struct {
-	mu          sync.Mutex
-	reloadMu    sync.Mutex
-	servers     map[string]*tsnet.Server
-	configs     map[string]config.TailnetConfig
-	initFunc    func(config.TailnetConfig) (*tsnet.Server, error)
-	cleanupFunc func(*tsnet.Server, string)
+	mu              sync.Mutex
+	reloadMu        sync.Mutex
+	servers         map[string]*tsnet.Server
+	configs         map[string]config.TailnetConfig
+	initFunc        func(config.TailnetConfig) (*tsnet.Server, error)
+	cleanupFunc     func(*tsnet.Server, string)
+	dialerForServer func(string, *tsnet.Server) proxy.Dialer
+
+	vipDiscoverFunc vipDiscoverFunc
+	activeCfg       *config.Config
+	appliedPorts    []proxy.PortMapping
+	vipAllocations  map[vipAllocKey]int
+	lastTailnetVIPs map[string]map[tailcfg.ServiceName]tailcfg.ServiceDetails
+
+	vipWatchMu         sync.Mutex
+	reconcilerCtx      context.Context
+	reconcilerCancel   context.CancelFunc
+	vipTriggerCh       chan struct{}
+	vipTickerCh        chan time.Duration
+	vipWatchers        map[string]vipWatcherEntry
+	vipInterval        time.Duration
+	vipRefreshOverride time.Duration
+	vipDebounceDelay   time.Duration
 }
 
 func newTailnetManager() *tailnetManager {
 	return &tailnetManager{
-		servers:     make(map[string]*tsnet.Server),
-		configs:     make(map[string]config.TailnetConfig),
-		initFunc:    initializeServer,
-		cleanupFunc: cleanupTailnetServer,
+		servers:         make(map[string]*tsnet.Server),
+		configs:         make(map[string]config.TailnetConfig),
+		initFunc:        initializeServer,
+		cleanupFunc:     cleanupTailnetServer,
+		vipDiscoverFunc: defaultDiscoverVIPServices,
+		vipAllocations:  make(map[vipAllocKey]int),
+		lastTailnetVIPs: make(map[string]map[tailcfg.ServiceName]tailcfg.ServiceDetails),
+		vipWatchers:     make(map[string]vipWatcherEntry),
 	}
 }
 
@@ -340,6 +363,8 @@ func (tm *tailnetManager) snapshotServers() map[string]*tsnet.Server {
 
 // closeAll shuts down all managed tsnet.Server instances.
 func (tm *tailnetManager) closeAll() {
+	tm.stopVIPWatchers()
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -362,7 +387,7 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 		return fmt.Errorf("failed to load new config: %w", err)
 	}
 
-	newPortMappings := newCfg.ToProxyPortMappings()
+	manualMappings := newCfg.ToProxyPortMappings()
 
 	servers, restartedTailnets, cleanupRemoved, err := tm.syncTailnets(newCfg.Tailnets)
 	if err != nil {
@@ -370,16 +395,41 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 	}
 	defer cleanupRemoved()
 
-	for _, mapping := range newPortMappings {
+	for _, mapping := range manualMappings {
 		if _, exists := servers[mapping.Tailnet]; !exists {
 			return fmt.Errorf("port mapping for port %d references unknown tailnet '%s'", mapping.Source, mapping.Tailnet)
 		}
 	}
 
-	proxyServer.UpdateTailnetServers(servers)
+	if tm.dialerForServer != nil {
+		dialers := make(map[string]proxy.Dialer, len(servers))
+		for name, srv := range servers {
+			dialers[name] = tm.dialerForServer(name, srv)
+		}
+		proxyServer.UpdateTailnetDialers(dialers)
+	} else {
+		proxyServer.UpdateTailnetServers(servers)
+	}
 	proxyServer.SetProbeConfig(newCfg.ToProxyProbeConfig())
 
-	if err := proxyServer.ReloadConfig(newPortMappings); err != nil {
+	vipPorts, nextAllocs, discoveredSnap, diffLogs, err := tm.computeVIPMappingsLocked(context.Background(), newCfg, servers, false)
+	if err != nil {
+		return fmt.Errorf("failed to resolve VIP port mappings: %w", err)
+	}
+
+	desiredPorts := make([]proxy.PortMapping, 0, len(manualMappings)+len(vipPorts))
+	desiredPorts = append(desiredPorts, manualMappings...)
+	desiredPorts = append(desiredPorts, vipPorts...)
+
+	prevApplied := tm.appliedPorts
+	if prevApplied == nil {
+		prevApplied = proxyServer.CurrentPorts()
+	}
+
+	if err := proxyServer.ReloadConfig(desiredPorts); err != nil {
+		if rbErr := proxyServer.ReloadConfig(slices.Clone(prevApplied)); rbErr != nil {
+			log.Printf("Warning: error rolling back failed config reload: %v", rbErr)
+		}
 		return fmt.Errorf("failed to apply new config: %w", err)
 	}
 
@@ -388,6 +438,17 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 			return fmt.Errorf("failed to restart ports for updated tailnets: %w", err)
 		}
 	}
+
+	tm.activeCfg = newCfg
+	tm.vipAllocations = nextAllocs
+	tm.lastTailnetVIPs = discoveredSnap
+	tm.appliedPorts = slices.Clone(desiredPorts)
+
+	for _, line := range diffLogs {
+		log.Println(line)
+	}
+
+	tm.syncVIPWatchers(newCfg, servers)
 
 	return nil
 }
@@ -766,12 +827,19 @@ func main() {
 
 	for _, mapping := range portMappings {
 		if _, exists := tailnetServers[mapping.Tailnet]; !exists {
+			tm.closeAll()
 			log.Fatalf("Port mapping for port %d references unknown tailnet '%s'", mapping.Source, mapping.Tailnet)
 		}
 	}
 
+	initialPorts, err := tm.prepareInitialPorts(ctx, cfg, tailnetServers)
+	if err != nil {
+		tm.closeAll()
+		log.Fatalf("Failed to initialize VIP service port mappings: %v", err)
+	}
+
 	proxyServer := proxy.NewProxyWithMultiTailnet(
-		portMappings,
+		initialPorts,
 		tailnetServers,
 		cfg.Proxy.BufferSize*1024,
 		cfg.Proxy.WorkerPoolSize,
@@ -780,49 +848,14 @@ func main() {
 
 	if cfg.Proxy.HealthPort > 0 {
 		if err := startHealthServer(ctx, cfg.Proxy.ListenAddress, cfg.Proxy.HealthPort, proxyServer, tm); err != nil {
+			tm.closeAll()
 			log.Fatalf("Failed to start health server: %v", err)
 		}
 	}
 
-	go startConfigWatcher(ctx, configFile, reloadChan)
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-reloadChan:
-				log.Printf("Processing configuration reload...")
-				if err := reloadConfig(configFile, proxyServer, tm); err != nil {
-					log.Printf("Failed to reload config: %v", err)
-				} else {
-					log.Printf("Configuration reloaded successfully")
-				}
-			}
-		}
-	}()
-
-	if cfg.Proxy.EnableMetrics {
-		go func() {
-			ticker := time.NewTicker(time.Duration(cfg.Proxy.MetricsInterval) * time.Second)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					stats := proxyServer.GetStats()
-					log.Printf("METRICS: TCP_Connections=%d, UDP_Packets=%d, Bytes_Transferred=%d, Errors=%d",
-						stats.TCPConnections, stats.UDPPackets, stats.BytesTransferred, stats.ErrorCount)
-				}
-			}
-		}()
-	}
-
 	fmt.Printf("Starting proxtail with %d tailnets, %d workers, %dKB buffers...\n",
 		len(tailnetServers), cfg.Proxy.WorkerPoolSize, cfg.Proxy.BufferSize)
-	if len(portMappings) == 0 {
+	if len(initialPorts) == 0 {
 		if cfg.Proxy.HealthPort > 0 {
 			log.Printf("Running in tailnet discovery mode (0 port mappings configured; health & discovery active on :%d)", cfg.Proxy.HealthPort)
 		} else {
@@ -838,16 +871,70 @@ func main() {
 	}()
 
 	var startupErr error
+	proxyStarted := false
 	select {
 	case startupErr = <-proxyErrChan:
 		if startupErr != nil {
 			log.Printf("Proxy server exited with error: %v", startupErr)
 			cancel()
 		}
+	case <-proxyServer.Started():
+		proxyStarted = true
 	case <-shutdown:
 		log.Println("Shutdown signal received, stopping proxy...")
 	case <-ctx.Done():
 		log.Println("Context cancelled, stopping proxy...")
+	}
+
+	if proxyStarted {
+		tm.startVIPReconciler(ctx, proxyServer)
+		go startConfigWatcher(ctx, configFile, reloadChan)
+
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-reloadChan:
+					log.Printf("Processing configuration reload...")
+					if err := reloadConfig(configFile, proxyServer, tm); err != nil {
+						log.Printf("Failed to reload config: %v", err)
+					} else {
+						log.Printf("Configuration reloaded successfully")
+					}
+				}
+			}
+		}()
+
+		if cfg.Proxy.EnableMetrics {
+			go func() {
+				ticker := time.NewTicker(time.Duration(cfg.Proxy.MetricsInterval) * time.Second)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						stats := proxyServer.GetStats()
+						log.Printf("METRICS: TCP_Connections=%d, UDP_Packets=%d, Bytes_Transferred=%d, Errors=%d",
+							stats.TCPConnections, stats.UDPPackets, stats.BytesTransferred, stats.ErrorCount)
+					}
+				}
+			}()
+		}
+
+		select {
+		case startupErr = <-proxyErrChan:
+			if startupErr != nil {
+				log.Printf("Proxy server exited with error: %v", startupErr)
+				cancel()
+			}
+		case <-shutdown:
+			log.Println("Shutdown signal received, stopping proxy...")
+		case <-ctx.Done():
+			log.Println("Context cancelled, stopping proxy...")
+		}
 	}
 
 	log.Println("Stopping proxy server...")

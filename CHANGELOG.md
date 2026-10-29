@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Automatic Tailscale VIP Service Discovery & Dynamic Proxying**:
+  - Automatically discovers Tailscale Virtual IP (VIP) services (`LocalClient().GetServices()`) per tailnet and proxies their advertised TCP/UDP ports onto local listeners allocated from a reserved configurable range (`proxy.vip_port_range`, default `"30000-30999"`, override via `PROXTAIL_VIP_PORT_RANGE`).
+  - Enabled by default on every tailnet via minimal tailnet-level boolean `auto_proxy_vips` (default `true`; set `auto_proxy_vips: false` to opt out per tailnet).
+  - Enforces strict port reservation in `config.Validate`: manual `port` / `source_port` mappings and `proxy.health_port` are rejected if they fall inside `proxy.vip_port_range`.
+  - Event-driven continuous synchronization via Tailscale's local IPN notification bus (`WatchIPNBus(ctx, ipn.NotifyInitialState)` tracking `SelfChange` / `State` with zero peer-churn overhead) paired with a configurable fallback refresh interval (`proxy.vip_refresh_interval`, default `30` seconds, override via `PROXTAIL_VIP_REFRESH_INTERVAL`).
+  - Sticky local port allocation keyed by `(tailnet, service, target_port)` so dual-protocol VIP services (e.g., TCP+UDP on port `53`) share the same local port number and adding/removing VIP services at runtime never shifts or drops unaffected active connections.
+  - Fail-fast startup and atomic runtime reconciliation rollback when any VIP port allocation (`vip_port_range` exhaustion or wildcard port range) or socket bind fails, plus `vip_service` attribution on auto-proxied entries in `GET /healthz` `ports[]`.
 - **Active TCP & UDP Upstream Probing, Local Listener Suspension & Per-Port Health Status**:
   - Added opt-in active upstream reachability probing (`proxy.probe` with `enabled`, `interval`, `timeout`, `consecutive_failures`, `cooldown`, `PROXTAIL_PROBE_ENABLED`, and per-port `probe: true/false` overrides) with hot-reload support.
   - Automatically suspends local TCP `net.Listener` (`TCP RST` / `ECONNREFUSED`, supporting half-open SYN monitors such as F5 BIG-IP `tcp_half_open`) and UDP `net.PacketConn` (`ICMP Port Unreachable`) when upstream destinations are unreachable, and re-binds automatically upon recovery.

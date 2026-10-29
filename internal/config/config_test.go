@@ -304,6 +304,12 @@ func TestConnectionSettingsEqual(t *testing.T) {
 	if base.ConnectionSettingsEqual(diffEph) {
 		t.Errorf("expected different ephemeral to not be equal")
 	}
+
+	diffVIP := base
+	diffVIP.AutoProxyVIPs = &fVal
+	if !base.ConnectionSettingsEqual(diffVIP) {
+		t.Errorf("expected toggling AutoProxyVIPs not to change ConnectionSettingsEqual")
+	}
 }
 
 func TestExampleConfigFileValid(t *testing.T) {
@@ -636,5 +642,181 @@ proxy:
 		if _, err := Parse([]byte(inv)); err == nil {
 			t.Errorf("case %d: expected validation error for invalid probe config, got nil", idx)
 		}
+	}
+}
+
+func TestVIPSettingsDefaultsEnvAndValidation(t *testing.T) {
+	// 1. Defaults: auto_proxy_vips=true, vip_port_range="30000-30999", vip_refresh_interval=30
+	defaultYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+  - name: 'staging'
+    auto_proxy_vips: false
+`)
+	cfg, err := Parse(defaultYAML)
+	if err != nil {
+		t.Fatalf("unexpected error parsing default VIP config: %v", err)
+	}
+	if !cfg.Tailnets[0].IsAutoProxyVIPs() {
+		t.Errorf("expected prod tailnet IsAutoProxyVIPs()=true by default, got false")
+	}
+	if cfg.Tailnets[1].IsAutoProxyVIPs() {
+		t.Errorf("expected staging tailnet IsAutoProxyVIPs()=false, got true")
+	}
+	if cfg.Proxy.VIPPortRange != DefaultVIPPortRange {
+		t.Errorf("expected default VIPPortRange %q, got %q", DefaultVIPPortRange, cfg.Proxy.VIPPortRange)
+	}
+	if cfg.Proxy.VIPRefreshInterval != DefaultVIPRefreshInterval {
+		t.Errorf("expected default VIPRefreshInterval %d, got %d", DefaultVIPRefreshInterval, cfg.Proxy.VIPRefreshInterval)
+	}
+
+	// 2. Custom vip_port_range and vip_refresh_interval (allowing manual port 30000 when range moved)
+	customYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 30000
+        destination: 'web:80'
+proxy:
+  vip_port_range: '40000-40010'
+  vip_refresh_interval: 15
+`)
+	cfgCustom, err := Parse(customYAML)
+	if err != nil {
+		t.Fatalf("expected manual port 30000 to succeed when vip_port_range is 40000-40010, got: %v", err)
+	}
+	start, end, err := ParsePortRange(cfgCustom.Proxy.VIPPortRange)
+	if err != nil || start != 40000 || end != 40010 {
+		t.Errorf("unexpected ParsePortRange result: start=%d end=%d err=%v", start, end, err)
+	}
+	if cfgCustom.Proxy.VIPRefreshInterval != 15 {
+		t.Errorf("expected VIPRefreshInterval=15, got %d", cfgCustom.Proxy.VIPRefreshInterval)
+	}
+
+	// 3. Environment variable overrides
+	t.Setenv("PROXTAIL_VIP_PORT_RANGE", "35000-35000")
+	t.Setenv("PROXTAIL_VIP_REFRESH_INTERVAL", "45")
+	cfgEnv, err := Parse(defaultYAML)
+	if err != nil {
+		t.Fatalf("unexpected error with VIP env overrides: %v", err)
+	}
+	if cfgEnv.Proxy.VIPPortRange != "35000-35000" {
+		t.Errorf("expected VIPPortRange='35000-35000' from env, got %q", cfgEnv.Proxy.VIPPortRange)
+	}
+	if cfgEnv.Proxy.VIPRefreshInterval != 45 {
+		t.Errorf("expected VIPRefreshInterval=45 from env, got %d", cfgEnv.Proxy.VIPRefreshInterval)
+	}
+
+	t.Setenv("PROXTAIL_VIP_REFRESH_INTERVAL", "not-an-int")
+	if _, err := Parse(defaultYAML); err == nil {
+		t.Errorf("expected Parse to fail on invalid PROXTAIL_VIP_REFRESH_INTERVAL")
+	}
+	t.Setenv("PROXTAIL_VIP_PORT_RANGE", "")
+	t.Setenv("PROXTAIL_VIP_REFRESH_INTERVAL", "")
+
+	// 4. Validation failures for reserved VIP port range conflicts and malformed settings
+	invalidCases := []struct {
+		name        string
+		yaml        string
+		errContains string
+	}{
+		{
+			name: "manual source_port at start of default vip_port_range",
+			yaml: `
+tailnets:
+  - name: 'prod'
+    ports:
+      - source_port: 30000
+        destination: 'web:80'
+`,
+			errContains: "falls within reserved vip_port_range 30000-30999",
+		},
+		{
+			name: "manual port alias at end of default vip_port_range even when auto_proxy_vips false",
+			yaml: `
+tailnets:
+  - name: 'prod'
+    auto_proxy_vips: false
+    ports:
+      - port: 30999
+        destination: 'web:80'
+`,
+			errContains: "falls within reserved vip_port_range 30000-30999",
+		},
+		{
+			name: "health_port inside vip_port_range",
+			yaml: `
+tailnets:
+  - name: 'prod'
+proxy:
+  health_port: 30500
+`,
+			errContains: "health_port 30500 falls within reserved vip_port_range 30000-30999",
+		},
+		{
+			name: "malformed vip_port_range missing hyphen",
+			yaml: `
+tailnets:
+  - name: 'prod'
+proxy:
+  vip_port_range: '30000'
+`,
+			errContains: "expected 'start-end' format",
+		},
+		{
+			name: "inverted vip_port_range",
+			yaml: `
+tailnets:
+  - name: 'prod'
+proxy:
+  vip_port_range: '31000-30000'
+`,
+			errContains: "start port (31000) cannot be greater than end port (30000)",
+		},
+		{
+			name: "out of bounds vip_port_range",
+			yaml: `
+tailnets:
+  - name: 'prod'
+proxy:
+  vip_port_range: '30000-70000'
+`,
+			errContains: "ports must be between 1 and 65535",
+		},
+		{
+			name: "negative vip_refresh_interval",
+			yaml: `
+tailnets:
+  - name: 'prod'
+proxy:
+  vip_refresh_interval: -5
+`,
+			errContains: "invalid vip_refresh_interval -5",
+		},
+		{
+			name: "excessive vip_refresh_interval",
+			yaml: `
+tailnets:
+  - name: 'prod'
+proxy:
+  vip_refresh_interval: 5000
+`,
+			errContains: "invalid vip_refresh_interval 5000",
+		},
+	}
+
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.errContains)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Fatalf("expected error containing %q, got %q", tc.errContains, err.Error())
+			}
+		})
 	}
 }

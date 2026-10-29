@@ -14,17 +14,47 @@ import (
 	"proxtail/internal/proxy"
 )
 
+const (
+	// DefaultVIPPortRange is the default reserved local port range for auto-proxied Tailscale VIP services.
+	DefaultVIPPortRange = "30000-30999"
+	// DefaultVIPRefreshInterval is the default fallback VIP service discovery polling interval in seconds.
+	DefaultVIPRefreshInterval = 30
+)
+
+// ParsePortRange parses and validates a "start-end" port range specification (inclusive),
+// requiring 1 <= start <= end <= 65535.
+func ParsePortRange(spec string) (int, int, error) {
+	trimmed := strings.TrimSpace(spec)
+	startStr, endStr, ok := strings.Cut(trimmed, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("invalid vip_port_range '%s': expected 'start-end' format (e.g., '30000-30999')", spec)
+	}
+	start, err1 := strconv.Atoi(strings.TrimSpace(startStr))
+	end, err2 := strconv.Atoi(strings.TrimSpace(endStr))
+	if err1 != nil || err2 != nil {
+		return 0, 0, fmt.Errorf("invalid vip_port_range '%s': start and end must be integers", spec)
+	}
+	if start < 1 || start > 65535 || end < 1 || end > 65535 {
+		return 0, 0, fmt.Errorf("invalid vip_port_range '%s': ports must be between 1 and 65535", spec)
+	}
+	if start > end {
+		return 0, 0, fmt.Errorf("invalid vip_port_range '%s': start port (%d) cannot be greater than end port (%d)", spec, start, end)
+	}
+	return start, end, nil
+}
+
 // TailnetConfig defines settings for a specific Tailscale network.
 type TailnetConfig struct {
-	Name          string        `yaml:"name"`                     // Unique identifier for this tailnet (defaults to "default" if single tailnet)
-	Hostname      string        `yaml:"hostname,omitempty"`       // Hostname for this tailnet (optional, defaults to "<system-hostname>-<name>")
-	AuthKey       string        `yaml:"auth_key,omitempty"`       // Auth key or OAuth secret env var / literal (optional, defaults to "TS_AUTHKEY_<NAME>")
-	ControlURL    string        `yaml:"control_url,omitempty"`    // Coordination server URL (optional, defaults to Tailscale control plane)
-	Ephemeral     *bool         `yaml:"ephemeral,omitempty"`      // Whether this node is ephemeral (optional, defaults to true)
-	Tags          []string      `yaml:"tags,omitempty"`           // Tailscale ACL tags to advertise (e.g., ["tag:proxy"])
-	WireGuardPort uint16        `yaml:"wireguard_port,omitempty"` // Optional UDP port for direct peer-to-peer WireGuard traffic
-	WebClient     bool          `yaml:"web_client,omitempty"`     // Optional Tailscale web management client on port 5252
-	Ports         []PortMapping `yaml:"ports"`                    // Ports to forward for this tailnet
+	Name          string        `yaml:"name"`                      // Unique identifier for this tailnet (defaults to "default" if single tailnet)
+	Hostname      string        `yaml:"hostname,omitempty"`        // Hostname for this tailnet (optional, defaults to "<system-hostname>-<name>")
+	AuthKey       string        `yaml:"auth_key,omitempty"`        // Auth key or OAuth secret env var / literal (optional, defaults to "TS_AUTHKEY_<NAME>")
+	ControlURL    string        `yaml:"control_url,omitempty"`     // Coordination server URL (optional, defaults to Tailscale control plane)
+	Ephemeral     *bool         `yaml:"ephemeral,omitempty"`       // Whether this node is ephemeral (optional, defaults to true)
+	AutoProxyVIPs *bool         `yaml:"auto_proxy_vips,omitempty"` // Automatically discover and proxy Tailscale VIP services (optional, defaults to true)
+	Tags          []string      `yaml:"tags,omitempty"`            // Tailscale ACL tags to advertise (e.g., ["tag:proxy"])
+	WireGuardPort uint16        `yaml:"wireguard_port,omitempty"`  // Optional UDP port for direct peer-to-peer WireGuard traffic
+	WebClient     bool          `yaml:"web_client,omitempty"`      // Optional Tailscale web management client on port 5252
+	Ports         []PortMapping `yaml:"ports"`                     // Ports to forward for this tailnet
 }
 
 // IsEphemeral returns the configured ephemeral value, defaulting to true if unset.
@@ -33,6 +63,15 @@ func (t TailnetConfig) IsEphemeral() bool {
 		return true
 	}
 	return *t.Ephemeral
+}
+
+// IsAutoProxyVIPs returns whether automatic Tailscale VIP service discovery and proxying
+// is enabled for this tailnet, defaulting to true if unset.
+func (t TailnetConfig) IsAutoProxyVIPs() bool {
+	if t.AutoProxyVIPs == nil {
+		return true
+	}
+	return *t.AutoProxyVIPs
 }
 
 // ConnectionSettingsEqual reports whether two TailnetConfig values have identical
@@ -126,13 +165,15 @@ type ProbeSettings struct {
 
 // ProxySettings defines performance, binding, health check, and monitoring settings for the proxy server.
 type ProxySettings struct {
-	ListenAddress   string        `yaml:"listen_address,omitempty"`   // Default local bind IP for all ports (default: all interfaces)
-	BufferSize      int           `yaml:"buffer_size,omitempty"`      // Buffer size in KB (default: 512)
-	WorkerPoolSize  int           `yaml:"worker_pool_size,omitempty"` // Max concurrent workers (default: 200)
-	EnableMetrics   bool          `yaml:"enable_metrics,omitempty"`   // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
-	MetricsInterval int           `yaml:"metrics_interval,omitempty"` // Metrics logging interval in seconds (default: 60 when metrics enabled)
-	HealthPort      int           `yaml:"health_port,omitempty"`      // Optional HTTP port for /healthz and Prometheus /metrics endpoints
-	Probe           ProbeSettings `yaml:"probe,omitempty"`            // Active upstream reachability probing and listener suspension
+	ListenAddress      string        `yaml:"listen_address,omitempty"`       // Default local bind IP for all ports (default: all interfaces)
+	BufferSize         int           `yaml:"buffer_size,omitempty"`          // Buffer size in KB (default: 512)
+	WorkerPoolSize     int           `yaml:"worker_pool_size,omitempty"`     // Max concurrent workers (default: 200)
+	EnableMetrics      bool          `yaml:"enable_metrics,omitempty"`       // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
+	MetricsInterval    int           `yaml:"metrics_interval,omitempty"`     // Metrics logging interval in seconds (default: 60 when metrics enabled)
+	HealthPort         int           `yaml:"health_port,omitempty"`          // Optional HTTP port for /healthz and Prometheus /metrics endpoints
+	VIPPortRange       string        `yaml:"vip_port_range,omitempty"`       // Reserved local port range for auto-proxied VIP services (default: "30000-30999")
+	VIPRefreshInterval int           `yaml:"vip_refresh_interval,omitempty"` // Fallback VIP discovery refresh interval in seconds (default: 30)
+	Probe              ProbeSettings `yaml:"probe,omitempty"`                // Active upstream reachability probing and listener suspension
 }
 
 // Config defines the structure for the YAML configuration file.
@@ -218,6 +259,26 @@ func ApplyDefaults(cfg *Config) {
 		}
 	}
 
+	cfg.Proxy.VIPPortRange = strings.TrimSpace(cfg.Proxy.VIPPortRange)
+	if cfg.Proxy.VIPPortRange == "" {
+		cfg.Proxy.VIPPortRange = strings.TrimSpace(os.Getenv("PROXTAIL_VIP_PORT_RANGE"))
+	}
+	if cfg.Proxy.VIPPortRange == "" {
+		cfg.Proxy.VIPPortRange = DefaultVIPPortRange
+	}
+	if cfg.Proxy.VIPRefreshInterval == 0 {
+		if vrStr := strings.TrimSpace(os.Getenv("PROXTAIL_VIP_REFRESH_INTERVAL")); vrStr != "" {
+			if vr, err := strconv.Atoi(vrStr); err == nil && vr > 0 {
+				cfg.Proxy.VIPRefreshInterval = vr
+			} else {
+				cfg.Proxy.VIPRefreshInterval = -1 // Trigger validation error in Validate
+			}
+		}
+	}
+	if cfg.Proxy.VIPRefreshInterval == 0 {
+		cfg.Proxy.VIPRefreshInterval = DefaultVIPRefreshInterval
+	}
+
 	if val := strings.TrimSpace(os.Getenv("PROXTAIL_PROBE_ENABLED")); val != "" {
 		if b, err := strconv.ParseBool(val); err == nil {
 			cfg.Proxy.Probe.Enabled = b
@@ -257,6 +318,10 @@ func ApplyDefaults(cfg *Config) {
 		if cfg.Tailnets[i].Ephemeral == nil {
 			defaultEphemeral := true
 			cfg.Tailnets[i].Ephemeral = &defaultEphemeral
+		}
+		if cfg.Tailnets[i].AutoProxyVIPs == nil {
+			defaultAutoVIPs := true
+			cfg.Tailnets[i].AutoProxyVIPs = &defaultAutoVIPs
 		}
 		if cfg.Tailnets[i].AuthKey == "" && cfg.Tailnets[i].Name != "" {
 			defaultEnv := DefaultAuthKeyEnv(cfg.Tailnets[i].Name)
@@ -320,6 +385,22 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("invalid health_port %d: must be between 1 and 65535", cfg.Proxy.HealthPort)
 	}
 
+	vipRangeSpec := strings.TrimSpace(cfg.Proxy.VIPPortRange)
+	if vipRangeSpec == "" {
+		vipRangeSpec = DefaultVIPPortRange
+	}
+	vipStart, vipEnd, err := ParsePortRange(vipRangeSpec)
+	if err != nil {
+		return err
+	}
+	if cfg.Proxy.VIPRefreshInterval != 0 && (cfg.Proxy.VIPRefreshInterval < 1 || cfg.Proxy.VIPRefreshInterval > 3600) {
+		return fmt.Errorf("invalid vip_refresh_interval %d: must be between 1 and 3600 seconds", cfg.Proxy.VIPRefreshInterval)
+	}
+	if cfg.Proxy.HealthPort >= vipStart && cfg.Proxy.HealthPort <= vipEnd {
+		return fmt.Errorf("port conflict: health_port %d falls within reserved vip_port_range %d-%d",
+			cfg.Proxy.HealthPort, vipStart, vipEnd)
+	}
+
 	tailnetNames := make(map[string]bool)
 	for _, tailnet := range cfg.Tailnets {
 		if strings.TrimSpace(tailnet.Name) == "" {
@@ -348,6 +429,10 @@ func Validate(cfg *Config) error {
 			}
 			if port.Source <= 0 || port.Source > 65535 {
 				return fmt.Errorf("invalid source port %d in tailnet %s: must be between 1 and 65535", port.Source, tailnet.Name)
+			}
+			if port.Source >= vipStart && port.Source <= vipEnd {
+				return fmt.Errorf("port conflict: manual source port %d in tailnet '%s' falls within reserved vip_port_range %d-%d",
+					port.Source, tailnet.Name, vipStart, vipEnd)
 			}
 			if port.ListenAddress != "" && net.ParseIP(port.ListenAddress) == nil {
 				return fmt.Errorf("invalid listen_address '%s' in tailnet %s, port %d: must be a valid IP address",
