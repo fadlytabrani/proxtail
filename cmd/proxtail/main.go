@@ -501,8 +501,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 					if ip6.IsValid() {
 						st.IPv6 = ip6.String()
 					}
-					st.VIPServices = discoverVIPServices(r.Context(), srv)
-					st.Peers = discoverTailnetPeers(r.Context(), srv)
+					st.Peers, st.VIPServices = discoverTailnetDetails(r.Context(), srv)
 				}
 			}
 			tailnets = append(tailnets, st)

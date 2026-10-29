@@ -23,6 +23,7 @@ type healthPeerStatus struct {
 // healthVIPService describes a Tailnet Virtual IP / VIP Service for /healthz.
 type healthVIPService struct {
 	Name        string   `json:"name"`
+	DNSName     string   `json:"dns_name,omitempty"`
 	DisplayName string   `json:"display_name,omitempty"`
 	IPv4        string   `json:"ipv4,omitempty"`
 	IPv6        string   `json:"ipv6,omitempty"`
@@ -70,31 +71,14 @@ func extractPeersFromStatus(tsStatus *ipnstate.Status) []healthPeerStatus {
 	return peers
 }
 
-// discoverTailnetPeers queries the live tsnet LocalClient for tailnet peer status.
-func discoverTailnetPeers(ctx context.Context, srv *tsnet.Server) []healthPeerStatus {
-	if srv == nil || srv.Sys() == nil {
-		return nil
-	}
-	lc, err := srv.LocalClient()
-	if err != nil || lc == nil {
-		return nil
-	}
-	stCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	tsStatus, err := lc.Status(stCtx)
-	if err != nil || tsStatus == nil {
-		return nil
-	}
-	return extractPeersFromStatus(tsStatus)
-}
-
 // extractVIPServices converts a map of Tailscale ServiceDetails into a
-// deterministic, name-sorted slice of healthVIPService entries.
-func extractVIPServices(svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails) []healthVIPService {
+// deterministic, name-sorted slice of healthVIPService entries with MagicDNS FQDNs.
+func extractVIPServices(svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails, magicDNSSuffix string) []healthVIPService {
 	if len(svcs) == 0 {
 		return nil
 	}
+
+	magicDNSSuffix = strings.Trim(magicDNSSuffix, ".")
 
 	result := make([]healthVIPService, 0, len(svcs))
 	for _, svc := range svcs {
@@ -113,13 +97,20 @@ func extractVIPServices(svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails) []h
 		}
 		sort.Strings(ports)
 
-		name := svc.Name.WithoutPrefix()
+		bare := svc.Name.WithoutPrefix()
+		name := bare
 		if name == "" {
 			name = string(svc.Name)
 		}
 
+		var dnsName string
+		if bare != "" && magicDNSSuffix != "" {
+			dnsName = bare + "." + magicDNSSuffix
+		}
+
 		result = append(result, healthVIPService{
 			Name:        name,
+			DNSName:     dnsName,
 			DisplayName: svc.DisplayName,
 			IPv4:        p4,
 			IPv6:        p6,
@@ -136,21 +127,36 @@ func extractVIPServices(svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails) []h
 	return result
 }
 
-// discoverVIPServices queries the live tsnet LocalClient for tailnet VIP services.
-func discoverVIPServices(ctx context.Context, srv *tsnet.Server) []healthVIPService {
+// discoverTailnetDetails queries the live tsnet LocalClient for tailnet peers and VIP services.
+func discoverTailnetDetails(ctx context.Context, srv *tsnet.Server) ([]healthPeerStatus, []healthVIPService) {
 	if srv == nil || srv.Sys() == nil {
-		return nil
+		return nil, nil
 	}
 	lc, err := srv.LocalClient()
 	if err != nil || lc == nil {
-		return nil
+		return nil, nil
 	}
 	stCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	svcs, err := lc.GetServices(stCtx)
-	if err != nil || len(svcs) == 0 {
-		return nil
+	var peers []healthPeerStatus
+	var magicDNSSuffix string
+
+	tsStatus, err := lc.Status(stCtx)
+	if err == nil && tsStatus != nil {
+		peers = extractPeersFromStatus(tsStatus)
+		if tsStatus.CurrentTailnet != nil && tsStatus.CurrentTailnet.MagicDNSSuffix != "" {
+			magicDNSSuffix = tsStatus.CurrentTailnet.MagicDNSSuffix
+		} else if tsStatus.MagicDNSSuffix != "" {
+			magicDNSSuffix = tsStatus.MagicDNSSuffix
+		}
 	}
-	return extractVIPServices(svcs)
+
+	var vipServices []healthVIPService
+	svcs, err := lc.GetServices(stCtx)
+	if err == nil && len(svcs) > 0 {
+		vipServices = extractVIPServices(svcs, magicDNSSuffix)
+	}
+
+	return peers, vipServices
 }

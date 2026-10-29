@@ -68,14 +68,14 @@ func TestExtractPeersFromStatus(t *testing.T) {
 		t.Errorf("unexpected third peer: %+v", peers[2])
 	}
 
-	// Verify unstarted tsnet.Server safely returns nil from discoverTailnetPeers
-	if got := discoverTailnetPeers(context.Background(), &tsnet.Server{Hostname: "unstarted"}); got != nil {
-		t.Errorf("expected nil peers for unstarted tsnet.Server, got %+v", got)
+	// Verify unstarted tsnet.Server safely returns nil from discoverTailnetDetails
+	if p, _ := discoverTailnetDetails(context.Background(), &tsnet.Server{Hostname: "unstarted"}); p != nil {
+		t.Errorf("expected nil peers for unstarted tsnet.Server, got %+v", p)
 	}
 }
 
 func TestExtractVIPServices(t *testing.T) {
-	if got := extractVIPServices(nil); got != nil {
+	if got := extractVIPServices(nil, "corp.ts.net"); got != nil {
 		t.Fatalf("expected nil for nil services map, got %+v", got)
 	}
 
@@ -102,22 +102,29 @@ func TestExtractVIPServices(t *testing.T) {
 		},
 	}
 
-	got := extractVIPServices(svcs)
+	got := extractVIPServices(svcs, "corp.ts.net.")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 VIP services, got %d", len(got))
 	}
 
-	// Verify sorted by Name: "db" before "web"
-	if got[0].Name != "db" || got[0].DisplayName != "Primary Database" || got[0].IPv4 != "100.64.0.51" || len(got[0].Ports) != 1 || got[0].Ports[0] != "tcp:5432" {
+	// Verify sorted by Name: "db" before "web", with MagicDNS FQDNs
+	if got[0].Name != "db" || got[0].DNSName != "db.corp.ts.net" || got[0].DisplayName != "Primary Database" || got[0].IPv4 != "100.64.0.51" || len(got[0].Ports) != 1 || got[0].Ports[0] != "tcp:5432" {
 		t.Errorf("unexpected first VIP service: %+v", got[0])
 	}
-	if got[1].Name != "web" || got[1].DisplayName != "Web Frontend" || got[1].IPv4 != "100.64.0.50" || got[1].IPv6 != "fd7a:115c:a1e0::50" || len(got[1].Ports) != 2 {
+	if got[1].Name != "web" || got[1].DNSName != "web.corp.ts.net" || got[1].DisplayName != "Web Frontend" || got[1].IPv4 != "100.64.0.50" || got[1].IPv6 != "fd7a:115c:a1e0::50" || len(got[1].Ports) != 2 {
 		t.Errorf("unexpected second VIP service: %+v", got[1])
 	}
 
-	// Verify unstarted tsnet.Server safely returns nil from discoverVIPServices
-	if gotUnstarted := discoverVIPServices(context.Background(), &tsnet.Server{Hostname: "unstarted"}); gotUnstarted != nil {
-		t.Errorf("expected nil VIP services for unstarted tsnet.Server, got %+v", gotUnstarted)
+	// Verify without MagicDNS suffix, DNSName is omitted
+	gotNoSuffix := extractVIPServices(svcs, "")
+	if len(gotNoSuffix) != 2 || gotNoSuffix[0].DNSName != "" || gotNoSuffix[1].DNSName != "" {
+		t.Errorf("expected empty DNSName when magicDNSSuffix is empty, got %+v", gotNoSuffix)
+	}
+
+	// Verify unstarted tsnet.Server safely returns nil from discoverTailnetDetails
+	p, v := discoverTailnetDetails(context.Background(), &tsnet.Server{Hostname: "unstarted"})
+	if p != nil || v != nil {
+		t.Errorf("expected nil from discoverTailnetDetails for unstarted server, got p=%+v v=%+v", p, v)
 	}
 }
 
@@ -130,6 +137,7 @@ func TestHealthTailnetStatusJSONMarshaling(t *testing.T) {
 		VIPServices: []healthVIPService{
 			{
 				Name:        "postgres",
+				DNSName:     "postgres.corp-net.ts.net",
 				DisplayName: "Database Cluster",
 				IPv4:        "100.64.0.50",
 				IPv6:        "fd7a:115c:a1e0::50",
@@ -157,7 +165,7 @@ func TestHealthTailnetStatusJSONMarshaling(t *testing.T) {
 		t.Fatalf("failed to unmarshal healthTailnetStatus: %v", err)
 	}
 
-	if len(decoded.VIPServices) != 1 || decoded.VIPServices[0].Name != "postgres" || decoded.VIPServices[0].IPv4 != "100.64.0.50" {
+	if len(decoded.VIPServices) != 1 || decoded.VIPServices[0].Name != "postgres" || decoded.VIPServices[0].DNSName != "postgres.corp-net.ts.net" || decoded.VIPServices[0].IPv4 != "100.64.0.50" {
 		t.Errorf("unexpected decoded VIP services: %+v", decoded.VIPServices)
 	}
 	if len(decoded.Peers) != 1 || decoded.Peers[0].HostName != "backend" || !decoded.Peers[0].Online {
