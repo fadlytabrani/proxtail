@@ -449,10 +449,11 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 
 // healthTailnetStatus describes the runtime status of a single tailnet for /healthz.
 type healthTailnetStatus struct {
-	Name     string `json:"name"`
-	Hostname string `json:"hostname,omitempty"`
-	IPv4     string `json:"ipv4,omitempty"`
-	IPv6     string `json:"ipv6,omitempty"`
+	Name     string             `json:"name"`
+	Hostname string             `json:"hostname,omitempty"`
+	IPv4     string             `json:"ipv4,omitempty"`
+	IPv6     string             `json:"ipv6,omitempty"`
+	Peers    []healthPeerStatus `json:"peers,omitempty"`
 }
 
 // healthResponse is the JSON payload returned by GET /healthz.
@@ -499,6 +500,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 					if ip6.IsValid() {
 						st.IPv6 = ip6.String()
 					}
+					st.Peers = discoverTailnetPeers(r.Context(), srv)
 				}
 			}
 			tailnets = append(tailnets, st)
