@@ -366,6 +366,25 @@ tailnets:
         destination: 'api-backend:443'
 ```
 
+### Recipe 8: Zero-Port Tailnet Discovery Mode
+Start `proxtail` with zero port mappings (`ports: []` or omitted) to discover active tailnet peers and Virtual IP (VIP) services via `/healthz` before defining routes:
+
+```yaml
+tailnets:
+  - name: 'production'
+    # 'ports:' omitted or set to []
+
+proxy:
+  health_port: 9090
+```
+
+Once running, query `/healthz` to inspect discovered services:
+```bash
+curl http://localhost:9090/healthz | jq .tailnets[0].vip_services
+```
+
+You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automatic file watcher dynamically binds the newly added ports with zero downtime and without reconnecting to the tailnet.
+
 ---
 
 ## Configuration Reference
@@ -382,7 +401,7 @@ tailnets:
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `name` | `string` | `"default"` *(if 1 tailnet)* | Identifier for the tailnet. Required when multiple tailnets are defined. |
-| `ports` | `list` | *(required)* | List of TCP and UDP port mappings for this tailnet. |
+| `ports` | `list` | `[]` *(discovery mode)* | List of TCP and UDP port mappings for this tailnet. Omit or set to `[]` for discovery mode. |
 | `hostname` | `string` | `<system-hostname>-<name>` | Hostname registered in Tailscale. Supports `${ENV_VAR}` expansion. |
 | `auth_key` | `string` | `TS_AUTHKEY_<NAME>` *(or `TS_AUTHKEY`)* | Env var name or literal auth key (`tskey-auth-...`) / OAuth secret (`tskey-client-...`). |
 | `tags` | `list` | Auto-discovered from OAuth | Tailscale ACL tags to advertise (e.g., `["tag:proxy"]`). Discovered automatically for OAuth secrets. |

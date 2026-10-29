@@ -366,6 +366,80 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	}
 }
 
+func TestZeroPortsDiscoveryModeLifecycle(t *testing.T) {
+	tm := newTailnetManager()
+	tm.initFunc = func(cfg config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: cfg.Hostname}, nil
+	}
+	tm.cleanupFunc = func(*tsnet.Server, string) {}
+
+	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{
+		{Name: "discovery-tailnet", Hostname: "discovery-node"},
+	})
+	if err != nil {
+		t.Fatalf("syncTailnets failed: %v", err)
+	}
+
+	// Zero port mappings
+	zeroProxy := proxy.NewProxyWithMultiTailnet(nil, servers, 64*1024, 50)
+	handler := newHealthHandler(zeroProxy, tm)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = zeroProxy.Start(ctx) }()
+	defer zeroProxy.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. /healthz returns 200 OK in discovery mode
+	recHealth := httptest.NewRecorder()
+	handler.ServeHTTP(recHealth, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recHealth.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK in discovery mode, got %d", recHealth.Code)
+	}
+	var hr healthResponse
+	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
+	}
+	if len(hr.Tailnets) != 1 || hr.Tailnets[0].Name != "discovery-tailnet" {
+		t.Errorf("unexpected healthResponse tailnets: %+v", hr.Tailnets)
+	}
+
+	// 2. /readyz returns 200 OK with active_listeners: 0
+	recReady := httptest.NewRecorder()
+	handler.ServeHTTP(recReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recReady.Code != http.StatusOK {
+		t.Fatalf("expected /readyz 200 OK with 0 ports, got %d", recReady.Code)
+	}
+	var rr readyResponse
+	if err := json.Unmarshal(recReady.Body.Bytes(), &rr); err != nil {
+		t.Fatalf("failed decoding /readyz: %v", err)
+	}
+	if rr.Status != "ready" || rr.ActiveListeners != 0 || rr.Tailnets != 1 {
+		t.Errorf("unexpected readyResponse: %+v", rr)
+	}
+
+	// 3. runHealthCheck with HealthPort succeeds
+	healthPort := getFreePort(t)
+	if err := startHealthServer(ctx, "127.0.0.1", healthPort, zeroProxy, tm); err != nil {
+		t.Fatalf("startHealthServer failed: %v", err)
+	}
+	cfgWithHealth := &config.Config{
+		Proxy: config.ProxySettings{ListenAddress: "127.0.0.1", HealthPort: healthPort},
+	}
+	if err := runHealthCheck(cfgWithHealth); err != nil {
+		t.Errorf("runHealthCheck failed: %v", err)
+	}
+
+	// 4. runHealthCheck without HealthPort and with 0 TCP listeners fails with informative error
+	cfgWithoutHealth := &config.Config{
+		Tailnets: []config.TailnetConfig{{Name: "discovery-tailnet"}},
+	}
+	if err := runHealthCheck(cfgWithoutHealth); err == nil {
+		t.Errorf("expected runHealthCheck without health_port and 0 TCP listeners to fail, but succeeded")
+	}
+}
+
 func TestConfigWatcherKubernetesConfigMapSymlink(t *testing.T) {
 	tmpDir := t.TempDir()
 	v1Dir := filepath.Join(tmpDir, "..2026_10_17_01")

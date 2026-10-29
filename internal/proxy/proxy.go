@@ -993,11 +993,8 @@ func (p *Proxy) GetStats() ProxyStats {
 }
 
 // ReloadConfig updates the proxy port mappings at runtime without dropping unaffected active connections.
+// If newPorts is empty, all currently active listeners are gracefully stopped.
 func (p *Proxy) ReloadConfig(newPorts []PortMapping) error {
-	if len(newPorts) == 0 {
-		return fmt.Errorf("no ports configured in new configuration")
-	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

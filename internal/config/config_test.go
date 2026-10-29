@@ -408,3 +408,64 @@ tailnets:
 		t.Errorf("expected Parse to fail on invalid PROXTAIL_HEALTH_PORT")
 	}
 }
+
+func TestZeroPortMappingsAllowed(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "single tailnet explicit empty ports",
+			yaml: `
+tailnets:
+  - name: 'discovery-only'
+    ports: []
+proxy:
+  health_port: 9090
+`,
+		},
+		{
+			name: "single tailnet omitted ports",
+			yaml: `
+tailnets:
+  - name: 'discovery-only'
+proxy:
+  health_port: 9090
+`,
+		},
+		{
+			name: "multi-tailnet mixed zero and non-zero ports",
+			yaml: `
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'web:80'
+  - name: 'staging'
+    ports: []
+`,
+		},
+		{
+			name: "all tailnets zero ports without health port",
+			yaml: `
+tailnets:
+  - name: 'prod'
+`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("expected config to be valid, got error: %v", err)
+			}
+			if tc.name == "all tailnets zero ports without health port" {
+				mappings := cfg.ToProxyPortMappings()
+				if len(mappings) != 0 {
+					t.Fatalf("expected 0 port mappings, got %d", len(mappings))
+				}
+			}
+		})
+	}
+}

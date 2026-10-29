@@ -621,7 +621,8 @@ func runHealthCheck(cfg *config.Config) error {
 	}
 
 	// If health_port is not enabled, verify that at least one configured TCP listener is accepting connections.
-	for _, mapping := range cfg.ToProxyPortMappings() {
+	mappings := cfg.ToProxyPortMappings()
+	for _, mapping := range mappings {
 		if mapping.Protocol == "tcp" {
 			host := strings.TrimSpace(mapping.ListenAddress)
 			if host == "" || host == "0.0.0.0" || host == "::" {
@@ -635,6 +636,10 @@ func runHealthCheck(cfg *config.Config) error {
 			_ = conn.Close()
 			return nil
 		}
+	}
+
+	if len(mappings) == 0 {
+		return fmt.Errorf("cannot probe running instance: neither health_port nor TCP listeners are configured")
 	}
 
 	return nil
@@ -797,6 +802,13 @@ func main() {
 
 	fmt.Printf("Starting proxtail with %d tailnets, %d workers, %dKB buffers...\n",
 		len(tailnetServers), cfg.Proxy.WorkerPoolSize, cfg.Proxy.BufferSize)
+	if len(portMappings) == 0 {
+		if cfg.Proxy.HealthPort > 0 {
+			log.Printf("Running in tailnet discovery mode (0 port mappings configured; health & discovery active on :%d)", cfg.Proxy.HealthPort)
+		} else {
+			log.Printf("Running with 0 port mappings configured")
+		}
+	}
 	fmt.Printf("Hot reload enabled - watching for config changes in: %s\n", configFile)
 	fmt.Printf("Manual reload available - send SIGHUP signal to trigger config reload\n")
 

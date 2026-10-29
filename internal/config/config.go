@@ -359,10 +359,6 @@ func Validate(cfg *Config) error {
 		}
 	}
 
-	if totalPorts == 0 {
-		return fmt.Errorf("at least one port mapping must be configured")
-	}
-
 	if cfg.Proxy.BufferSize < 1 || cfg.Proxy.BufferSize > 8192 {
 		return fmt.Errorf("invalid buffer_size %d: must be between 1 and 8192 KB", cfg.Proxy.BufferSize)
 	}

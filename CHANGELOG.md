@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Zero-Port Discovery Mode**:
+  - Allow starting `proxtail` with zero port mappings (`ports: []` or omitted) for initial tailnet peer and Virtual IP (VIP) services discovery via `GET /healthz`.
+  - Allow dynamic hot-reload transitions down to 0 ports (`ReloadConfig`), gracefully closing active TCP and UDP listeners without dropping tailnet connectivity.
+  - Added discovery mode startup logging when running with 0 configured port mappings.
+  - Supported `/readyz` readiness probe returning `200 OK` in zero-port mode once tailnet nodes are connected.
+  - Updated `runHealthCheck` (`-healthcheck`) to return an informative error when neither `health_port` nor TCP listeners are configured.
+
 ## [0.2.0] - 2026-10-29
 
 ### Added

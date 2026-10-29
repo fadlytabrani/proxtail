@@ -701,6 +701,107 @@ func TestZeroDowntimeHotReloadModifyRemoveAndTailnetRestart(t *testing.T) {
 	}
 }
 
+func TestHotReloadToZeroPortsAndBack(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend: %v", err)
+	}
+	defer backend.Close()
+	go func() {
+		for {
+			conn, err := backend.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4)
+				_, _ = io.ReadFull(c, buf)
+				_, _ = c.Write([]byte("ACK:" + string(buf)))
+			}(conn)
+		}
+	}()
+
+	proxyPort := getFreeTCPPort(t)
+	initialPorts := []PortMapping{
+		{
+			Source:            proxyPort,
+			Destination:       backend.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           "t1",
+			ConnectionTimeout: 5,
+		},
+	}
+
+	p := NewProxyWithDialers(initialPorts, map[string]Dialer{"t1": &localDialer{}}, 16*1024, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Initial port works
+	c1, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to initial proxy port: %v", err)
+	}
+	_, _ = c1.Write([]byte("test"))
+	reply := make([]byte, 8)
+	if _, err := io.ReadFull(c1, reply); err != nil || string(reply) != "ACK:test" {
+		t.Fatalf("unexpected reply: %q (err=%v)", string(reply), err)
+	}
+	_ = c1.Close()
+
+	// 2. Reload to 0 ports (draining mode)
+	if err := p.ReloadConfig([]PortMapping{}); err != nil {
+		t.Fatalf("ReloadConfig with 0 ports failed: %v", err)
+	}
+
+	if count := p.ActiveListenerCount(); count != 0 {
+		t.Fatalf("expected 0 active listeners after reload to empty ports, got %d", count)
+	}
+	if !p.IsReady() {
+		t.Fatalf("expected IsReady() to be true with 0 ports")
+	}
+
+	// Verify old port is closed and connection refused
+	_, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 200*time.Millisecond)
+	if err == nil {
+		t.Fatalf("expected dial to closed proxy port to fail, but succeeded")
+	}
+
+	// 3. Reload back to 1 port
+	newProxyPort := getFreeTCPPort(t)
+	restoredPorts := []PortMapping{
+		{
+			Source:            newProxyPort,
+			Destination:       backend.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           "t1",
+			ConnectionTimeout: 5,
+		},
+	}
+	if err := p.ReloadConfig(restoredPorts); err != nil {
+		t.Fatalf("ReloadConfig back to 1 port failed: %v", err)
+	}
+	if count := p.ActiveListenerCount(); count != 1 {
+		t.Fatalf("expected 1 active listener after reload, got %d", count)
+	}
+
+	// Verify new port works
+	c2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", newProxyPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to restored proxy port: %v", err)
+	}
+	defer c2.Close()
+	_, _ = c2.Write([]byte("ping"))
+	reply2 := make([]byte, 8)
+	if _, err := io.ReadFull(c2, reply2); err != nil || string(reply2) != "ACK:ping" {
+		t.Fatalf("unexpected reply on restored port: %q (err=%v)", string(reply2), err)
+	}
+}
+
 func TestDialFailureIncrementsErrorStats(t *testing.T) {
 	closedBackendPort := getFreeTCPPort(t)
 	proxyPort := getFreeTCPPort(t)
