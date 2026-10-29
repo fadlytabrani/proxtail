@@ -189,6 +189,17 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 func cleanupTailnetServer(server *tsnet.Server, tailnetName string) {
 	log.Printf("Cleaning up tailnet connection: %s", tailnetName)
 	if server != nil {
+		if server.Ephemeral {
+			if lc, err := server.LocalClient(); err == nil && lc != nil {
+				logoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := lc.Logout(logoutCtx); err != nil {
+					log.Printf("Warning: error logging out ephemeral tailnet server %s: %v", tailnetName, err)
+				} else {
+					log.Printf("Logged out ephemeral tailnet node for %s from control plane", tailnetName)
+				}
+				cancel()
+			}
+		}
 		if err := server.Close(); err != nil {
 			log.Printf("Warning: error closing tailnet server %s: %v", tailnetName, err)
 		}
@@ -227,14 +238,10 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 		oldCfg := tm.configs[t.Name]
 		if !oldCfg.ConnectionSettingsEqual(t) {
 			log.Printf("Tailnet '%s' connection settings changed, reinitializing...", t.Name)
-			// If non-ephemeral, close the existing server first to release any state dir lock.
-			if !oldCfg.IsEphemeral() || !t.IsEphemeral() {
-				tm.cleanupFunc(existingSrv, t.Name)
-				delete(tm.servers, t.Name)
-				delete(tm.configs, t.Name)
-			} else {
-				removedServers[t.Name] = existingSrv
-			}
+			// Close and log out existing server first to release state dir lock and avoid duplicate hostname suffix.
+			tm.cleanupFunc(existingSrv, t.Name)
+			delete(tm.servers, t.Name)
+			delete(tm.configs, t.Name)
 			tasks = append(tasks, initTask{cfg: t, restart: true})
 		}
 	}
@@ -695,6 +702,7 @@ func main() {
 	defer cancel()
 
 	sigs := make(chan os.Signal, 1)
+	signal.Ignore(syscall.SIGPIPE)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
 
 	shutdown := make(chan struct{})
