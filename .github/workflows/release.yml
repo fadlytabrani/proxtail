@@ -27,20 +27,54 @@ jobs:
       - name: Run tests with race detector
         run: go test -v -race ./...
 
-      - name: Cross-compile release binaries
+      - name: Cross-compile release binaries and archives
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p dist
-          for target in "linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64"; do
+          targets=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+            "windows/arm64"
+            "freebsd/amd64"
+          )
+          for target in "${targets[@]}"; do
             GOOS="${target%/*}"
             GOARCH="${target#*/}"
-            OUTPUT="dist/proxtail-${VERSION}-${GOOS}-${GOARCH}"
-            echo "Building ${OUTPUT}..."
+            EXT=""
+            if [ "${GOOS}" = "windows" ]; then
+              EXT=".exe"
+            fi
+            BIN_NAME="proxtail-${VERSION}-${GOOS}-${GOARCH}${EXT}"
+            OUTPUT="dist/${BIN_NAME}"
+            echo "Building standalone executable ${OUTPUT}..."
             CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
               go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
               -o "${OUTPUT}" ./cmd/proxtail
+
+            # Provide unversioned standalone executable for latest download scripts
+            cp "${OUTPUT}" "dist/proxtail-${GOOS}-${GOARCH}${EXT}"
+
+            # Package standalone archive with LICENSE and README
+            STAGE_DIR="dist/stage_${GOOS}_${GOARCH}"
+            mkdir -p "${STAGE_DIR}"
+            cp "${OUTPUT}" "${STAGE_DIR}/proxtail${EXT}"
+            cp LICENSE "${STAGE_DIR}/"
+            cp README.md "${STAGE_DIR}/"
+
+            if [ "${GOOS}" = "windows" ]; then
+              (cd "${STAGE_DIR}" && zip -q -r "../../dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.zip" .)
+              cp "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.zip" "dist/proxtail-${GOOS}-${GOARCH}.zip"
+            else
+              tar -czf "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.tar.gz" -C "${STAGE_DIR}" .
+              cp "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.tar.gz" "dist/proxtail-${GOOS}-${GOARCH}.tar.gz"
+            fi
+            rm -rf "${STAGE_DIR}"
           done
+
           cd dist
           sha256sum proxtail-* > SHA256SUMS
 

@@ -223,8 +223,15 @@ docker run -d --name proxtail \
 ```
 
 #### Option B: Standalone Binary
+Download prebuilt standalone executables for Linux, macOS, or Windows from [GitHub Releases](https://github.com/fadlytabrani/proxtail/releases), or compile from source:
 ```bash
-go build -o proxtail ./cmd/proxtail
+# Example: Download Linux amd64 standalone executable directly
+curl -Lo proxtail https://github.com/fadlytabrani/proxtail/releases/latest/download/proxtail-linux-amd64
+chmod +x proxtail
+
+# Or compile from source:
+# go build -o proxtail ./cmd/proxtail
+
 export TS_AUTHKEY="tskey-auth-xxxxx"
 ./proxtail
 ```
