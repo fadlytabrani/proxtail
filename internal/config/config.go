@@ -340,12 +340,20 @@ func Validate(cfg *Config) error {
 				return fmt.Errorf("invalid protocol '%s' in tailnet %s, port %d: must be 'tcp' or 'udp'", port.Protocol, tailnet.Name, port.Source)
 			}
 
-			if cfg.Proxy.HealthPort > 0 && protocol == "tcp" && port.Source == cfg.Proxy.HealthPort {
-				return fmt.Errorf("port conflict: health_port %d conflicts with TCP source port %d in tailnet '%s'",
-					cfg.Proxy.HealthPort, port.Source, tailnet.Name)
+			portListenAddr := strings.TrimSpace(port.ListenAddress)
+			if portListenAddr == "" {
+				portListenAddr = strings.TrimSpace(cfg.Proxy.ListenAddress)
 			}
 
-			portKey := fmt.Sprintf("%d-%s", port.Source, protocol)
+			if cfg.Proxy.HealthPort > 0 && protocol == "tcp" && port.Source == cfg.Proxy.HealthPort {
+				healthBind := strings.TrimSpace(cfg.Proxy.ListenAddress)
+				if portListenAddr == "" || healthBind == "" || portListenAddr == "0.0.0.0" || healthBind == "0.0.0.0" || portListenAddr == healthBind {
+					return fmt.Errorf("port conflict: health_port %d conflicts with TCP source port %d in tailnet '%s'",
+						cfg.Proxy.HealthPort, port.Source, tailnet.Name)
+				}
+			}
+
+			portKey := fmt.Sprintf("%s:%d-%s", portListenAddr, port.Source, protocol)
 			if existingTailnet, exists := portMap[portKey]; exists {
 				return fmt.Errorf("port conflict: port %d (%s) is used by both tailnet '%s' and tailnet '%s'",
 					port.Source, protocol, existingTailnet, tailnet.Name)

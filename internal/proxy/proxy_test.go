@@ -1744,3 +1744,215 @@ func BenchmarkRealTSNetWireGuardUDPParallelThroughput(b *testing.B) {
 		}
 	})
 }
+
+func TestTCPUpstreamProbeSuspendAndResume(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend TCP listener: %v", err)
+	}
+	backendAddr := backendListener.Addr().String()
+
+	serveEcho := func(ln net.Listener) {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}
+	go serveEcho(backendListener)
+
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 20 * time.Millisecond
+	p.probeInterval = 40 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Initially UP
+	statuses := p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected TCP listener to be initially UP, got %+v", statuses)
+	}
+
+	// 2. Stop backend -> probe detects unreachable upstream and suspends local TCP listener
+	_ = backendListener.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || statuses[0].Up {
+		t.Fatalf("expected TCP listener to be suspended (Up=false) when upstream is down, got %+v", statuses)
+	}
+
+	// Verify local port refuses TCP connections while suspended
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 200*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatalf("expected local TCP listener on port %d to refuse connections while suspended", proxyPort)
+	}
+
+	// 3. Restart backend on the same address -> probe detects recovery and resumes local TCP listener
+	restartedBackend, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatalf("failed to restart backend TCP listener on %s: %v", backendAddr, err)
+	}
+	defer restartedBackend.Close()
+	go serveEcho(restartedBackend)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && st[0].Up {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected TCP listener to resume (Up=true) after upstream recovery, got %+v", statuses)
+	}
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to resumed TCP listener: %v", err)
+	}
+	defer conn.Close()
+	msg := []byte("resumed-tcp")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	reply := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, reply); err != nil || !bytes.Equal(reply, msg) {
+		t.Fatalf("unexpected reply after TCP resume: %q (err=%v)", reply, err)
+	}
+}
+
+func TestUDPUpstreamProbeSuspendAndResume(t *testing.T) {
+	backendConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend UDP server: %v", err)
+	}
+	backendAddr := backendConn.LocalAddr().String()
+
+	serveUDPEcho := func(pc net.PacketConn) {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				_, _ = pc.WriteTo(buf[:n], addr)
+			}
+		}
+	}
+	go serveUDPEcho(backendConn)
+
+	proxyUDPPort := getFreeUDPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendAddr,
+			Protocol:          "udp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 20 * time.Millisecond
+	p.probeInterval = 40 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Initially UP
+	statuses := p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected UDP socket to be initially UP, got %+v", statuses)
+	}
+
+	// 2. Close backend UDP socket -> probe receives ICMP Port Unreachable (ECONNREFUSED) and suspends local UDP socket
+	_ = backendConn.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || statuses[0].Up {
+		t.Fatalf("expected UDP socket to be suspended (Up=false) when upstream UDP port is closed, got %+v", statuses)
+	}
+
+	// 3. Restart backend UDP socket on the same address -> probe detects recovery and re-binds local UDP socket
+	restartedUDP, err := net.ListenPacket("udp", backendAddr)
+	if err != nil {
+		t.Fatalf("failed to restart backend UDP server on %s: %v", backendAddr, err)
+	}
+	defer restartedUDP.Close()
+	go serveUDPEcho(restartedUDP)
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && st[0].Up {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	statuses = p.GetPortStatuses()
+	if len(statuses) != 1 || !statuses[0].Up {
+		t.Fatalf("expected UDP socket to resume (Up=true) after upstream UDP recovery, got %+v", statuses)
+	}
+
+	// Verify UDP forwarding works after resumption
+	clientConn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", proxyUDPPort), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial resumed UDP proxy: %v", err)
+	}
+	defer clientConn.Close()
+	msg := []byte("resumed-udp")
+	if _, err := clientConn.Write(msg); err != nil {
+		t.Fatalf("failed writing UDP packet after resume: %v", err)
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	reply := make([]byte, len(msg))
+	if _, err := io.ReadFull(clientConn, reply); err != nil || !bytes.Equal(reply, msg) {
+		t.Fatalf("unexpected UDP reply after resume: %q (err=%v)", reply, err)
+	}
+}
