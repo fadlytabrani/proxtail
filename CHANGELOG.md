@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Active TCP & UDP Upstream Probing, Local Listener Suspension & Per-Port Health Status**:
+  - Added opt-in active upstream reachability probing (`proxy.probe` with `enabled`, `interval`, `timeout`, `consecutive_failures`, `cooldown`, `PROXTAIL_PROBE_ENABLED`, and per-port `probe: true/false` overrides) with hot-reload support.
+  - Automatically suspends local TCP `net.Listener` (`TCP RST` / `ECONNREFUSED`, supporting half-open SYN monitors such as F5 BIG-IP `tcp_half_open`) and UDP `net.PacketConn` (`ICMP Port Unreachable`) when upstream destinations are unreachable, and re-binds automatically upon recovery.
+  - Implemented 5-point low-CPU probing optimizations: zero-overhead opt-in fast path, coalesced traffic-aware cooldown (`250ms` CAS window), asymmetric fast-fail on live traffic vs. consecutive idle threshold, 2-second per-tailnet cached in-memory Tailscale peer online lookup before dialing, and staggered startup/interval jitter (`±20%`).
+  - Exposed per-port runtime health status (`ports[]`: `source_port`, `listen_address`, `listen_addr`, `destination`, `protocol`, `tailnet`, `up`, `last_error`) in `GET /healthz`, and updated `GET /readyz` to return `503 Service Unavailable` when all configured listeners are suspended.
 - **Disabled `netns` in Userspace Mode**:
   - Explicitly disabled `tailscale.com/net/netns` socket binding by default (`netns.SetEnabled(false)`), eliminating `[unexpected] netns: SO_BINDTODEVICE("lo") ... operation not permitted` warnings on Linux and Kubernetes restricted pods without `CAP_NET_RAW`.
   - Added `PROXTAIL_NETNS_ENABLED=true` environment variable override to re-enable `netns` if ever required.
