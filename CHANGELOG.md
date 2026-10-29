@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-30
+
 ### Added
 - **Automatic Tailscale VIP Service Discovery & Dynamic Proxying**:
   - Automatically discovers Tailscale Virtual IP (VIP) services (`LocalClient().GetServices()`) per tailnet and proxies their advertised TCP/UDP ports onto local listeners allocated from a reserved configurable range (`proxy.vip_port_range`, default `"30000-30999"`, override via `PROXTAIL_VIP_PORT_RANGE`).
