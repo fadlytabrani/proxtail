@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
 
@@ -17,6 +18,15 @@ type healthPeerStatus struct {
 	IPv4     string `json:"ipv4,omitempty"`
 	IPv6     string `json:"ipv6,omitempty"`
 	Online   bool   `json:"online"`
+}
+
+// healthVIPService describes a Tailnet Virtual IP / VIP Service for /healthz.
+type healthVIPService struct {
+	Name        string   `json:"name"`
+	DisplayName string   `json:"display_name,omitempty"`
+	IPv4        string   `json:"ipv4,omitempty"`
+	IPv6        string   `json:"ipv6,omitempty"`
+	Ports       []string `json:"ports,omitempty"`
 }
 
 // extractPeersFromStatus converts a Tailscale ipnstate.Status peer map into a
@@ -77,4 +87,70 @@ func discoverTailnetPeers(ctx context.Context, srv *tsnet.Server) []healthPeerSt
 		return nil
 	}
 	return extractPeersFromStatus(tsStatus)
+}
+
+// extractVIPServices converts a map of Tailscale ServiceDetails into a
+// deterministic, name-sorted slice of healthVIPService entries.
+func extractVIPServices(svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails) []healthVIPService {
+	if len(svcs) == 0 {
+		return nil
+	}
+
+	result := make([]healthVIPService, 0, len(svcs))
+	for _, svc := range svcs {
+		var p4, p6 string
+		for _, addr := range svc.Addrs {
+			if addr.Is4() && p4 == "" {
+				p4 = addr.String()
+			} else if addr.Is6() && p6 == "" {
+				p6 = addr.String()
+			}
+		}
+
+		var ports []string
+		for _, p := range svc.Ports {
+			ports = append(ports, p.String())
+		}
+		sort.Strings(ports)
+
+		name := svc.Name.WithoutPrefix()
+		if name == "" {
+			name = string(svc.Name)
+		}
+
+		result = append(result, healthVIPService{
+			Name:        name,
+			DisplayName: svc.DisplayName,
+			IPv4:        p4,
+			IPv6:        p6,
+			Ports:       ports,
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Name != result[j].Name {
+			return result[i].Name < result[j].Name
+		}
+		return result[i].IPv4 < result[j].IPv4
+	})
+	return result
+}
+
+// discoverVIPServices queries the live tsnet LocalClient for tailnet VIP services.
+func discoverVIPServices(ctx context.Context, srv *tsnet.Server) []healthVIPService {
+	if srv == nil || srv.Sys() == nil {
+		return nil
+	}
+	lc, err := srv.LocalClient()
+	if err != nil || lc == nil {
+		return nil
+	}
+	stCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	svcs, err := lc.GetServices(stCtx)
+	if err != nil || len(svcs) == 0 {
+		return nil
+	}
+	return extractVIPServices(svcs)
 }

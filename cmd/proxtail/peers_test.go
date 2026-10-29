@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/key"
 )
@@ -73,12 +74,68 @@ func TestExtractPeersFromStatus(t *testing.T) {
 	}
 }
 
+func TestExtractVIPServices(t *testing.T) {
+	if got := extractVIPServices(nil); got != nil {
+		t.Fatalf("expected nil for nil services map, got %+v", got)
+	}
+
+	portsPG, _ := tailcfg.ParseProtoPortRanges([]string{"tcp:5432"})
+	portsHTTP, _ := tailcfg.ParseProtoPortRanges([]string{"tcp:80", "tcp:443"})
+
+	svcs := map[tailcfg.ServiceName]tailcfg.ServiceDetails{
+		tailcfg.ServiceName("svc:web"): {
+			Name:        tailcfg.ServiceName("svc:web"),
+			DisplayName: "Web Frontend",
+			Addrs: []netip.Addr{
+				netip.MustParseAddr("100.64.0.50"),
+				netip.MustParseAddr("fd7a:115c:a1e0::50"),
+			},
+			Ports: portsHTTP,
+		},
+		tailcfg.ServiceName("svc:db"): {
+			Name:        tailcfg.ServiceName("svc:db"),
+			DisplayName: "Primary Database",
+			Addrs: []netip.Addr{
+				netip.MustParseAddr("100.64.0.51"),
+			},
+			Ports: portsPG,
+		},
+	}
+
+	got := extractVIPServices(svcs)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 VIP services, got %d", len(got))
+	}
+
+	// Verify sorted by Name: "db" before "web"
+	if got[0].Name != "db" || got[0].DisplayName != "Primary Database" || got[0].IPv4 != "100.64.0.51" || len(got[0].Ports) != 1 || got[0].Ports[0] != "tcp:5432" {
+		t.Errorf("unexpected first VIP service: %+v", got[0])
+	}
+	if got[1].Name != "web" || got[1].DisplayName != "Web Frontend" || got[1].IPv4 != "100.64.0.50" || got[1].IPv6 != "fd7a:115c:a1e0::50" || len(got[1].Ports) != 2 {
+		t.Errorf("unexpected second VIP service: %+v", got[1])
+	}
+
+	// Verify unstarted tsnet.Server safely returns nil from discoverVIPServices
+	if gotUnstarted := discoverVIPServices(context.Background(), &tsnet.Server{Hostname: "unstarted"}); gotUnstarted != nil {
+		t.Errorf("expected nil VIP services for unstarted tsnet.Server, got %+v", gotUnstarted)
+	}
+}
+
 func TestHealthTailnetStatusJSONMarshaling(t *testing.T) {
 	st := healthTailnetStatus{
 		Name:     "corp-net",
 		Hostname: "proxtail-lb",
 		IPv4:     "100.64.0.1",
 		IPv6:     "fd7a:115c:a1e0::1",
+		VIPServices: []healthVIPService{
+			{
+				Name:        "postgres",
+				DisplayName: "Database Cluster",
+				IPv4:        "100.64.0.50",
+				IPv6:        "fd7a:115c:a1e0::50",
+				Ports:       []string{"tcp:5432"},
+			},
+		},
 		Peers: []healthPeerStatus{
 			{
 				HostName: "backend",
@@ -100,6 +157,9 @@ func TestHealthTailnetStatusJSONMarshaling(t *testing.T) {
 		t.Fatalf("failed to unmarshal healthTailnetStatus: %v", err)
 	}
 
+	if len(decoded.VIPServices) != 1 || decoded.VIPServices[0].Name != "postgres" || decoded.VIPServices[0].IPv4 != "100.64.0.50" {
+		t.Errorf("unexpected decoded VIP services: %+v", decoded.VIPServices)
+	}
 	if len(decoded.Peers) != 1 || decoded.Peers[0].HostName != "backend" || !decoded.Peers[0].Online {
 		t.Errorf("unexpected decoded peers: %+v", decoded.Peers)
 	}
