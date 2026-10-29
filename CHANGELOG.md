@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-29
+
 ### Added
+- **Tailnet Peer & Virtual IP (VIP) Services Discovery**:
+  - Direct peer discovery in `GET /healthz` via `tsnet.Server.LocalClient().Status()`.
+  - Surfaces active peers, Tailscale IPv4/IPv6 addresses, hostname, MagicDNS names, OS, online/active status, rx/tx counters, and last seen timestamps.
+  - Tailscale Virtual IP (VIP) services discovery in `GET /healthz` via `tsnet.Server.LocalClient().GetServices()`.
+  - Automatically resolves MagicDNS FQDNs for VIP services (`<service-name>.<magic-dns-suffix>`) using `st.CurrentTailnet.MagicDNSSuffix`, alongside VIP IPv4/IPv6 addresses and exposed proto-port ranges.
+  - Streamlined single-pass discovery per tailnet (`discoverTailnetDetails`) with a bounded 2-second timeout context and graceful failure tolerance.
+- **Cross-Platform Standalone Binaries & Distribution**:
+  - Cross-compiled standalone executables across 7 targets: Linux (`amd64`, `arm64`), macOS (`amd64`, `arm64`), Windows (`amd64`, `arm64`), and FreeBSD (`amd64`).
+  - Added unversioned standalone binaries (`proxtail-<os>-<arch>`) on GitHub Releases for simple curl/wget installation scripts.
+  - Packaged release archives (`.tar.gz` and `.zip`) including `README.md` and `LICENSE`, alongside `SHA256SUMS` verification manifest.
 - **Performance & Multiprocessing Optimizations**:
   - Multi-core UDP ingress reader pool (`min(GOMAXPROCS, 8)` workers) scaling parallel UDP throughput by 3.24x to ~61,000 pkts/s.
   - 16-shard cache-line-padded `udpSessionTable` and striped atomic counters (`paddedAtomicInt64`), eliminating cross-core false sharing and lock contention.

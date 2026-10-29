@@ -164,6 +164,8 @@ flowchart TD
 - **Parallel Multi-Core UDP Engine**: Multi-worker reader pool and 16-shard cacheline-padded session table scale parallel UDP traffic by **3.24x** to **~61,000 pkts/s** with zero lock contention.
 - **Horizontal Kubernetes Scaling**: Scales linearly across pod replicas (tested **3.12x** TCP and **3.94x** UDP throughput scaling across 3 pods) using dynamic `${HOSTNAME}` node registration.
 - **Instant Clean Teardown**: Ephemeral nodes are deregistered immediately on `SIGTERM` via `b.Logout()`, purging nodes from the Tailscale admin console in **< 150 ms** without waiting for 30–60 minute timeouts.
+- **Tailnet Peer & VIP Service Discovery**: Automatic discovery of active tailnet peers and Virtual IP (VIP) services with MagicDNS FQDNs, VIP IPs, and exposed ports via `/healthz`.
+- **Cross-Platform Standalone Binaries**: Precompiled standalone binaries for Linux, macOS, Windows, and FreeBSD with zero external dependencies.
 - **Tailscale OAuth & Auto ACL Tag Discovery**: Authenticate with non-expiring OAuth client secrets (`tskey-client-...`). When `tags:` are omitted in YAML, `proxtail` automatically queries the Tailscale API to discover and advertise authorized tags.
 - **Zero-Downtime Hot Reload**: Dynamic file watching and Kubernetes atomic symlink detection (`..data`) reload routes in **< 100 ms** without dropping active connections.
 - **Native Observability**: Prometheus metrics (`/metrics`), Kubernetes liveness (`/healthz`) and readiness (`/readyz`) probes, and optional periodic traffic summaries.
@@ -223,15 +225,25 @@ docker run -d --name proxtail \
 ```
 
 #### Option B: Standalone Binary
-Download prebuilt standalone executables for Linux, macOS, or Windows from [GitHub Releases](https://github.com/fadlytabrani/proxtail/releases), or compile from source:
+Download prebuilt standalone executables for Linux, macOS, Windows, or FreeBSD directly from [GitHub Releases](https://github.com/fadlytabrani/proxtail/releases/latest):
+
 ```bash
-# Example: Download Linux amd64 standalone executable directly
-curl -Lo proxtail https://github.com/fadlytabrani/proxtail/releases/latest/download/proxtail-linux-amd64
-chmod +x proxtail
+# Linux (x86_64 / amd64)
+curl -Lo proxtail https://github.com/fadlytabrani/proxtail/releases/latest/download/proxtail-linux-amd64 && chmod +x proxtail
 
-# Or compile from source:
-# go build -o proxtail ./cmd/proxtail
+# Linux (ARM64)
+curl -Lo proxtail https://github.com/fadlytabrani/proxtail/releases/latest/download/proxtail-linux-arm64 && chmod +x proxtail
 
+# macOS Apple Silicon (arm64)
+curl -Lo proxtail https://github.com/fadlytabrani/proxtail/releases/latest/download/proxtail-darwin-arm64 && chmod +x proxtail
+
+# macOS Intel (amd64)
+curl -Lo proxtail https://github.com/fadlytabrani/proxtail/releases/latest/download/proxtail-darwin-amd64 && chmod +x proxtail
+
+# Windows (PowerShell)
+# Invoke-WebRequest -Uri https://github.com/fadlytabrani/proxtail/releases/latest/download/proxtail-windows-amd64.exe -OutFile proxtail.exe
+
+# Run proxtail
 export TS_AUTHKEY="tskey-auth-xxxxx"
 ./proxtail
 ```
@@ -447,6 +459,71 @@ Modify `config.yaml` to add, update, or remove ports on the fly:
 - **Automatic**: File watcher detects atomic file replacements and Kubernetes `ConfigMap` symlink updates within **100 ms**.
 - **Signal**: Trigger manually via `kill -HUP $(pgrep proxtail)` or `docker kill --signal=HUP proxtail`.
 - **Safe Rollback**: If an invalid configuration is introduced, `proxtail` rejects it, logs the validation error, and continues serving active traffic without interruption.
+
+### Tailnet Peer & VIP Service Discovery (`/healthz`)
+
+When `health_port` is configured (or via `PROXTAIL_HEALTH_PORT=9090`), the `/healthz` HTTP endpoint returns comprehensive operational health and live network discovery details for each configured tailnet:
+- **Node Addresses**: Tailscale IPv4 and IPv6 addresses assigned to the `proxtail` node.
+- **Active Peers**: Discovered tailnet peer nodes with hostname, MagicDNS names, IP addresses, OS, online status, and network transfer counters.
+- **VIP Services**: Discovered Tailscale Virtual IP (VIP) services with service names, display names, resolved MagicDNS FQDNs (`<service-name>.<magic-dns-suffix>`), VIP addresses, and exposed proto-ports.
+
+```bash
+curl http://localhost:9090/healthz | jq
+```
+
+Example JSON response:
+```json
+{
+  "status": "healthy",
+  "version": "v0.2.0",
+  "uptime": "1h24m10s",
+  "listeners": 2,
+  "tailnets": [
+    {
+      "name": "production",
+      "addresses": [
+        "100.64.0.42",
+        "fd7a:115c:a1e0::2a"
+      ],
+      "vip_services": [
+        {
+          "name": "svc:api-backend",
+          "display_name": "api-backend",
+          "magic_dns_name": "api-backend.example-tailnet.ts.net",
+          "addrs": [
+            "100.64.0.100",
+            "fd7a:115c:a1e0::64"
+          ],
+          "ports": [
+            "tcp:443",
+            "tcp:8443"
+          ]
+        }
+      ],
+      "peers": [
+        {
+          "id": 1048576,
+          "hostname": "postgres-prod-01",
+          "dns_name": "postgres-prod-01.example-tailnet.ts.net.",
+          "tailscale_ips": [
+            "100.64.0.15",
+            "fd7a:115c:a1e0::f"
+          ],
+          "os": "linux",
+          "online": true,
+          "active": true,
+          "rx_bytes": 104857600,
+          "tx_bytes": 52428800,
+          "last_seen": "2026-10-29T23:30:00Z"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Readiness Probe (`/readyz`)
+Returns `200 OK` once all configured TCP and UDP listeners are actively bound and serving traffic. Returns `503 Service Unavailable` during startup, reconfiguration, or graceful teardown (`SIGTERM`).
 
 ### Prometheus Metrics
 When `health_port` is enabled (e.g. `PROXTAIL_HEALTH_PORT=9090`):
