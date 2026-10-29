@@ -345,6 +345,17 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		t.Fatalf("expected /readyz 200 OK after listeners start, got %d", recReady.Code)
 	}
 
+	// Verify /healthz includes active per-port listener statuses
+	recHealthPorts := httptest.NewRecorder()
+	readyHandler.ServeHTTP(recHealthPorts, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var hrWithPorts healthResponse
+	if err := json.Unmarshal(recHealthPorts.Body.Bytes(), &hrWithPorts); err != nil {
+		t.Fatalf("failed to decode /healthz JSON with ports: %v", err)
+	}
+	if len(hrWithPorts.Ports) != 1 || hrWithPorts.Ports[0].Source != freePort || !hrWithPorts.Ports[0].Up {
+		t.Errorf("expected /healthz to expose 1 active port mapping on %d, got %+v", freePort, hrWithPorts.Ports)
+	}
+
 	// Verify runHealthCheck against running HTTP health server and TCP listener
 	healthPort := getFreePort(t)
 	if err := startHealthServer(ctx, "127.0.0.1", healthPort, readyProxy, tm); err != nil {

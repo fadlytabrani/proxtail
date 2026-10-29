@@ -449,16 +449,18 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 
 // healthTailnetStatus describes the runtime status of a single tailnet for /healthz.
 type healthTailnetStatus struct {
-	Name     string `json:"name"`
-	Hostname string `json:"hostname,omitempty"`
-	IPv4     string `json:"ipv4,omitempty"`
-	IPv6     string `json:"ipv6,omitempty"`
+	Name     string             `json:"name"`
+	Hostname string             `json:"hostname,omitempty"`
+	IPv4     string             `json:"ipv4,omitempty"`
+	IPv6     string             `json:"ipv6,omitempty"`
+	Peers    []healthPeerStatus `json:"peers,omitempty"`
 }
 
 // healthResponse is the JSON payload returned by GET /healthz.
 type healthResponse struct {
 	Status           string                `json:"status"`
 	Tailnets         []healthTailnetStatus `json:"tailnets"`
+	Ports            []proxy.PortStatus    `json:"ports,omitempty"`
 	TCPConnections   int64                 `json:"tcp_connections"`
 	UDPPackets       int64                 `json:"udp_packets"`
 	BytesTransferred int64                 `json:"bytes_transferred"`
@@ -478,6 +480,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		stats := proxyServer.GetStats()
+		portStatuses := proxyServer.GetPortStatuses()
 		servers := tm.snapshotServers()
 
 		names := make([]string, 0, len(servers))
@@ -499,6 +502,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 					if ip6.IsValid() {
 						st.IPv6 = ip6.String()
 					}
+					st.Peers = discoverTailnetPeers(r.Context(), srv)
 				}
 			}
 			tailnets = append(tailnets, st)
@@ -508,6 +512,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		_ = json.NewEncoder(w).Encode(healthResponse{
 			Status:           "ok",
 			Tailnets:         tailnets,
+			Ports:            portStatuses,
 			TCPConnections:   stats.TCPConnections,
 			UDPPackets:       stats.UDPPackets,
 			BytesTransferred: stats.BytesTransferred,
