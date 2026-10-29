@@ -209,7 +209,7 @@ tailnets:
       - port: 8080
         destination: 'web-server' # Forwards local TCP :8080 -> web-server:8080
 ```
-*(Supports MagicDNS names like `web-server`, FQDNs, or Tailscale IPs like `100.64.0.10`.)*
+*(Supports MagicDNS hostnames like `web-server`, Tailscale VIP service names/FQDNs, or Tailscale IPs like `100.64.0.10`.)*
 
 ### 3. Run `proxtail`
 
@@ -355,6 +355,17 @@ tailnets:
         destination: 'internal-app:8080'
 ```
 
+### Recipe 7: Forwarding to Tailscale Virtual IP (VIP) Services
+Forward local traffic directly to high-availability Tailscale VIP services or `tailscale serve` endpoints using their service name or MagicDNS FQDN:
+
+```yaml
+tailnets:
+  - ports:
+      # Resolves via tsnet DNS to VIP service address (discovered in /healthz)
+      - port: 8443
+        destination: 'api-backend:443'
+```
+
 ---
 
 ## Configuration Reference
@@ -385,7 +396,7 @@ tailnets:
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `port` *(or `source_port`)* | `int` | *(required)* | Local port `proxtail` listens on (`1`–`65535`). |
-| `destination` | `string` | *(required)* | Destination `host:port` or `host` inside the tailnet. If `:port` is omitted, reuses `port`. Supports `${ENV_VAR}`. |
+| `destination` | `string` | *(required)* | Destination `host:port` or `host` inside the tailnet (supports MagicDNS hostnames, VIP services, FQDNs, or Tailscale IPs). If `:port` is omitted, reuses `port`. Supports `${ENV_VAR}`. |
 | `protocol` | `string` | `"tcp"` | Layer 4 protocol: `"tcp"` or `"udp"`. |
 | `listen_address` | `string` | `proxy.listen_address` *(all)* | Local IP to bind on (e.g., `"127.0.0.1"` for loopback only). |
 | `timeout` | `int` | `30` | Idle connection / session timeout in seconds (`1`–`3600`). |
@@ -426,7 +437,7 @@ tailnets:
 - **Read-Only Root Filesystem**: Operates cleanly with `readOnlyRootFilesystem: true` using an `emptyDir` at `/var/lib/tsnet` and `/tmp`.
 - **ConfigMap Hot Reload**: Watches the `/etc/proxtail` directory; swapping the `..data` symlink on `kubectl apply` reloads routes with zero downtime.
 - **Liveness & Readiness Probes**:
-  - `GET /healthz`: Liveness probe returning node status and Tailscale IP addresses.
+  - `GET /healthz`: Liveness probe returning node health, assigned Tailscale IPs, active tailnet peers, and discovered Virtual IP (VIP) services with MagicDNS FQDNs.
   - `GET /readyz`: Readiness probe returning `200 OK` once all listeners are bound and active (`503 Service Unavailable` during startup or `SIGTERM` draining).
   - `GET /metrics`: Prometheus metrics scraper endpoint.
 - **Graceful Shutdown**: On pod scale-down or node draining, Kubernetes sends `SIGTERM`. `proxtail` immediately deregisters its ephemeral nodes via `b.Logout()`, eliminating stale or offline nodes in Tailscale Admin.
