@@ -2587,3 +2587,236 @@ func TestHotReloadProbeEnabledToggle(t *testing.T) {
 		t.Fatalf("expected hot-reloaded probe.enabled=false to restore unprobed bound listener, got %+v", st)
 	}
 }
+
+func TestTCPUnidirectionalStreamSharedConnectionTimeout(t *testing.T) {
+	// Backend streams chunks to client for 1.6s while client->backend is completely idle,
+	// then reads a final message from the client after ConnectionTimeout (1s) has elapsed.
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+
+	clientMsgCh := make(chan string, 1)
+	go func() {
+		conn, err := backendLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Stream 8 chunks every 200ms (total 1.6s > 1s ConnectionTimeout)
+		for i := range 8 {
+			time.Sleep(200 * time.Millisecond)
+			if _, err := fmt.Fprintf(conn, "chunk-%d\n", i); err != nil {
+				return
+			}
+		}
+
+		buf := make([]byte, 64)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := conn.Read(buf)
+		if err == nil && n > 0 {
+			clientMsgCh <- string(buf[:n])
+		}
+	}()
+
+	proxyPort := getFreeTCPPort(t)
+	probeDisabled := false
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendLn.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 1, // 1 second timeout
+			Probe:             &probeDisabled,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	select {
+	case <-p.Started():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxy to start")
+	}
+
+	clientConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial proxy: %v", err)
+	}
+	defer clientConn.Close()
+
+	// Read all 8 chunks over ~1.6s without sending anything on client->backend
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	received := 0
+	buf := make([]byte, 256)
+	for received < 8 {
+		n, err := clientConn.Read(buf)
+		if err != nil {
+			t.Fatalf("client read failed after %d chunks: %v", received, err)
+		}
+		received += strings.Count(string(buf[:n]), "chunk-")
+	}
+
+	// Now send data on client->backend after 1.6s of client silence (exceeding 1s ConnectionTimeout).
+	// Because backend->client was active, client->backend must NOT have timed out.
+	if _, err := clientConn.Write([]byte("still-open")); err != nil {
+		t.Fatalf("failed writing from client after unidirectional stream: %v", err)
+	}
+
+	select {
+	case msg := <-clientMsgCh:
+		if msg != "still-open" {
+			t.Fatalf("expected backend to receive 'still-open', got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for backend to receive client message after unidirectional stream; client->backend was prematurely closed")
+	}
+}
+
+func TestLiveProbeConfigParameterUpdate(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+
+	go func() {
+		for {
+			c, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendLn.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 10 * time.Millisecond
+	// Start with a very long interval (30s) so the monitor sleeps after the first probe
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            30 * time.Second,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            10 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	select {
+	case <-p.Started():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxy to start")
+	}
+
+	// Wait for initial probe to complete and enter 30s sleep
+	time.Sleep(50 * time.Millisecond)
+
+	// Shut down backend and live-update ProbeConfig to a 20ms interval
+	_ = backendLn.Close()
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            20 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            10 * time.Millisecond,
+	})
+
+	// Monitor should wake up immediately on probeWakeCh and suspend the listener well under 1s
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("expected live SetProbeConfig update to wake monitor and suspend port within 500ms, got %+v", p.GetPortStatuses())
+}
+
+func TestReloadConfigPartialFailureAndRollback(t *testing.T) {
+	port1 := getFreeTCPPort(t)
+	occupiedLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind occupied listener: %v", err)
+	}
+	defer occupiedLn.Close()
+	occupiedPort := occupiedLn.Addr().(*net.TCPAddr).Port
+
+	probeDisabled := false
+	initialPorts := []PortMapping{
+		{
+			Source:            port1,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "127.0.0.1:9999",
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+			Probe:             &probeDisabled,
+		},
+	}
+
+	p := NewProxyWithDialers(initialPorts, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	select {
+	case <-p.Started():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxy to start")
+	}
+
+	if p.ActiveListenerCount() != 1 {
+		t.Fatalf("expected 1 active listener initially, got %d", p.ActiveListenerCount())
+	}
+
+	// Attempt to reload to occupiedPort (which fails to bind)
+	badPorts := []PortMapping{
+		{
+			Source:            occupiedPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "127.0.0.1:9999",
+			Protocol:          "tcp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+			Probe:             &probeDisabled,
+		},
+	}
+	if err := p.ReloadConfig(badPorts); err == nil {
+		t.Fatal("expected ReloadConfig with occupied port to fail")
+	}
+
+	// Rolling back to initialPorts must re-bind port1
+	if err := p.ReloadConfig(initialPorts); err != nil {
+		t.Fatalf("rollback ReloadConfig(initialPorts) failed: %v", err)
+	}
+	if p.ActiveListenerCount() != 1 {
+		t.Fatalf("expected 1 active listener after rollback, got %d", p.ActiveListenerCount())
+	}
+}

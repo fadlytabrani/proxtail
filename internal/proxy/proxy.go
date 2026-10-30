@@ -402,6 +402,7 @@ type Proxy struct {
 	stats      proxyStatsCounters
 
 	// Hot reload and lifecycle management
+	lifecycleMu  sync.Mutex
 	mu           sync.RWMutex
 	tcpListeners map[string]*listenerInfo
 	udpConns     map[string]*listenerInfo
@@ -413,6 +414,7 @@ type Proxy struct {
 
 	// Upstream reachability probe settings
 	probeConfig        ProbeConfig
+	probeWakeCh        chan struct{}
 	forceUpstreamProbe bool
 	probeInitialDelay  time.Duration
 	peerCacheMu        sync.Mutex
@@ -491,15 +493,46 @@ func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, 
 			ConsecutiveFailures: 2,
 			Cooldown:            10 * time.Second,
 		},
-		peerCache: make(map[Dialer]peerStatusSnapshot),
+		probeWakeCh: make(chan struct{}),
+		peerCache:   make(map[Dialer]peerStatusSnapshot),
 	}
 }
 
-// SetProbeConfig updates the probe configuration for the proxy.
+// SetProbeConfig updates the probe configuration for the proxy and wakes active probe monitors if settings changed.
 func (p *Proxy) SetProbeConfig(cfg ProbeConfig) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	changed := p.probeConfig != cfg
 	p.probeConfig = cfg
+	if changed && p.probeWakeCh != nil {
+		close(p.probeWakeCh)
+		p.probeWakeCh = make(chan struct{})
+	}
+	p.mu.Unlock()
+}
+
+func (p *Proxy) getProbeSettings() (interval, timeout, cooldown time.Duration, maxFailures int, wakeCh <-chan struct{}) {
+	p.mu.RLock()
+	cfg := p.probeConfig
+	wakeCh = p.probeWakeCh
+	p.mu.RUnlock()
+
+	interval = cfg.Interval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	timeout = cfg.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	cooldown = cfg.Cooldown
+	if cooldown <= 0 {
+		cooldown = interval
+	}
+	maxFailures = cfg.ConsecutiveFailures
+	if maxFailures <= 0 {
+		maxFailures = 2
+	}
+	return interval, timeout, cooldown, maxFailures, wakeCh
 }
 
 // UpdateTailnetServers updates the active tailnet servers map during a configuration reload.
@@ -751,31 +784,39 @@ func (p *Proxy) Started() <-chan struct{} {
 // Start initializes and starts all configured TCP and UDP listeners, then blocks until stopped.
 // If any listener fails to bind during startup, all previously started listeners are rolled back.
 func (p *Proxy) Start(ctx context.Context) error {
+	p.lifecycleMu.Lock()
 	p.mu.Lock()
 	for _, port := range p.Ports {
 		key := port.Key()
 		switch strings.ToLower(port.Protocol) {
 		case "tcp":
 			if err := p.startTCPListener(port, key); err != nil {
-				p.stopAllListenersLocked()
+				detached := p.detachAllListenersLocked()
 				p.mu.Unlock()
+				p.waitListeners(detached)
+				p.lifecycleMu.Unlock()
 				log.Printf("Error starting TCP listener on port %d: %v", port.Source, err)
 				return err
 			}
 		case "udp":
 			if err := p.startUDPListener(port, key); err != nil {
-				p.stopAllListenersLocked()
+				detached := p.detachAllListenersLocked()
 				p.mu.Unlock()
+				p.waitListeners(detached)
+				p.lifecycleMu.Unlock()
 				log.Printf("Error starting UDP listener on port %d: %v", port.Source, err)
 				return err
 			}
 		default:
-			p.stopAllListenersLocked()
+			detached := p.detachAllListenersLocked()
 			p.mu.Unlock()
+			p.waitListeners(detached)
+			p.lifecycleMu.Unlock()
 			return fmt.Errorf("unsupported protocol for port %d: %s", port.Source, port.Protocol)
 		}
 	}
 	p.mu.Unlock()
+	p.lifecycleMu.Unlock()
 	p.startedOnce.Do(func() {
 		close(p.startedCh)
 	})
@@ -804,6 +845,9 @@ func (p *Proxy) forwardTCP(ctx context.Context, dialer Dialer, port PortMapping,
 	})
 	defer stopClose()
 
+	var connWg sync.WaitGroup
+	defer connWg.Wait()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -818,9 +862,9 @@ func (p *Proxy) forwardTCP(ctx context.Context, dialer Dialer, port PortMapping,
 			continue
 		}
 
-		info.wg.Add(1)
+		connWg.Add(1)
 		go func(c net.Conn) {
-			defer info.wg.Done()
+			defer connWg.Done()
 			p.acquireWorker()
 			defer p.releaseWorker()
 			p.handleTCPConnection(ctx, dialer, port, c, info)
@@ -870,16 +914,19 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 	})
 	defer stopCancel()
 
+	var connActivity atomic.Int64
+	connActivity.Store(time.Now().UnixNano())
+
 	var wg sync.WaitGroup
 
 	wg.Go(func() {
-		p.forwardStreamBuffered(conn, destConn, port.Source, timeout, nil)
+		p.forwardStreamBuffered(conn, destConn, port.Source, timeout, nil, &connActivity)
 		if cw, ok := destConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 	})
 
-	p.forwardStreamBuffered(destConn, conn, port.Source, timeout, info)
+	p.forwardStreamBuffered(destConn, conn, port.Source, timeout, info, &connActivity)
 	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 		_ = cw.CloseWrite()
 	}
@@ -890,7 +937,7 @@ func (p *Proxy) handleTCPConnection(ctx context.Context, dialer Dialer, port Por
 // forwardUDP reads UDP datagrams across a multi-core reader pool using zero-allocation
 // ReadFromUDPAddrPort when available, forwarding packets inline for established sessions
 // and dispatching new sessions to the bounded worker pool.
-func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping, conn net.PacketConn, sessionWg *sync.WaitGroup, info *listenerInfo) {
+func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping, conn net.PacketConn, info *listenerInfo) {
 	timeoutSec := port.ConnectionTimeout
 	if timeoutSec <= 0 {
 		timeoutSec = 30
@@ -918,6 +965,8 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 
 	var closeLogOnce sync.Once
 	var readerWg sync.WaitGroup
+	var dialWg sync.WaitGroup
+	var readWg sync.WaitGroup
 
 	for readerIdx := range numReaders {
 		shardIdx := uint32(readerIdx) & (statsShardCount - 1)
@@ -926,7 +975,6 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 
 		readerWg.Go(func() {
 			readBuf := make([]byte, maxUDPBufferSize)
-			var pktCount uint32
 
 			for {
 				var (
@@ -977,10 +1025,7 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 
 				// Fast path: established UDP session forwards inline with zero allocations and zero goroutine spawns.
 				if sess := table.get(key); sess != nil && sess.readyOK.Load() {
-					if pktCount&7 == 0 {
-						sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
-					}
-					pktCount++
+					sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
 					written, writeErr := sess.destConn.Write(readBuf[:n])
 					if written > 0 {
 						bytesCounter.Add(int64(written))
@@ -1005,18 +1050,20 @@ func (p *Proxy) forwardUDP(ctx context.Context, dialer Dialer, port PortMapping,
 				pktBuf.Reset()
 				_, _ = pktBuf.Write(readBuf[:n])
 
-				sessionWg.Add(1)
+				dialWg.Add(1)
 				go func(buf *OptimizedBuffer, k udpSessionKey, ap netip.AddrPort, hasAP bool, cAddr net.Addr) {
-					defer sessionWg.Done()
+					defer dialWg.Done()
 					p.acquireWorker()
 					defer p.releaseWorker()
-					p.handleUDPSessionSlowPath(ctx, dialer, port, conn, udpConn, isUDPConn, buf, k, ap, hasAP, cAddr, table, sessionWg, timeout, refreshStep, info)
+					p.handleUDPSessionSlowPath(ctx, dialer, port, conn, udpConn, isUDPConn, buf, k, ap, hasAP, cAddr, table, &readWg, timeout, refreshStep, info)
 				}(pktBuf, key, addrPort, hasAddrPort, clientAddr)
 			}
 		})
 	}
 
 	readerWg.Wait()
+	dialWg.Wait()
+	readWg.Wait()
 }
 
 // handleUDPSessionSlowPath establishes a new UDP session (or waits for an in-flight dial) and writes the packet.
@@ -1033,7 +1080,7 @@ func (p *Proxy) handleUDPSessionSlowPath(
 	hasAddrPort bool,
 	clientAddr net.Addr,
 	table *udpSessionTable,
-	sessionWg *sync.WaitGroup,
+	readWg *sync.WaitGroup,
 	timeout time.Duration,
 	refreshStep time.Duration,
 	info *listenerInfo,
@@ -1067,9 +1114,9 @@ func (p *Proxy) handleUDPSessionSlowPath(
 		sess.readyOK.Store(true)
 		close(sess.ready)
 
-		sessionWg.Add(1)
+		readWg.Add(1)
 		go func() {
-			defer sessionWg.Done()
+			defer readWg.Done()
 			p.readUDPBackendSession(ctx, port, conn, udpConn, isUDPConn, sess, table, timeout, refreshStep, info)
 		}()
 	} else {
@@ -1133,20 +1180,14 @@ func (p *Proxy) readUDPBackendSession(
 	data := respBuffer.data
 	shardIdx := (table.shardIndexFor(sess.key) + 8) & (statsShardCount - 1)
 	bytesCounter := &p.stats.bytesTransferred[shardIdx].val
-	var iter uint32
 
 	for {
-		if iter&7 == 0 {
-			sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
-		}
-		iter++
+		sess.refreshDeadlinesIfNeeded(timeout, refreshStep)
 
 		bytesRead, err := sess.destConn.Read(data)
 		if bytesRead > 0 {
 			info.recordActive()
-			if iter&7 == 1 {
-				table.refreshConnWriteDeadline(conn, timeout, refreshStep)
-			}
+			table.refreshConnWriteDeadline(conn, timeout, refreshStep)
 
 			payload := data[:bytesRead]
 			var (
@@ -1189,10 +1230,10 @@ func (p *Proxy) readUDPBackendSession(
 // forwardStream transfers data from src to dst using pooled OptimizedBuffers,
 // coalescing deadline refreshes and updating BytesTransferred in real time.
 func (p *Proxy) forwardStream(src, dst net.Conn, port int, timeout time.Duration) {
-	p.forwardStreamBuffered(src, dst, port, timeout, nil)
+	p.forwardStreamBuffered(src, dst, port, timeout, nil, nil)
 }
 
-func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.Duration, activeInfo *listenerInfo) {
+func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.Duration, activeInfo *listenerInfo, connActivity *atomic.Int64) {
 	buf := p.bufPool.Get().(*OptimizedBuffer)
 	buf.pool = p.bufPool
 	defer buf.Release()
@@ -1203,26 +1244,26 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 	bytesCounter := &p.stats.bytesTransferred[shardIdx].val
 	var lastReadDeadlineNano int64
 	var lastWriteDeadlineNano int64
-	var iter uint32
 
 	for {
-		if iter&7 == 0 {
-			nowNano := time.Now().UnixNano()
-			if nowNano-lastReadDeadlineNano >= int64(refreshStep) {
-				lastReadDeadlineNano = nowNano
-				_ = src.SetReadDeadline(time.Unix(0, nowNano).Add(timeout))
-			}
-			if nowNano-lastWriteDeadlineNano >= int64(refreshStep) {
-				lastWriteDeadlineNano = nowNano
-				_ = dst.SetWriteDeadline(time.Unix(0, nowNano).Add(timeout))
-			}
+		nowNano := time.Now().UnixNano()
+		if nowNano-lastReadDeadlineNano >= int64(refreshStep) {
+			lastReadDeadlineNano = nowNano
+			_ = src.SetReadDeadline(time.Unix(0, nowNano).Add(timeout))
 		}
-		iter++
 
 		bytesRead, err := src.Read(data)
 
 		if bytesRead > 0 {
 			activeInfo.recordActive()
+			nowNano := time.Now().UnixNano()
+			if connActivity != nil && nowNano-connActivity.Load() >= activityRecordCoalesceNs {
+				connActivity.Store(nowNano)
+			}
+			if nowNano-lastWriteDeadlineNano >= int64(refreshStep) {
+				lastWriteDeadlineNano = nowNano
+				_ = dst.SetWriteDeadline(time.Unix(0, nowNano).Add(timeout))
+			}
 			writtenTotal := 0
 			for writtenTotal < bytesRead {
 				n, writeErr := dst.Write(data[writtenTotal:bytesRead])
@@ -1251,6 +1292,18 @@ func (p *Proxy) forwardStreamBuffered(src, dst net.Conn, port int, timeout time.
 		}
 
 		if err != nil {
+			if connActivity != nil && isTimeoutError(err) {
+				lastAct := connActivity.Load()
+				if lastAct > 0 {
+					elapsed := time.Since(time.Unix(0, lastAct))
+					if elapsed < timeout {
+						nextDeadline := time.Unix(0, lastAct).Add(timeout)
+						lastReadDeadlineNano = time.Now().UnixNano()
+						_ = src.SetReadDeadline(nextDeadline)
+						continue
+					}
+				}
+			}
 			if !isConnectionClosed(err) {
 				p.stats.errorCount.Add(1)
 				log.Printf("Stream read error on port %d: %v", port, err)
@@ -1278,8 +1331,10 @@ func (p *Proxy) GetStats() ProxyStats {
 // ReloadConfig updates the proxy port mappings at runtime without dropping unaffected active connections.
 // If newPorts is empty, all currently active listeners are gracefully stopped.
 func (p *Proxy) ReloadConfig(newPorts []PortMapping) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	oldPortsMap := make(map[string]PortMapping, len(p.Ports))
 	newPortsMap := make(map[string]PortMapping, len(newPorts))
@@ -1299,7 +1354,7 @@ func (p *Proxy) ReloadConfig(newPorts []PortMapping) error {
 	portsToModify := make([]PortMapping, 0)
 
 	for key, newPort := range newPortsMap {
-		if oldPort, exists := oldPortsMap[key]; exists {
+		if oldPort, exists := oldPortsMap[key]; exists && p.isListenerActiveLocked(oldPort) {
 			if !portsEqual(oldPort, newPort) || p.portProbingChangedLocked(key, newPort) {
 				portsToModify = append(portsToModify, newPort)
 			}
@@ -1314,33 +1369,47 @@ func (p *Proxy) ReloadConfig(newPorts []PortMapping) error {
 		}
 	}
 
-	var reloadErrors []string
-
+	detached := make([]*listenerInfo, 0, len(portsToRemove)+len(portsToModify))
 	for _, port := range portsToRemove {
-		if err := p.stopListener(port); err != nil {
-			reloadErrors = append(reloadErrors, fmt.Sprintf("failed to stop port %d (%s): %v", port.Source, port.Protocol, err))
-		}
+		detached = append(detached, p.detachListenerLocked(port)...)
+	}
+	for _, port := range portsToModify {
+		detached = append(detached, p.detachListenerLocked(port)...)
 	}
 
-	for _, port := range portsToModify {
-		if err := p.stopListener(port); err != nil {
-			reloadErrors = append(reloadErrors, fmt.Sprintf("failed to stop port %d (%s): %v", port.Source, port.Protocol, err))
-		}
-	}
+	p.mu.Unlock()
+	p.waitListeners(detached)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var reloadErrors []string
+	failedKeys := make(map[string]bool)
 
 	for _, port := range portsToAdd {
 		if err := p.startListener(port); err != nil {
+			failedKeys[port.Key()] = true
 			reloadErrors = append(reloadErrors, fmt.Sprintf("failed to start port %d (%s): %v", port.Source, port.Protocol, err))
 		}
 	}
 
 	for _, port := range portsToModify {
 		if err := p.startListener(port); err != nil {
+			failedKeys[port.Key()] = true
 			reloadErrors = append(reloadErrors, fmt.Sprintf("failed to start port %d (%s): %v", port.Source, port.Protocol, err))
 		}
 	}
 
-	p.Ports = newPorts
+	if len(failedKeys) == 0 {
+		p.Ports = newPorts
+	} else {
+		activePorts := make([]PortMapping, 0, len(newPorts))
+		for _, port := range newPorts {
+			if !failedKeys[port.Key()] && p.isListenerActiveLocked(port) {
+				activePorts = append(activePorts, port)
+			}
+		}
+		p.Ports = activePorts
+	}
 
 	if len(reloadErrors) > 0 {
 		log.Printf("Configuration reloaded with %d errors: %s", len(reloadErrors), strings.Join(reloadErrors, "; "))
@@ -1360,17 +1429,28 @@ func (p *Proxy) RestartTailnetPorts(tailnetNames map[string]bool) error {
 		return nil
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 
-	var errs []string
+	p.mu.Lock()
+	var portsToRestart []PortMapping
+	var detached []*listenerInfo
 	for _, port := range p.Ports {
 		if !tailnetNames[port.Tailnet] {
 			continue
 		}
-		if err := p.stopListener(port); err != nil {
-			errs = append(errs, err.Error())
-		}
+		portsToRestart = append(portsToRestart, port)
+		detached = append(detached, p.detachListenerLocked(port)...)
+	}
+	p.mu.Unlock()
+
+	p.waitListeners(detached)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var errs []string
+	for _, port := range portsToRestart {
 		if err := p.startListener(port); err != nil {
 			errs = append(errs, err.Error())
 		}
@@ -1394,6 +1474,17 @@ func portsEqual(a, b PortMapping) bool {
 		probeEqual
 }
 
+func (p *Proxy) isListenerActiveLocked(port PortMapping) bool {
+	key := port.Key()
+	if _, ok := p.tcpListeners[key]; ok {
+		return true
+	}
+	if _, ok := p.udpConns[key]; ok {
+		return true
+	}
+	return false
+}
+
 func (p *Proxy) portProbingChangedLocked(key string, newPort PortMapping) bool {
 	dialer := p.tailnetDialers[newPort.Tailnet]
 	wantProbing := p.isPortProbingEnabledLocked(newPort, dialer)
@@ -1406,8 +1497,9 @@ func (p *Proxy) portProbingChangedLocked(key string, newPort PortMapping) bool {
 	return false
 }
 
-func (p *Proxy) stopListener(port PortMapping) error {
+func (p *Proxy) detachListenerLocked(port PortMapping) []*listenerInfo {
 	key := port.Key()
+	var detached []*listenerInfo
 
 	if info, exists := p.tcpListeners[key]; exists {
 		info.mu.Lock()
@@ -1417,8 +1509,8 @@ func (p *Proxy) stopListener(port PortMapping) error {
 			info.listener = nil
 		}
 		info.mu.Unlock()
-		info.wg.Wait()
 		delete(p.tcpListeners, key)
+		detached = append(detached, info)
 		log.Printf("TCP listener stopped for %s", port.ListenAddr())
 	}
 
@@ -1430,12 +1522,18 @@ func (p *Proxy) stopListener(port PortMapping) error {
 			info.conn = nil
 		}
 		info.mu.Unlock()
-		info.wg.Wait()
 		delete(p.udpConns, key)
+		detached = append(detached, info)
 		log.Printf("UDP listener stopped for %s", port.ListenAddr())
 	}
 
-	return nil
+	return detached
+}
+
+func (p *Proxy) waitListeners(detached []*listenerInfo) {
+	for _, info := range detached {
+		info.wg.Wait()
+	}
 }
 
 func (p *Proxy) startListener(port PortMapping) error {
@@ -1514,24 +1612,8 @@ func (p *Proxy) probeTCPUpstream(ctx context.Context, dialer Dialer, destination
 	return nil
 }
 
-func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port PortMapping, info *listenerInfo, cfg ProbeConfig, initialDelay time.Duration) {
-
-	interval := cfg.Interval
-	if interval <= 0 {
-		interval = 10 * time.Second
-	}
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
-	cooldown := cfg.Cooldown
-	if cooldown <= 0 {
-		cooldown = interval
-	}
-	maxFailures := cfg.ConsecutiveFailures
-	if maxFailures <= 0 {
-		maxFailures = 2
-	}
+func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port PortMapping, info *listenerInfo, _ ProbeConfig, initialDelay time.Duration) {
+	_, _, _, _, cfgWakeCh := p.getProbeSettings()
 
 	if initialDelay <= 0 {
 		initialDelay = time.Duration(100+rand.Intn(400)) * time.Millisecond
@@ -1548,6 +1630,8 @@ func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port Port
 		initialTimer.Stop()
 		p.suspendTCPListener(info, "client dial failed to upstream")
 		justSuspended = true
+	case <-cfgWakeCh:
+		initialTimer.Stop()
 	case <-initialTimer.C:
 	}
 
@@ -1555,6 +1639,8 @@ func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port Port
 		if ctx.Err() != nil {
 			return
 		}
+
+		interval, timeout, cooldown, maxFailures, cfgWakeCh := p.getProbeSettings()
 
 		if !justSuspended {
 			info.mu.Lock()
@@ -1639,6 +1725,8 @@ func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port Port
 			timer.Stop()
 			p.suspendTCPListener(info, "client dial failed to upstream")
 			justSuspended = true
+		case <-cfgWakeCh:
+			timer.Stop()
 		case <-timer.C:
 		}
 	}
@@ -1689,7 +1777,7 @@ func (p *Proxy) startUDPListener(port PortMapping, key string) error {
 	p.udpConns[key] = info
 
 	info.wg.Go(func() {
-		p.forwardUDP(ctx, dialer, port, conn, &info.wg, info)
+		p.forwardUDP(ctx, dialer, port, conn, info)
 	})
 
 	if probing {
@@ -1749,24 +1837,8 @@ func (p *Proxy) probeUDPUpstream(ctx context.Context, dialer Dialer, destination
 	return err
 }
 
-func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port PortMapping, info *listenerInfo, cfg ProbeConfig, initialDelay time.Duration) {
-
-	interval := cfg.Interval
-	if interval <= 0 {
-		interval = 10 * time.Second
-	}
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
-	cooldown := cfg.Cooldown
-	if cooldown <= 0 {
-		cooldown = interval
-	}
-	maxFailures := cfg.ConsecutiveFailures
-	if maxFailures <= 0 {
-		maxFailures = 2
-	}
+func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port PortMapping, info *listenerInfo, _ ProbeConfig, initialDelay time.Duration) {
+	_, _, _, _, cfgWakeCh := p.getProbeSettings()
 
 	if initialDelay <= 0 {
 		initialDelay = time.Duration(100+rand.Intn(400)) * time.Millisecond
@@ -1783,6 +1855,8 @@ func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port Port
 		initialTimer.Stop()
 		p.suspendUDPListener(info, "client dial failed to upstream")
 		justSuspended = true
+	case <-cfgWakeCh:
+		initialTimer.Stop()
 	case <-initialTimer.C:
 	}
 
@@ -1790,6 +1864,8 @@ func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port Port
 		if ctx.Err() != nil {
 			return
 		}
+
+		interval, timeout, cooldown, maxFailures, cfgWakeCh := p.getProbeSettings()
 
 		if !justSuspended {
 			info.mu.Lock()
@@ -1845,7 +1921,7 @@ func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port Port
 							log.Printf("Upstream UDP %s recovered; resumed local UDP listener on %s",
 								port.Destination, port.ListenAddr())
 							info.wg.Go(func() {
-								p.forwardUDP(ctx, dialer, port, conn, &info.wg, info)
+								p.forwardUDP(ctx, dialer, port, conn, info)
 							})
 						}
 					}
@@ -1873,6 +1949,8 @@ func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port Port
 			timer.Stop()
 			p.suspendUDPListener(info, "client dial failed to upstream")
 			justSuspended = true
+		case <-cfgWakeCh:
+			timer.Stop()
 		case <-timer.C:
 		}
 	}
@@ -1891,7 +1969,8 @@ func (p *Proxy) suspendUDPListener(info *listenerInfo, reason string) {
 	}
 }
 
-func (p *Proxy) stopAllListenersLocked() {
+func (p *Proxy) detachAllListenersLocked() []*listenerInfo {
+	detached := make([]*listenerInfo, 0, len(p.tcpListeners)+len(p.udpConns))
 	for key, info := range p.tcpListeners {
 		info.mu.Lock()
 		info.cancel()
@@ -1902,8 +1981,8 @@ func (p *Proxy) stopAllListenersLocked() {
 			info.listener = nil
 		}
 		info.mu.Unlock()
-		info.wg.Wait()
 		delete(p.tcpListeners, key)
+		detached = append(detached, info)
 	}
 
 	for key, info := range p.udpConns {
@@ -1916,9 +1995,10 @@ func (p *Proxy) stopAllListenersLocked() {
 			info.conn = nil
 		}
 		info.mu.Unlock()
-		info.wg.Wait()
 		delete(p.udpConns, key)
+		detached = append(detached, info)
 	}
+	return detached
 }
 
 // GetPortStatuses returns the health and bind status of all configured port mappings.
@@ -2009,9 +2089,13 @@ func (p *Proxy) Stop() {
 	p.stopOnce.Do(func() {
 		p.cancel()
 
+		p.lifecycleMu.Lock()
 		p.mu.Lock()
-		p.stopAllListenersLocked()
+		detached := p.detachAllListenersLocked()
 		p.mu.Unlock()
+
+		p.waitListeners(detached)
+		p.lifecycleMu.Unlock()
 
 		log.Printf("All listeners stopped and goroutines cleaned up")
 	})

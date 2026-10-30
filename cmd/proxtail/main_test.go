@@ -712,7 +712,8 @@ func TestZeroTailnetsStandbyModeAndHotReloadLifecycle(t *testing.T) {
 tailnets: []
 proxy:
   listen_address: '127.0.0.1'
-  enable_backend_probes: false
+  probe:
+    enabled: false
 `
 	if err := os.WriteFile(cfgPath, []byte(standbyYAML), 0o600); err != nil {
 		t.Fatalf("failed to write initial standby config: %v", err)
@@ -812,7 +813,8 @@ tailnets:
         destination: '100.64.0.1:8080'
 proxy:
   listen_address: '127.0.0.1'
-  enable_backend_probes: false
+  probe:
+    enabled: false
 `, port1)
 	if err := os.WriteFile(cfgPath, []byte(activeYAML), 0o600); err != nil {
 		t.Fatalf("failed to write active config: %v", err)
@@ -860,6 +862,127 @@ proxy:
 	}
 	if rr2.Status != "ready" || rr2.ActiveListeners != 0 || rr2.Tailnets != 0 {
 		t.Fatalf("unexpected /readyz after 1 -> 0 reload: %+v", rr2)
+	}
+}
+
+func TestReloadConfigTransactionalRollbackPreservesRemovedTailnet(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+
+	port1 := getFreePort(t)
+	occupiedLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind occupied listener: %v", err)
+	}
+	defer occupiedLn.Close()
+	occupiedPort := occupiedLn.Addr().(*net.TCPAddr).Port
+
+	initialYAML := fmt.Sprintf(`
+tailnets:
+  - name: 'alpha'
+    hostname: 'alpha-node'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.1:8080'
+proxy:
+  listen_address: '127.0.0.1'
+  probe:
+    enabled: false
+`, port1)
+	if err := os.WriteFile(cfgPath, []byte(initialYAML), 0o600); err != nil {
+		t.Fatalf("failed writing initial config: %v", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("failed loading initial config: %v", err)
+	}
+
+	var mu sync.Mutex
+	cleanedTailnets := make(map[string]int)
+
+	tm := newTailnetManager()
+	tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: c.Hostname}, nil
+	}
+	tm.cleanupFunc = func(srv *tsnet.Server, name string) {
+		mu.Lock()
+		cleanedTailnets[name]++
+		mu.Unlock()
+	}
+	defer tm.closeAll()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers, _, _, err := tm.syncTailnets(cfg.Tailnets)
+	if err != nil {
+		t.Fatalf("initial syncTailnets failed: %v", err)
+	}
+	initialPorts, err := tm.prepareInitialPorts(ctx, cfg, servers)
+	if err != nil {
+		t.Fatalf("prepareInitialPorts failed: %v", err)
+	}
+
+	proxyServer := proxy.NewProxyWithMultiTailnet(initialPorts, servers, 64*1024, 50)
+	proxyServer.SetProbeConfig(cfg.ToProxyProbeConfig())
+
+	go func() { _ = proxyServer.Start(ctx) }()
+	defer proxyServer.Stop()
+
+	select {
+	case <-proxyServer.Started():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxyServer.Started()")
+	}
+
+	// Attempt to reload to a config that removes 'alpha', adds 'beta', and binds occupiedPort (which fails)
+	failingYAML := fmt.Sprintf(`
+tailnets:
+  - name: 'beta'
+    hostname: 'beta-node'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.2:8080'
+proxy:
+  listen_address: '127.0.0.1'
+  probe:
+    enabled: false
+`, occupiedPort)
+	if err := os.WriteFile(cfgPath, []byte(failingYAML), 0o600); err != nil {
+		t.Fatalf("failed writing failing config: %v", err)
+	}
+
+	if err := reloadConfig(cfgPath, proxyServer, tm); err == nil {
+		t.Fatal("expected reloadConfig with occupied port to fail")
+	}
+
+	mu.Lock()
+	alphaCleaned := cleanedTailnets["alpha"]
+	betaCleaned := cleanedTailnets["beta"]
+	mu.Unlock()
+
+	if alphaCleaned != 0 {
+		t.Fatalf("expected removed tailnet 'alpha' NOT to be cleaned up on rollback, got %d cleanups", alphaCleaned)
+	}
+	if betaCleaned != 1 {
+		t.Fatalf("expected newly added tailnet 'beta' to be cleaned up on rollback, got %d cleanups", betaCleaned)
+	}
+
+	snap := tm.snapshotServers()
+	if _, ok := snap["alpha"]; !ok {
+		t.Fatalf("expected 'alpha' to remain in tm.servers after rollback, got %v", snap)
+	}
+	if _, ok := snap["beta"]; ok {
+		t.Fatalf("expected 'beta' to be removed from tm.servers after rollback, got %v", snap)
+	}
+
+	if proxyServer.ActiveListenerCount() != 1 {
+		t.Fatalf("expected 1 active listener on 'alpha' after rollback, got %d", proxyServer.ActiveListenerCount())
 	}
 }
 

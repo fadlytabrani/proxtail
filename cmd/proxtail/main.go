@@ -244,6 +244,14 @@ func cleanupTailnetServer(server *tsnet.Server, tailnetName string) {
 // syncTailnets reconciles running tsnet.Server instances with the provided configuration,
 // starting added tailnets in parallel, restarting modified tailnets, and returning a cleanup callback for removed ones.
 func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[string]*tsnet.Server, map[string]bool, func(), error) {
+	servers, restarted, commit, _, err := tm.syncTailnetsWithRollback(tailnets)
+	return servers, restarted, commit, err
+}
+
+// syncTailnetsWithRollback reconciles running tsnet.Server instances and returns both a commit callback
+// (which cleans up removed tailnet servers after listeners migrate) and a rollback callback
+// (which restores removed tailnet servers and cleans up newly added ones if config reload fails).
+func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConfig) (map[string]*tsnet.Server, map[string]bool, func(), func(), error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -255,6 +263,7 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 	addedServers := make(map[string]*tsnet.Server)
 	restartedTailnets := make(map[string]bool)
 	removedServers := make(map[string]*tsnet.Server)
+	removedConfigs := make(map[string]config.TailnetConfig)
 
 	type initTask struct {
 		cfg     config.TailnetConfig
@@ -325,7 +334,7 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 			for name, started := range addedServers {
 				tm.cleanupFunc(started, name)
 			}
-			return nil, nil, nil, firstErr
+			return nil, nil, nil, nil, firstErr
 		}
 	}
 
@@ -334,10 +343,12 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 		tm.configs[name] = newConfigs[name]
 	}
 
-	// Identify removed tailnets so they can be closed after listeners stop using them.
+	// Identify removed tailnets so they can be closed after listeners stop using them,
+	// or restored if the reload fails and rolls back.
 	for name, srv := range tm.servers {
 		if _, exists := newConfigs[name]; !exists {
 			removedServers[name] = srv
+			removedConfigs[name] = tm.configs[name]
 			delete(tm.servers, name)
 			delete(tm.configs, name)
 		}
@@ -345,13 +356,34 @@ func (tm *tailnetManager) syncTailnets(tailnets []config.TailnetConfig) (map[str
 
 	snapshot := maps.Clone(tm.servers)
 
-	cleanupRemoved := func() {
-		for name, srv := range removedServers {
-			tm.cleanupFunc(srv, name)
-		}
+	var finishOnce sync.Once
+	commit := func() {
+		finishOnce.Do(func() {
+			for name, srv := range removedServers {
+				tm.cleanupFunc(srv, name)
+			}
+		})
 	}
 
-	return snapshot, restartedTailnets, cleanupRemoved, nil
+	rollback := func() {
+		finishOnce.Do(func() {
+			tm.mu.Lock()
+			for name, srv := range addedServers {
+				if !restartedTailnets[name] {
+					delete(tm.servers, name)
+					delete(tm.configs, name)
+					tm.cleanupFunc(srv, name)
+				}
+			}
+			for name, srv := range removedServers {
+				tm.servers[name] = srv
+				tm.configs[name] = removedConfigs[name]
+			}
+			tm.mu.Unlock()
+		})
+	}
+
+	return snapshot, restartedTailnets, commit, rollback, nil
 }
 
 // snapshotServers returns a thread-safe copy of the currently active tailnet servers.
@@ -377,6 +409,18 @@ func (tm *tailnetManager) closeAll() {
 	log.Println("All tailnet servers cleaned up")
 }
 
+func applyTailnetServersToProxy(proxyServer *proxy.Proxy, tm *tailnetManager, servers map[string]*tsnet.Server) {
+	if tm.dialerForServer != nil {
+		dialers := make(map[string]proxy.Dialer, len(servers))
+		for name, srv := range servers {
+			dialers[name] = tm.dialerForServer(name, srv)
+		}
+		proxyServer.UpdateTailnetDialers(dialers)
+	} else {
+		proxyServer.UpdateTailnetServers(servers)
+	}
+}
+
 // reloadConfig loads and validates the updated configuration and applies it to the running proxy.
 func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManager) error {
 	tm.reloadMu.Lock()
@@ -389,31 +433,21 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 
 	manualMappings := newCfg.ToProxyPortMappings()
 
-	servers, restartedTailnets, cleanupRemoved, err := tm.syncTailnets(newCfg.Tailnets)
+	servers, restartedTailnets, commitTailnets, rollbackTailnets, err := tm.syncTailnetsWithRollback(newCfg.Tailnets)
 	if err != nil {
 		return err
 	}
-	defer cleanupRemoved()
 
 	for _, mapping := range manualMappings {
 		if _, exists := servers[mapping.Tailnet]; !exists {
+			rollbackTailnets()
 			return fmt.Errorf("port mapping for port %d references unknown tailnet '%s'", mapping.Source, mapping.Tailnet)
 		}
 	}
 
-	if tm.dialerForServer != nil {
-		dialers := make(map[string]proxy.Dialer, len(servers))
-		for name, srv := range servers {
-			dialers[name] = tm.dialerForServer(name, srv)
-		}
-		proxyServer.UpdateTailnetDialers(dialers)
-	} else {
-		proxyServer.UpdateTailnetServers(servers)
-	}
-	proxyServer.SetProbeConfig(newCfg.ToProxyProbeConfig())
-
 	vipPorts, nextAllocs, discoveredSnap, diffLogs, err := tm.computeVIPMappingsLocked(context.Background(), newCfg, servers, false)
 	if err != nil {
+		rollbackTailnets()
 		return fmt.Errorf("failed to resolve VIP port mappings: %w", err)
 	}
 
@@ -426,7 +460,16 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 		prevApplied = proxyServer.CurrentPorts()
 	}
 
+	applyTailnetServersToProxy(proxyServer, tm, servers)
+	proxyServer.SetProbeConfig(newCfg.ToProxyProbeConfig())
+
 	if err := proxyServer.ReloadConfig(desiredPorts); err != nil {
+		rollbackTailnets()
+		restoredServers := tm.snapshotServers()
+		applyTailnetServersToProxy(proxyServer, tm, restoredServers)
+		if tm.activeCfg != nil {
+			proxyServer.SetProbeConfig(tm.activeCfg.ToProxyProbeConfig())
+		}
 		if rbErr := proxyServer.ReloadConfig(slices.Clone(prevApplied)); rbErr != nil {
 			log.Printf("Warning: error rolling back failed config reload: %v", rbErr)
 		}
@@ -435,9 +478,12 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 
 	if len(restartedTailnets) > 0 {
 		if err := proxyServer.RestartTailnetPorts(restartedTailnets); err != nil {
+			commitTailnets()
 			return fmt.Errorf("failed to restart ports for updated tailnets: %w", err)
 		}
 	}
+
+	commitTailnets()
 
 	tm.activeCfg = newCfg
 	tm.vipAllocations = nextAllocs

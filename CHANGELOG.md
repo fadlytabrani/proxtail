@@ -8,6 +8,19 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+### Fixed
+- **Transactional Hot-Reload Rollback (`reloadConfig` & `Proxy.ReloadConfig`)**:
+  - Deferred closing removed `tsnet.Server` instances until after VIP resolution and `Proxy.ReloadConfig` succeed; if a configuration reload fails, newly started tailnet servers are cleaned up and previously running tailnet servers, probe settings, and port listeners are transactionally restored.
+  - Updated `Proxy.ReloadConfig` to verify live listener state (`p.tcpListeners` / `p.udpConns`) and only commit active listeners to `p.Ports`, ensuring failed binds are properly rolled back.
+- **Non-Blocking Listener Teardown & `WaitGroup` Race Prevention**:
+  - Separated per-connection/session `sync.WaitGroup` tracking in `forwardTCP` and `forwardUDP` from `listenerInfo.wg` to prevent `Add`/`Wait` races during concurrent listener teardown.
+  - Detached stopped listeners under `p.mu` and waited for active connections to drain outside `p.mu` (serialized by `p.lifecycleMu`) so `/healthz`, `/readyz`, `/metrics`, and `GetPortStatuses()` remain non-blocking during hot reloads.
+- **Shared Bidirectional Activity Tracking & Low-Rate Deadline Refresh for `ConnectionTimeout`**:
+  - Shared a coalesced atomic activity timestamp across both directions of each proxied TCP connection so long-lived unidirectional streams (large downloads, SSE, log tailing) do not prematurely half-close after `ConnectionTimeout`.
+  - Removed the 8-packet modulo gate (`iter&7 == 0`) on time-coalesced TCP and UDP deadline refreshes and refreshed destination write deadlines upon receiving payload bytes, preventing low-packet-rate streams (`< 8` packets per `ConnectionTimeout`) from timing out mid-stream.
+- **Live Reloading of `ProbeConfig` Parameters**:
+  - Added immediate wake-up signaling (`probeWakeCh`) and dynamic parameter refresh in `monitorTCPUpstream` and `monitorUDPUpstream` so updates to `probe.interval`, `probe.timeout`, `probe.consecutive_failures`, and `probe.cooldown` take effect immediately on hot reload without restarting listeners.
+
 ## [0.3.1] - 2026-10-31
 
 ### Added
