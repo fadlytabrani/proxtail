@@ -4,8 +4,19 @@ All notable changes to `proxtail` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaranteed across releases.
 
 ## [Unreleased]
+
+## [0.3.1] - 2026-10-31
+
+### Added
+- **Zero-Tailnet Standby Mode** ([#18](https://github.com/fadlytabrani/proxtail/issues/18)):
+  - Allow starting `proxtail` with 0 tailnets configured (`tailnets: []` or omitted) so container appliances and orchestrators can boot in standby mode (`GET /healthz`, `GET /readyz`, and `GET /metrics` active) and dynamically provision tailnets via `SIGHUP` hot reload.
+  - Added standby mode startup logging and `0 -> N -> 0` tailnet hot-reload lifecycle tests.
+- **Release & Version Metadata Enhancements**:
+  - Embedded UTC build date (`main.buildDate`) into `proxtail -version` output (`proxtail vX.Y.Z (YYYY-MM-DD)`) and GitHub Release display titles.
+  - Added `make release VERSION=vX.Y.Z` target in `Makefile` and updated GHCR container tagging so `main` branch builds publish `:edge`/`:main` while only stable `v*.*.*` tags move `:latest`.
 
 ## [0.3.0] - 2026-10-30
 
