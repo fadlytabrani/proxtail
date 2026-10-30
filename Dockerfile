@@ -6,6 +6,7 @@ FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24 AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG VERSION=dev
+ARG BUILD_DATE=""
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates
@@ -19,7 +20,7 @@ RUN go mod download
 # Copy source code and compile a static, stripped binary for the target architecture
 COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o proxtail ./cmd/proxtail
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.buildDate=${BUILD_DATE}" -o proxtail ./cmd/proxtail
 
 # Runtime stage: Lightweight Alpine image running as an unprivileged user
 FROM alpine:3.24

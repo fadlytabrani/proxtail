@@ -28,9 +28,13 @@ jobs:
         run: go test -v -race ./...
 
       - name: Cross-compile release binaries and archives
+        id: release-meta
         env:
           VERSION: ${{ github.ref_name }}
+          IS_PRERELEASE: ${{ contains(github.ref_name, '-') }}
         run: |
+          BUILD_DATE="$(date -u +%Y-%m-%d)"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
           mkdir -p dist
           targets=(
             "linux/amd64"
@@ -52,11 +56,13 @@ jobs:
             OUTPUT="dist/${BIN_NAME}"
             echo "Building standalone executable ${OUTPUT}..."
             CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
-              go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+              go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.buildDate=${BUILD_DATE}" \
               -o "${OUTPUT}" ./cmd/proxtail
 
-            # Provide unversioned standalone executable for latest download scripts
-            cp "${OUTPUT}" "dist/proxtail-${GOOS}-${GOARCH}${EXT}"
+            # Provide unversioned standalone executable for latest stable download scripts
+            if [ "${IS_PRERELEASE}" != "true" ]; then
+              cp "${OUTPUT}" "dist/proxtail-${GOOS}-${GOARCH}${EXT}"
+            fi
 
             # Package standalone archive with LICENSE and README
             STAGE_DIR="dist/stage_${GOOS}_${GOARCH}"
@@ -67,10 +73,14 @@ jobs:
 
             if [ "${GOOS}" = "windows" ]; then
               (cd "${STAGE_DIR}" && zip -q -r "../../dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.zip" .)
-              cp "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.zip" "dist/proxtail-${GOOS}-${GOARCH}.zip"
+              if [ "${IS_PRERELEASE}" != "true" ]; then
+                cp "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.zip" "dist/proxtail-${GOOS}-${GOARCH}.zip"
+              fi
             else
               tar -czf "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.tar.gz" -C "${STAGE_DIR}" .
-              cp "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.tar.gz" "dist/proxtail-${GOOS}-${GOARCH}.tar.gz"
+              if [ "${IS_PRERELEASE}" != "true" ]; then
+                cp "dist/proxtail-${VERSION}-${GOOS}-${GOARCH}.tar.gz" "dist/proxtail-${GOOS}-${GOARCH}.tar.gz"
+              fi
             fi
             rm -rf "${STAGE_DIR}"
           done
@@ -81,6 +91,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          name: proxtail ${{ github.ref_name }} (${{ steps.release-meta.outputs.build_date }})
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
             dist/proxtail-*

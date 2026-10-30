@@ -372,11 +372,8 @@ func ApplyDefaults(cfg *Config) {
 }
 
 // Validate performs comprehensive validation of the configuration.
+// Zero tailnets (len(cfg.Tailnets) == 0) is permitted for standby/unconfigured deployments.
 func Validate(cfg *Config) error {
-	if len(cfg.Tailnets) == 0 {
-		return fmt.Errorf("at least one tailnet must be configured")
-	}
-
 	if cfg.Proxy.ListenAddress != "" && net.ParseIP(cfg.Proxy.ListenAddress) == nil {
 		return fmt.Errorf("invalid proxy listen_address '%s': must be a valid IP address", cfg.Proxy.ListenAddress)
 	}

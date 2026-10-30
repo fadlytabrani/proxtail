@@ -52,6 +52,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build version and date
+        id: build-meta
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo "${{ github.sha }}")"
+          fi
+          BUILD_DATE="$(date -u +%Y-%m-%d)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         if: github.event_name != 'pull_request'
@@ -77,7 +91,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=edge,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
@@ -95,7 +109,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ steps.build-meta.outputs.version }}
+            BUILD_DATE=${{ steps.build-meta.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false

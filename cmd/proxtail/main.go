@@ -743,8 +743,18 @@ func resolveConfigPath(flagConfig string) string {
 	return "/etc/proxtail/config.yaml"
 }
 
-// version is populated at build time via -ldflags="-X main.version=..."
-var version = "dev"
+// version and buildDate are populated at build time via -ldflags="-X main.version=... -X main.buildDate=..."
+var (
+	version   = "dev"
+	buildDate = ""
+)
+
+func formatVersion() string {
+	if buildDate != "" {
+		return fmt.Sprintf("proxtail %s (%s)", version, buildDate)
+	}
+	return fmt.Sprintf("proxtail %s", version)
+}
 
 func main() {
 	var flagConfig string
@@ -761,7 +771,7 @@ func main() {
 	flag.Parse()
 
 	if flagVersion {
-		fmt.Printf("proxtail %s\n", version)
+		fmt.Println(formatVersion())
 		return
 	}
 
@@ -855,7 +865,13 @@ func main() {
 
 	fmt.Printf("Starting proxtail with %d tailnets, %d workers, %dKB buffers...\n",
 		len(tailnetServers), cfg.Proxy.WorkerPoolSize, cfg.Proxy.BufferSize)
-	if len(initialPorts) == 0 {
+	if len(tailnetServers) == 0 {
+		if cfg.Proxy.HealthPort > 0 {
+			log.Printf("Running in standby mode (0 tailnets configured; health server active on :%d)", cfg.Proxy.HealthPort)
+		} else {
+			log.Printf("Running in standby mode (0 tailnets configured)")
+		}
+	} else if len(initialPorts) == 0 {
 		if cfg.Proxy.HealthPort > 0 {
 			log.Printf("Running in tailnet discovery mode (0 port mappings configured; health & discovery active on :%d)", cfg.Proxy.HealthPort)
 		} else {

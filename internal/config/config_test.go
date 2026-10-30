@@ -148,17 +148,52 @@ func TestAuthKeyNormalizationAndLiteralSupport(t *testing.T) {
 	}
 }
 
+func TestZeroTailnetsStandbyConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "empty tailnets slice",
+			yaml: `
+tailnets: []
+proxy:
+  listen_address: '10.254.254.254'
+  health_port: 9090
+`,
+		},
+		{
+			name: "omitted tailnets field",
+			yaml: `
+proxy:
+  health_port: 9090
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("expected 0-tailnet standby config to be valid, got error: %v", err)
+			}
+			if len(cfg.Tailnets) != 0 {
+				t.Fatalf("expected 0 tailnets, got %d", len(cfg.Tailnets))
+			}
+			if len(cfg.ToProxyPortMappings()) != 0 {
+				t.Fatalf("expected 0 port mappings, got %d", len(cfg.ToProxyPortMappings()))
+			}
+			if cfg.Proxy.HealthPort != 9090 {
+				t.Errorf("expected health_port 9090, got %d", cfg.Proxy.HealthPort)
+			}
+		})
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	tests := []struct {
 		name        string
 		yaml        string
 		errContains string
 	}{
-		{
-			name:        "no tailnets",
-			yaml:        `tailnets: []`,
-			errContains: "at least one tailnet must be configured",
-		},
 		{
 			name: "duplicate tailnet names",
 			yaml: `

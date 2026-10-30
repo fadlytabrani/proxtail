@@ -703,3 +703,181 @@ func TestHealthzAndReadyzWhenListenersSuspended(t *testing.T) {
 		t.Fatalf("expected /readyz 503 when all configured port listeners are suspended, got %d", recAllDown.Code)
 	}
 }
+
+func TestZeroTailnetsStandbyModeAndHotReloadLifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+
+	standbyYAML := `
+tailnets: []
+proxy:
+  listen_address: '127.0.0.1'
+  enable_backend_probes: false
+`
+	if err := os.WriteFile(cfgPath, []byte(standbyYAML), 0o600); err != nil {
+		t.Fatalf("failed to write initial standby config: %v", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("expected standby config to load cleanly, got: %v", err)
+	}
+
+	var mu sync.Mutex
+	var cleanedTailnets []string
+
+	tm := newTailnetManager()
+	tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: c.Hostname}, nil
+	}
+	tm.cleanupFunc = func(srv *tsnet.Server, name string) {
+		mu.Lock()
+		cleanedTailnets = append(cleanedTailnets, name+":"+srv.Hostname)
+		mu.Unlock()
+	}
+	defer tm.closeAll()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers, _, _, err := tm.syncTailnets(cfg.Tailnets)
+	if err != nil {
+		t.Fatalf("syncTailnets with 0 tailnets failed: %v", err)
+	}
+	if len(servers) != 0 {
+		t.Fatalf("expected 0 servers in standby mode, got %d", len(servers))
+	}
+
+	initialPorts, err := tm.prepareInitialPorts(ctx, cfg, servers)
+	if err != nil {
+		t.Fatalf("prepareInitialPorts in standby mode failed: %v", err)
+	}
+
+	proxyServer := proxy.NewProxyWithMultiTailnet(
+		initialPorts,
+		servers,
+		64*1024,
+		50,
+	)
+	proxyServer.SetProbeConfig(cfg.ToProxyProbeConfig())
+
+	go func() { _ = proxyServer.Start(ctx) }()
+	defer proxyServer.Stop()
+
+	select {
+	case <-proxyServer.Started():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxyServer.Started() in standby mode")
+	}
+
+	handler := newHealthHandler(proxyServer, tm)
+
+	// 1. Standby state (0 tailnets, 0 ports): /healthz and /readyz return 200 OK
+	recHealth0 := httptest.NewRecorder()
+	handler.ServeHTTP(recHealth0, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recHealth0.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK in standby mode, got %d", recHealth0.Code)
+	}
+	var hr0 healthResponse
+	if err := json.Unmarshal(recHealth0.Body.Bytes(), &hr0); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
+	}
+	if hr0.Status != "ok" || len(hr0.Tailnets) != 0 || len(hr0.Ports) != 0 {
+		t.Fatalf("unexpected standby /healthz response: %+v", hr0)
+	}
+
+	recReady0 := httptest.NewRecorder()
+	handler.ServeHTTP(recReady0, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recReady0.Code != http.StatusOK {
+		t.Fatalf("expected /readyz 200 OK in standby mode, got %d", recReady0.Code)
+	}
+	var rr0 readyResponse
+	if err := json.Unmarshal(recReady0.Body.Bytes(), &rr0); err != nil {
+		t.Fatalf("failed decoding /readyz: %v", err)
+	}
+	if rr0.Status != "ready" || rr0.ActiveListeners != 0 || rr0.Tailnets != 0 {
+		t.Fatalf("unexpected standby /readyz response: %+v", rr0)
+	}
+
+	// 2. Reload 0 -> 1 tailnet with a TCP port mapping
+	port1 := getFreePort(t)
+	activeYAML := fmt.Sprintf(`
+tailnets:
+  - name: 'production'
+    hostname: 'prod-node'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        source_port: %d
+        destination: '100.64.0.1:8080'
+proxy:
+  listen_address: '127.0.0.1'
+  enable_backend_probes: false
+`, port1)
+	if err := os.WriteFile(cfgPath, []byte(activeYAML), 0o600); err != nil {
+		t.Fatalf("failed to write active config: %v", err)
+	}
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("reloadConfig (0 -> 1 tailnet) failed: %v", err)
+	}
+
+	recReady1 := httptest.NewRecorder()
+	handler.ServeHTTP(recReady1, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recReady1.Code != http.StatusOK {
+		t.Fatalf("expected /readyz 200 OK after reload (0 -> 1), got %d", recReady1.Code)
+	}
+	var rr1 readyResponse
+	if err := json.Unmarshal(recReady1.Body.Bytes(), &rr1); err != nil {
+		t.Fatalf("failed decoding /readyz: %v", err)
+	}
+	if rr1.Status != "ready" || rr1.ActiveListeners != 1 || rr1.Tailnets != 1 {
+		t.Fatalf("unexpected /readyz after 0 -> 1 reload: %+v", rr1)
+	}
+
+	// 3. Reload 1 -> 0 tailnets back to standby mode
+	if err := os.WriteFile(cfgPath, []byte(standbyYAML), 0o600); err != nil {
+		t.Fatalf("failed to write standby config for 1 -> 0 reload: %v", err)
+	}
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("reloadConfig (1 -> 0 tailnets) failed: %v", err)
+	}
+
+	mu.Lock()
+	cleanedCount := len(cleanedTailnets)
+	mu.Unlock()
+	if cleanedCount != 1 {
+		t.Fatalf("expected 1 cleaned tailnet server after 1 -> 0 reload, got %v", cleanedTailnets)
+	}
+
+	recReady2 := httptest.NewRecorder()
+	handler.ServeHTTP(recReady2, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recReady2.Code != http.StatusOK {
+		t.Fatalf("expected /readyz 200 OK after reload back to standby (1 -> 0), got %d", recReady2.Code)
+	}
+	var rr2 readyResponse
+	if err := json.Unmarshal(recReady2.Body.Bytes(), &rr2); err != nil {
+		t.Fatalf("failed decoding /readyz: %v", err)
+	}
+	if rr2.Status != "ready" || rr2.ActiveListeners != 0 || rr2.Tailnets != 0 {
+		t.Fatalf("unexpected /readyz after 1 -> 0 reload: %+v", rr2)
+	}
+}
+
+func TestFormatVersion(t *testing.T) {
+	origVersion, origBuildDate := version, buildDate
+	defer func() {
+		version = origVersion
+		buildDate = origBuildDate
+	}()
+
+	version = "v0.3.1"
+	buildDate = ""
+	if got := formatVersion(); got != "proxtail v0.3.1" {
+		t.Fatalf("expected 'proxtail v0.3.1', got %q", got)
+	}
+
+	buildDate = "2026-10-31"
+	if got := formatVersion(); got != "proxtail v0.3.1 (2026-10-31)" {
+		t.Fatalf("expected 'proxtail v0.3.1 (2026-10-31)', got %q", got)
+	}
+}
