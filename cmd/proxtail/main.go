@@ -71,7 +71,7 @@ type tailnetManager struct {
 
 	healthCacheMu      sync.Mutex
 	healthCache        map[string]cachedTailnetHealth
-	healthDiscoverFunc func(context.Context, string, *tsnet.Server) ([]healthPeerStatus, []healthVIPService)
+	healthDiscoverFunc func(context.Context, string, *tsnet.Server) tailnetHealthDetails
 }
 
 func newTailnetManager() *tailnetManager {
@@ -594,17 +594,19 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 
 // healthTailnetStatus describes the runtime status of a single tailnet for /healthz.
 type healthTailnetStatus struct {
-	Name        string             `json:"name"`
-	Hostname    string             `json:"hostname,omitempty"`
-	IPv4        string             `json:"ipv4,omitempty"`
-	IPv6        string             `json:"ipv6,omitempty"`
-	VIPServices []healthVIPService `json:"vip_services,omitempty"`
-	Peers       []healthPeerStatus `json:"peers,omitempty"`
+	Name            string             `json:"name"`
+	TailnetName     string             `json:"tailnet_name,omitempty"`
+	MagicDNSSuffix  string             `json:"magic_dns_suffix,omitempty"`
+	MagicDNSEnabled bool               `json:"magic_dns_enabled"`
+	Self            healthSelfStatus   `json:"self"`
+	VIPServices     []healthVIPService `json:"vip_services,omitempty"`
+	Peers           []healthPeerStatus `json:"peers,omitempty"`
 }
 
 // healthResponse is the JSON payload returned by GET /healthz.
 type healthResponse struct {
 	Status           string                `json:"status"`
+	ActiveListeners  int                   `json:"active_listeners"`
 	Tailnets         []healthTailnetStatus `json:"tailnets"`
 	Ports            []proxy.PortStatus    `json:"ports,omitempty"`
 	TCPConnections   int64                 `json:"tcp_connections"`
@@ -613,20 +615,40 @@ type healthResponse struct {
 	Errors           int64                 `json:"errors"`
 }
 
-// readyResponse is the JSON payload returned by GET /readyz.
-type readyResponse struct {
-	Status          string `json:"status"`
-	ActiveListeners int    `json:"active_listeners"`
-	Tailnets        int    `json:"tailnets"`
+// computeHealthStatus determines the overall health status ("ok", "degraded", or "down")
+// and the corresponding HTTP status code (200 OK for "ok"/"degraded", 503 Service Unavailable for "down").
+func computeHealthStatus(isReady bool, configuredPorts int, activeListeners int, ports []proxy.PortStatus, tailnets []healthTailnetStatus) (string, int) {
+	if !isReady {
+		return "down", http.StatusServiceUnavailable
+	}
+	if configuredPorts > 0 && (len(tailnets) == 0 || activeListeners == 0) {
+		return "down", http.StatusServiceUnavailable
+	}
+
+	for _, ps := range ports {
+		if !ps.Up {
+			return "degraded", http.StatusOK
+		}
+	}
+	for _, tn := range tailnets {
+		if (tn.Self.BackendState != "" && tn.Self.BackendState != "Running") || len(tn.Self.HealthWarnings) > 0 {
+			return "degraded", http.StatusOK
+		}
+	}
+
+	return "ok", http.StatusOK
 }
 
-// newHealthHandler constructs an http.Handler serving /healthz (liveness), /readyz (readiness), and /metrics (Prometheus).
+// newHealthHandler constructs an http.Handler serving /healthz (unified health & readiness) and /metrics (Prometheus).
 func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		stats := proxyServer.GetStats()
 		portStatuses := proxyServer.GetPortStatuses()
+		configuredPorts := proxyServer.ConfiguredPortCount()
+		activeListeners := proxyServer.ActiveListenerCount()
+		isReady := proxyServer.IsReady()
 		servers := tm.snapshotServers()
 
 		names := make([]string, 0, len(servers))
@@ -642,21 +664,21 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 			srv := servers[name]
 			st := healthTailnetStatus{Name: name}
 			if srv != nil {
-				st.Hostname = srv.Hostname
+				st.Self.HostName = srv.Hostname
 				if srv.Sys() != nil || tm.healthDiscoverFunc != nil {
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
-						if srv.Sys() != nil {
-							ip4, ip6 := srv.TailscaleIPs()
-							if ip4.IsValid() {
-								st.IPv4 = ip4.String()
-							}
-							if ip6.IsValid() {
-								st.IPv6 = ip6.String()
-							}
+						details := tm.getCachedTailnetDetails(r.Context(), name, srv)
+						if details.Self.HostName == "" {
+							details.Self.HostName = srv.Hostname
 						}
-						st.Peers, st.VIPServices = tm.getCachedTailnetDetails(r.Context(), name, srv)
+						st.TailnetName = details.TailnetName
+						st.MagicDNSSuffix = details.MagicDNSSuffix
+						st.MagicDNSEnabled = details.MagicDNSEnabled
+						st.Self = details.Self
+						st.VIPServices = details.VIPServices
+						st.Peers = details.Peers
 						tailnets[i] = st
 					}()
 					continue
@@ -666,37 +688,21 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		}
 		wg.Wait()
 
+		status, httpCode := computeHealthStatus(isReady, configuredPorts, activeListeners, portStatuses, tailnets)
+
 		w.Header().Set("Content-Type", "application/json")
+		if httpCode != http.StatusOK {
+			w.WriteHeader(httpCode)
+		}
 		_ = json.NewEncoder(w).Encode(healthResponse{
-			Status:           "ok",
+			Status:           status,
+			ActiveListeners:  activeListeners,
 			Tailnets:         tailnets,
 			Ports:            portStatuses,
 			TCPConnections:   stats.TCPConnections,
 			UDPPackets:       stats.UDPPackets,
 			BytesTransferred: stats.BytesTransferred,
 			Errors:           stats.ErrorCount,
-		})
-	})
-
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		servers := tm.snapshotServers()
-		configuredPorts := proxyServer.ConfiguredPortCount()
-		activeListeners := proxyServer.ActiveListenerCount()
-		ready := proxyServer.IsReady() && (configuredPorts == 0 || len(servers) > 0)
-		if configuredPorts > 0 && activeListeners == 0 {
-			ready = false
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		status := "ready"
-		if !ready {
-			status = "not_ready"
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-		_ = json.NewEncoder(w).Encode(readyResponse{
-			Status:          status,
-			ActiveListeners: activeListeners,
-			Tailnets:        len(servers),
 		})
 	})
 
@@ -778,7 +784,7 @@ func startHealthServer(ctx context.Context, listenAddress string, port int, prox
 	})
 
 	go func() {
-		log.Printf("Health & metrics server listening on %s (/healthz, /readyz, /metrics)", addr)
+		log.Printf("Health & metrics server listening on %s (/healthz, /metrics)", addr)
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("Health server error: %v", err)
 		}
@@ -794,7 +800,7 @@ func runHealthCheck(cfg *config.Config) error {
 		if probeHost == "" || probeHost == "0.0.0.0" || probeHost == "::" {
 			probeHost = "127.0.0.1"
 		}
-		url := fmt.Sprintf("http://%s/readyz", net.JoinHostPort(probeHost, strconv.Itoa(cfg.Proxy.HealthPort)))
+		url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(probeHost, strconv.Itoa(cfg.Proxy.HealthPort)))
 		client := &http.Client{Timeout: 3 * time.Second}
 		resp, err := client.Get(url)
 		if err != nil {

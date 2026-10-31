@@ -45,7 +45,7 @@ proxtail
 ```text
 2026/10/22 03:20:00 [default] tsnet node started (Tailscale IP: 100.64.1.42, hostname: proxtail-default)
 2026/10/22 03:20:00 [default] TCP listening on :8080 and forwarding to web-server:8080
-2026/10/22 03:20:01 Proxtail is ready to accept traffic (/readyz OK)
+2026/10/22 03:20:01 Proxtail is ready to accept traffic (/healthz OK)
 ```
 
 ```bash
@@ -168,7 +168,7 @@ flowchart TD
 - **Cross-Platform Standalone Binaries**: Precompiled standalone binaries for Linux, macOS, Windows, and FreeBSD with zero external dependencies.
 - **Tailscale OAuth & Auto ACL Tag Discovery**: Authenticate with non-expiring OAuth client secrets (`tskey-client-...`). When `tags:` are omitted in YAML, `proxtail` automatically queries the Tailscale API to discover and advertise authorized tags.
 - **Zero-Downtime Hot Reload**: Dynamic file watching and Kubernetes atomic symlink detection (`..data`) reload routes in **< 100 ms** without dropping active connections.
-- **Native Observability**: Prometheus metrics (`/metrics`), Kubernetes liveness (`/healthz`) and readiness (`/readyz`) probes, and optional periodic traffic summaries.
+- **Native Observability**: Prometheus metrics (`/metrics`), unified Kubernetes health and readiness endpoint (`/healthz`), and optional periodic traffic summaries.
 
 ---
 
@@ -439,8 +439,8 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `listen_address` | `string` | `""` *(all interfaces)* | Default local bind IP for all ports and health probes (e.g., `"127.0.0.1"`). |
-| `health_listen_address` | `string` | `proxy.listen_address` | Optional dedicated local bind IP for the HTTP health & metrics server (`/healthz`, `/readyz`, `/metrics`). |
-| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz`, `/readyz`, and `/metrics` (must be outside `vip_port_range`). |
+| `health_listen_address` | `string` | `proxy.listen_address` | Optional dedicated local bind IP for the HTTP health & metrics server (`/healthz`, `/metrics`). |
+| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz` and `/metrics` (must be outside `vip_port_range`). |
 | `vip_port_range` | `string` | `"30000-30999"` | Reserved local `"start-end"` port range allocated exclusively to auto-proxied VIP services. |
 | `vip_refresh_interval` | `int` | `30` | Fallback VIP service discovery refresh interval in seconds (`1`–`3600`), alongside real-time IPN bus events. |
 | `metrics_interval` | `int` | Disabled (`60` if enabled) | Frequency (in seconds) to log periodic `METRICS:` summaries. |
@@ -460,7 +460,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | :--- | :--- |
 | `-c`, `-config <path>` | Path to the YAML configuration file. |
 | `-validate`, `-check` | Validate configuration syntax, port rules, and permissions, then exit (`0` valid, `1` error). |
-| `-healthcheck` | Probe a running `proxtail` instance (`/readyz` or TCP listener) and exit (`0` healthy, `1` error). |
+| `-healthcheck` | Probe a running `proxtail` instance (`/healthz` or TCP listener) and exit (`0` healthy, `1` error). |
 | `-v`, `-version` | Print build version and exit. |
 | `TS_AUTHKEY` / `TS_CLIENT_SECRET` | Default auth key or OAuth client secret for single-tailnet mode. |
 | `TS_AUTHKEY_<NAME>` | Per-tailnet auth key (`<NAME>` is uppercase with hyphens/dots converted to `_`). |
@@ -482,9 +482,8 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 - **Numeric Non-Root User (`10001:10001`)**: Runs as `USER 10001:10001` with `securityContext.runAsNonRoot: true`.
 - **Read-Only Root Filesystem**: Operates cleanly with `readOnlyRootFilesystem: true` using an `emptyDir` at `/var/lib/tsnet` and `/tmp`.
 - **ConfigMap Hot Reload**: Watches the `/etc/proxtail` directory; swapping the `..data` symlink on `kubectl apply` reloads routes with zero downtime.
-- **Liveness & Readiness Probes**:
-  - `GET /healthz`: Liveness probe returning node health, assigned Tailscale IPs, active tailnet peers, and discovered Virtual IP (VIP) services with MagicDNS FQDNs.
-  - `GET /readyz`: Readiness probe returning `200 OK` once all listeners are bound and active (`503 Service Unavailable` during startup or `SIGTERM` draining).
+- **Health, Readiness & Metrics Endpoints**:
+  - `GET /healthz`: Unified health and readiness probe (`200 OK` when `"ok"` or `"degraded"`, `503 Service Unavailable` when `"down"` during startup, `SIGTERM` draining, or when all configured listeners are suspended), returning self-node metadata (`tailnets[].self`), active tailnet peers, discovered Virtual IP (VIP) services with MagicDNS FQDNs, and per-port listener state.
   - `GET /metrics`: Prometheus metrics scraper endpoint.
 - **Graceful Shutdown**: On pod scale-down or node draining, Kubernetes sends `SIGTERM`. `proxtail` immediately deregisters its ephemeral nodes via `b.Logout()`, eliminating stale or offline nodes in Tailscale Admin.
 
@@ -530,13 +529,17 @@ When placing `proxtail` behind an external L4 load balancer or Application Deliv
   4. **Cached In-Memory Peer Check**: Inspects a 2-second per-tailnet cached Tailscale peer status map before dialing; offline peers fail immediately with zero WireGuard handshakes or network packets.
   5. **Staggered Jitter**: Randomized startup delay (`100–500ms`) and `±20%` interval jitter prevent synchronized probe bursts across large port tables.
 
-### Tailnet Peer, VIP & Port Health Discovery (`/healthz`)
+### Unified Health, Readiness & Tailnet Discovery (`/healthz`)
 
-When `health_port` is configured (or via `PROXTAIL_HEALTH_PORT=9090`), the `/healthz` HTTP endpoint returns comprehensive operational health, per-port bind status, and live network discovery details for each configured tailnet:
-- **Node Addresses**: Tailscale IPv4 and IPv6 addresses assigned to the `proxtail` node.
-- **Per-Port Reachability (`ports[]`)**: Live local bind state (`up: true/false`), bind address, destination, protocol, tailnet, and `last_error` when suspended by upstream probing.
-- **Active Peers**: Discovered tailnet peer nodes with hostname, MagicDNS names, IP addresses, OS, online status, and network transfer counters.
-- **VIP Services**: Discovered Tailscale Virtual IP (VIP) services with service names, display names, resolved MagicDNS FQDNs (`<service-name>.<magic-dns-suffix>`), VIP addresses, and exposed proto-ports.
+When `health_port` is configured (or via `PROXTAIL_HEALTH_PORT=9090`), the `GET /healthz` HTTP endpoint acts as both the readiness probe and a zero-extra-RPC-cost ("Tier 0") operational status snapshot (cached for 2 seconds per tailnet):
+- **Dynamic Status & HTTP Codes**:
+  - `"ok"` (`200 OK`): All configured port listeners are bound (`up: true`) and all connected tailnet nodes are `Running` with no health warnings (also `"ok"` in zero-port discovery or zero-tailnet standby mode).
+  - `"degraded"` (`200 OK`): At least one port listener remains active (`active_listeners > 0`), **but** one or more ports are suspended (`up: false`), **or** a tailnet node has `self.backend_state != "Running"` or `self.health_warnings`.
+  - `"down"` (`503 Service Unavailable`): Proxy is starting up or shutting down, **or** ports are configured (`len(ports) > 0`) and all local listeners are down (`active_listeners == 0`).
+- **Tailnet & Self-Node Details (`tailnets[]` & `tailnets[].self`)**: Tailnet organization name (`tailnet_name`), MagicDNS suffix/status, and ProxTail's own node details (`id`, `hostname`, `dns_name`, `ipv4`, `ipv6`, `backend_state`, `online`, `relay`, `tags`, `key_expiry`, `cert_domains`, `health_warnings`).
+- **Per-Port Reachability (`ports[]`)**: Live local bind state (`up: true/false`), `listen_address`, `listen_addr`, `destination`, `protocol`, `tailnet`, `vip_service`, and `last_error` when suspended by upstream probing.
+- **Active Peers (`tailnets[].peers[]`)**: Discovered tailnet peer nodes with stable node ID, hostname, MagicDNS FQDN, IPv4/IPv6 addresses, online/active status, direct P2P `cur_addr` vs. DERP `relay`, `rx_bytes`/`tx_bytes` counters, `last_handshake`, `last_seen`, ACL `tags`, advertised `primary_routes`, and `expired` flag.
+- **VIP Services (`tailnets[].vip_services[]`)**: Discovered Tailscale Virtual IP (VIP) services with service names, display names, resolved MagicDNS FQDNs (`<service-name>.<magic-dns-suffix>`), IPv4/IPv6 VIPs, and exposed proto-ports.
 
 ```bash
 curl http://localhost:9090/healthz | jq
@@ -546,21 +549,34 @@ Example JSON response:
 ```json
 {
   "status": "ok",
+  "active_listeners": 2,
   "tailnets": [
     {
       "name": "production",
-      "hostname": "proxtail-production",
-      "ipv4": "100.64.0.42",
-      "ipv6": "fd7a:115c:a1e0::2a",
+      "tailnet_name": "example.com",
+      "magic_dns_suffix": "tail88356.ts.net",
+      "magic_dns_enabled": true,
+      "self": {
+        "id": "n293847239CNTRL",
+        "hostname": "proxtail-production",
+        "dns_name": "proxtail-production.tail88356.ts.net",
+        "ipv4": "100.64.0.42",
+        "ipv6": "fd7a:115c:a1e0::2a",
+        "backend_state": "Running",
+        "online": true,
+        "relay": "syd",
+        "tags": [
+          "tag:proxy"
+        ],
+        "key_expiry": "2027-04-29T10:00:00Z"
+      },
       "vip_services": [
         {
-          "name": "svc:api-backend",
-          "display_name": "api-backend",
-          "magic_dns_name": "api-backend.example-tailnet.ts.net",
-          "addrs": [
-            "100.64.0.100",
-            "fd7a:115c:a1e0::64"
-          ],
+          "name": "api-backend",
+          "dns_name": "api-backend.tail88356.ts.net",
+          "display_name": "API Backend",
+          "ipv4": "100.64.0.100",
+          "ipv6": "fd7a:115c:a1e0::64",
           "ports": [
             "tcp:443",
             "tcp:8443"
@@ -571,17 +587,23 @@ Example JSON response:
         {
           "id": "n1048576CNTRL",
           "hostname": "postgres-prod-01",
-          "dns_name": "postgres-prod-01.example-tailnet.ts.net",
-          "tailscale_ips": [
-            "100.64.0.15",
-            "fd7a:115c:a1e0::f"
-          ],
-          "os": "linux",
+          "dns_name": "postgres-prod-01.tail88356.ts.net",
+          "ipv4": "100.64.0.15",
+          "ipv6": "fd7a:115c:a1e0::f",
           "online": true,
           "active": true,
+          "cur_addr": "203.0.113.45:41641",
+          "relay": "syd",
           "rx_bytes": 104857600,
           "tx_bytes": 52428800,
-          "last_seen": "2026-10-29T23:30:00Z"
+          "last_handshake": "2026-10-31T10:22:15Z",
+          "last_seen": "2026-10-31T10:24:00Z",
+          "tags": [
+            "tag:prod-db"
+          ],
+          "primary_routes": [
+            "10.20.0.0/16"
+          ]
         }
       ]
     }
@@ -589,7 +611,8 @@ Example JSON response:
   "ports": [
     {
       "source_port": 5432,
-      "listen_addr": ":5432",
+      "listen_address": "127.0.0.1",
+      "listen_addr": "127.0.0.1:5432",
       "destination": "postgres-prod-01:5432",
       "protocol": "tcp",
       "tailnet": "production",
@@ -597,7 +620,8 @@ Example JSON response:
     },
     {
       "source_port": 30000,
-      "listen_addr": ":30000",
+      "listen_address": "127.0.0.1",
+      "listen_addr": "127.0.0.1:30000",
       "destination": "100.64.0.100:443",
       "protocol": "tcp",
       "tailnet": "production",
@@ -611,9 +635,6 @@ Example JSON response:
   "errors": 0
 }
 ```
-
-### Readiness Probe (`/readyz`)
-Returns `200 OK` once configured listeners are initialized and at least one configured TCP or UDP listener is actively bound (or immediately in zero-port discovery mode). Returns `503 Service Unavailable` during startup, graceful teardown (`SIGTERM`), or when all configured port listeners are suspended due to unreachable upstreams.
 
 ### Prometheus Metrics
 When `health_port` is enabled (e.g. `PROXTAIL_HEALTH_PORT=9090`):

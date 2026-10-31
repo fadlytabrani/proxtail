@@ -45,7 +45,7 @@ proxy:
   # listen_address: '0.0.0.0'         # Default bind address for proxy listeners
   # health_listen_address: '127.0.0.1' # Optional separate bind address for the health & metrics server
   metrics_interval: 30        # Log performance metrics every 30s (omit or set 0 to disable)
-  health_port: 9090           # Exposes /healthz, /readyz, and /metrics
+  health_port: 9090           # Exposes /healthz and /metrics
   vip_port_range: '30000-30999' # Reserved local port range for auto-proxied VIP services (manual ports cannot overlap)
   vip_refresh_interval: 30    # Fallback VIP discovery refresh interval in seconds (alongside real-time IPN bus events)
 

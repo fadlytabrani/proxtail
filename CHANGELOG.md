@@ -8,6 +8,17 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+### Changed
+- **Unified & Enriched `GET /healthz` Endpoint**:
+  - Consolidated readiness and liveness reporting into `GET /healthz`: top-level `status` dynamically reflects `"ok"` (`200 OK`), `"degraded"` (`200 OK` when partial listeners are suspended or a tailnet reports health warnings / non-`Running` state), or `"down"` (`503 Service Unavailable` during startup/shutdown or when all configured listeners are down), alongside `active_listeners`.
+  - Separated ProxTail's own node metadata on each tailnet into `tailnets[].self` (`id`, `hostname`, `dns_name`, `ipv4`, `ipv6`, `backend_state`, `online`, `relay`, `tags`, `key_expiry`, `cert_domains`, `health_warnings`).
+  - Enriched `tailnets[]` (`tailnet_name`, `magic_dns_suffix`, `magic_dns_enabled`) and `tailnets[].peers[]` (`id`, `active`, `cur_addr`, `relay`, `rx_bytes`, `tx_bytes`, `last_handshake`, `last_seen`, `tags`, `primary_routes`, `expired`) at zero extra RPC cost from the cached 2-second `lc.Status(ctx)` snapshot.
+  - Updated `proxtail -healthcheck` to probe `GET /healthz` when `proxy.health_port` is configured.
+
+### Removed
+- **Redundant `/readyz` Endpoint**:
+  - Removed `GET /readyz` in favor of the unified `GET /healthz` endpoint (which now returns `200 OK` for `"ok"` / `"degraded"` and `503 Service Unavailable` for `"down"`).
+
 ## [0.4.1] - 2026-10-31
 
 ### Removed

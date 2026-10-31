@@ -306,7 +306,7 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	proxyServer := proxy.NewProxyWithMultiTailnet(nil, servers, 64*1024, 50)
 	handler := newHealthHandler(proxyServer, tm)
 
-	// 1. Verify /healthz returns JSON with active tailnets
+	// 1. Verify /healthz returns JSON with active tailnets and self node details
 	reqHealth := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	recHealth := httptest.NewRecorder()
 	handler.ServeHTTP(recHealth, reqHealth)
@@ -318,7 +318,7 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
 		t.Fatalf("failed to decode /healthz JSON: %v", err)
 	}
-	if hr.Status != "ok" || len(hr.Tailnets) != 2 || hr.Tailnets[0].Name != "production" || hr.Tailnets[1].Name != "staging" {
+	if hr.Status != "ok" || len(hr.Tailnets) != 2 || hr.Tailnets[0].Name != "production" || hr.Tailnets[0].Self.HostName != "proxy-prod" || hr.Tailnets[1].Name != "staging" || hr.Tailnets[1].Self.HostName != "proxy-staging" {
 		t.Errorf("unexpected /healthz response: %+v", hr)
 	}
 
@@ -335,7 +335,7 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		t.Errorf("unexpected /metrics output:\n%s", body)
 	}
 
-	// 3. Verify /readyz lifecycle (503 before Start when ports configured, 200 after Start, 503 after Stop)
+	// 3. Verify /healthz readiness lifecycle (503 "down" before Start when ports configured, 200 "ok" after Start, 503 "down" after Stop)
 	freePort := getFreePort(t)
 	readyProxy := proxy.NewProxyWithMultiTailnet(
 		[]proxy.PortMapping{{Source: freePort, ListenAddress: "127.0.0.1", Destination: "100.64.0.1:8080", Protocol: "tcp", Tailnet: "production"}},
@@ -345,11 +345,18 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	)
 	readyHandler := newHealthHandler(readyProxy, tm)
 
-	// Before Start: not ready (503)
+	// Before Start: down (503)
 	recNotReady := httptest.NewRecorder()
-	readyHandler.ServeHTTP(recNotReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	readyHandler.ServeHTTP(recNotReady, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recNotReady.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected /readyz 503 before listeners start, got %d", recNotReady.Code)
+		t.Fatalf("expected /healthz 503 before listeners start, got %d", recNotReady.Code)
+	}
+	var hrDown healthResponse
+	if err := json.Unmarshal(recNotReady.Body.Bytes(), &hrDown); err != nil {
+		t.Fatalf("failed to decode /healthz JSON before Start: %v", err)
+	}
+	if hrDown.Status != "down" || hrDown.ActiveListeners != 0 {
+		t.Errorf("expected status 'down' and active_listeners 0 before Start, got %+v", hrDown)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -359,22 +366,18 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// After Start: ready (200)
-	recReady := httptest.NewRecorder()
-	readyHandler.ServeHTTP(recReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if recReady.Code != http.StatusOK {
-		t.Fatalf("expected /readyz 200 OK after listeners start, got %d", recReady.Code)
-	}
-
-	// Verify /healthz exposes ports array
+	// After Start: ok (200) and exposes ports array
 	recHealthWithPorts := httptest.NewRecorder()
 	readyHandler.ServeHTTP(recHealthWithPorts, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recHealthWithPorts.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK after listeners start, got %d", recHealthWithPorts.Code)
+	}
 	var hrPorts healthResponse
 	if err := json.Unmarshal(recHealthWithPorts.Body.Bytes(), &hrPorts); err != nil {
 		t.Fatalf("failed to decode /healthz JSON with ports: %v", err)
 	}
-	if len(hrPorts.Ports) != 1 || hrPorts.Ports[0].Source != freePort || !hrPorts.Ports[0].Up {
-		t.Errorf("expected /healthz to expose 1 active port mapping on %d, got %+v", freePort, hrPorts.Ports)
+	if hrPorts.Status != "ok" || hrPorts.ActiveListeners != 1 || len(hrPorts.Ports) != 1 || hrPorts.Ports[0].Source != freePort || !hrPorts.Ports[0].Up {
+		t.Errorf("expected /healthz to expose 1 active port mapping on %d with status 'ok', got %+v", freePort, hrPorts)
 	}
 
 	// Verify runHealthCheck against running HTTP health server and TCP listener
@@ -389,12 +392,12 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		t.Errorf("runHealthCheck with HealthPort failed: %v", err)
 	}
 
-	// After Stop: not ready (503)
+	// After Stop: down (503)
 	readyProxy.Stop()
 	recStopped := httptest.NewRecorder()
-	readyHandler.ServeHTTP(recStopped, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	readyHandler.ServeHTTP(recStopped, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recStopped.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected /readyz 503 after Stop, got %d", recStopped.Code)
+		t.Fatalf("expected /healthz 503 after Stop, got %d", recStopped.Code)
 	}
 }
 
@@ -423,7 +426,7 @@ func TestZeroPortsDiscoveryModeLifecycle(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 1. /healthz returns 200 OK in discovery mode
+	// 1. /healthz returns 200 OK with status "ok" and active_listeners: 0 in discovery mode
 	recHealth := httptest.NewRecorder()
 	handler.ServeHTTP(recHealth, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recHealth.Code != http.StatusOK {
@@ -433,25 +436,11 @@ func TestZeroPortsDiscoveryModeLifecycle(t *testing.T) {
 	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
 		t.Fatalf("failed decoding /healthz: %v", err)
 	}
-	if len(hr.Tailnets) != 1 || hr.Tailnets[0].Name != "discovery-tailnet" {
-		t.Errorf("unexpected healthResponse tailnets: %+v", hr.Tailnets)
+	if hr.Status != "ok" || hr.ActiveListeners != 0 || len(hr.Tailnets) != 1 || hr.Tailnets[0].Name != "discovery-tailnet" || hr.Tailnets[0].Self.HostName != "discovery-node" {
+		t.Errorf("unexpected healthResponse in discovery mode: %+v", hr)
 	}
 
-	// 2. /readyz returns 200 OK with active_listeners: 0
-	recReady := httptest.NewRecorder()
-	handler.ServeHTTP(recReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if recReady.Code != http.StatusOK {
-		t.Fatalf("expected /readyz 200 OK with 0 ports, got %d", recReady.Code)
-	}
-	var rr readyResponse
-	if err := json.Unmarshal(recReady.Body.Bytes(), &rr); err != nil {
-		t.Fatalf("failed decoding /readyz: %v", err)
-	}
-	if rr.Status != "ready" || rr.ActiveListeners != 0 || rr.Tailnets != 1 {
-		t.Errorf("unexpected readyResponse: %+v", rr)
-	}
-
-	// 3. runHealthCheck with HealthPort succeeds
+	// 2. runHealthCheck with HealthPort succeeds
 	healthPort := getFreePort(t)
 	if err := startHealthServer(ctx, "127.0.0.1", healthPort, zeroProxy, tm); err != nil {
 		t.Fatalf("startHealthServer failed: %v", err)
@@ -463,7 +452,7 @@ func TestZeroPortsDiscoveryModeLifecycle(t *testing.T) {
 		t.Errorf("runHealthCheck failed: %v", err)
 	}
 
-	// 4. runHealthCheck without HealthPort and with 0 TCP listeners fails with informative error
+	// 3. runHealthCheck without HealthPort and with 0 TCP listeners fails with informative error
 	cfgWithoutHealth := &config.Config{
 		Tailnets: []config.TailnetConfig{{Name: "discovery-tailnet"}},
 	}
@@ -672,25 +661,21 @@ func TestHealthzAndReadyzWhenListenersSuspended(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// Partial outage (1 of 2 ports active): /readyz stays 200 OK
-	recPartialReady := httptest.NewRecorder()
-	handler.ServeHTTP(recPartialReady, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if recPartialReady.Code != http.StatusOK {
-		t.Fatalf("expected /readyz 200 OK when 1 of 2 ports remains active, got %d", recPartialReady.Code)
-	}
-
-	// Verify /healthz reports per-port up status and last_error
+	// Partial outage (1 of 2 ports active): /healthz stays 200 OK with status "degraded"
 	recHealth := httptest.NewRecorder()
 	handler.ServeHTTP(recHealth, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recHealth.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK when 1 of 2 ports remains active, got %d", recHealth.Code)
+	}
 	var hr healthResponse
 	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
 		t.Fatalf("failed decoding /healthz: %v", err)
 	}
-	if len(hr.Ports) != 2 || !hr.Ports[0].Up || hr.Ports[1].Up || !strings.Contains(hr.Ports[1].LastError, "is offline") {
-		t.Fatalf("unexpected /healthz ports status during partial outage: %+v", hr.Ports)
+	if hr.Status != "degraded" || hr.ActiveListeners != 1 || len(hr.Ports) != 2 || !hr.Ports[0].Up || hr.Ports[1].Up || !strings.Contains(hr.Ports[1].LastError, "is offline") {
+		t.Fatalf("unexpected /healthz status during partial outage: %+v", hr)
 	}
 
-	// 2. Close remaining backend -> all ports suspended -> /readyz returns 503 Service Unavailable
+	// 2. Close remaining backend -> all ports suspended -> /healthz returns 503 Service Unavailable with status "down"
 	_ = backendLn.Close()
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -701,9 +686,16 @@ func TestHealthzAndReadyzWhenListenersSuspended(t *testing.T) {
 	}
 
 	recAllDown := httptest.NewRecorder()
-	handler.ServeHTTP(recAllDown, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	handler.ServeHTTP(recAllDown, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recAllDown.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected /readyz 503 when all configured port listeners are suspended, got %d", recAllDown.Code)
+		t.Fatalf("expected /healthz 503 when all configured port listeners are suspended, got %d", recAllDown.Code)
+	}
+	var hrAllDown healthResponse
+	if err := json.Unmarshal(recAllDown.Body.Bytes(), &hrAllDown); err != nil {
+		t.Fatalf("failed decoding /healthz when all ports down: %v", err)
+	}
+	if hrAllDown.Status != "down" || hrAllDown.ActiveListeners != 0 {
+		t.Fatalf("expected status 'down' and active_listeners 0 when all ports suspended, got %+v", hrAllDown)
 	}
 }
 
@@ -776,7 +768,7 @@ proxy:
 
 	handler := newHealthHandler(proxyServer, tm)
 
-	// 1. Standby state (0 tailnets, 0 ports): /healthz and /readyz return 200 OK
+	// 1. Standby state (0 tailnets, 0 ports): /healthz returns 200 OK with status "ok"
 	recHealth0 := httptest.NewRecorder()
 	handler.ServeHTTP(recHealth0, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recHealth0.Code != http.StatusOK {
@@ -786,21 +778,8 @@ proxy:
 	if err := json.Unmarshal(recHealth0.Body.Bytes(), &hr0); err != nil {
 		t.Fatalf("failed decoding /healthz: %v", err)
 	}
-	if hr0.Status != "ok" || len(hr0.Tailnets) != 0 || len(hr0.Ports) != 0 {
+	if hr0.Status != "ok" || hr0.ActiveListeners != 0 || len(hr0.Tailnets) != 0 || len(hr0.Ports) != 0 {
 		t.Fatalf("unexpected standby /healthz response: %+v", hr0)
-	}
-
-	recReady0 := httptest.NewRecorder()
-	handler.ServeHTTP(recReady0, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if recReady0.Code != http.StatusOK {
-		t.Fatalf("expected /readyz 200 OK in standby mode, got %d", recReady0.Code)
-	}
-	var rr0 readyResponse
-	if err := json.Unmarshal(recReady0.Body.Bytes(), &rr0); err != nil {
-		t.Fatalf("failed decoding /readyz: %v", err)
-	}
-	if rr0.Status != "ready" || rr0.ActiveListeners != 0 || rr0.Tailnets != 0 {
-		t.Fatalf("unexpected standby /readyz response: %+v", rr0)
 	}
 
 	// 2. Reload 0 -> 1 tailnet with a TCP port mapping
@@ -827,16 +806,16 @@ proxy:
 	}
 
 	recReady1 := httptest.NewRecorder()
-	handler.ServeHTTP(recReady1, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	handler.ServeHTTP(recReady1, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recReady1.Code != http.StatusOK {
-		t.Fatalf("expected /readyz 200 OK after reload (0 -> 1), got %d", recReady1.Code)
+		t.Fatalf("expected /healthz 200 OK after reload (0 -> 1), got %d", recReady1.Code)
 	}
-	var rr1 readyResponse
-	if err := json.Unmarshal(recReady1.Body.Bytes(), &rr1); err != nil {
-		t.Fatalf("failed decoding /readyz: %v", err)
+	var hr1 healthResponse
+	if err := json.Unmarshal(recReady1.Body.Bytes(), &hr1); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
 	}
-	if rr1.Status != "ready" || rr1.ActiveListeners != 1 || rr1.Tailnets != 1 {
-		t.Fatalf("unexpected /readyz after 0 -> 1 reload: %+v", rr1)
+	if hr1.Status != "ok" || hr1.ActiveListeners != 1 || len(hr1.Tailnets) != 1 || hr1.Tailnets[0].Self.HostName != "prod-node" {
+		t.Fatalf("unexpected /healthz after 0 -> 1 reload: %+v", hr1)
 	}
 
 	// 3. Reload 1 -> 0 tailnets back to standby mode
@@ -855,16 +834,16 @@ proxy:
 	}
 
 	recReady2 := httptest.NewRecorder()
-	handler.ServeHTTP(recReady2, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	handler.ServeHTTP(recReady2, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recReady2.Code != http.StatusOK {
-		t.Fatalf("expected /readyz 200 OK after reload back to standby (1 -> 0), got %d", recReady2.Code)
+		t.Fatalf("expected /healthz 200 OK after reload back to standby (1 -> 0), got %d", recReady2.Code)
 	}
-	var rr2 readyResponse
-	if err := json.Unmarshal(recReady2.Body.Bytes(), &rr2); err != nil {
-		t.Fatalf("failed decoding /readyz: %v", err)
+	var hr2 healthResponse
+	if err := json.Unmarshal(recReady2.Body.Bytes(), &hr2); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
 	}
-	if rr2.Status != "ready" || rr2.ActiveListeners != 0 || rr2.Tailnets != 0 {
-		t.Fatalf("unexpected /readyz after 1 -> 0 reload: %+v", rr2)
+	if hr2.Status != "ok" || hr2.ActiveListeners != 0 || len(hr2.Tailnets) != 0 {
+		t.Fatalf("unexpected /healthz after 1 -> 0 reload: %+v", hr2)
 	}
 }
 
@@ -1072,7 +1051,7 @@ func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
 	barrier := make(chan struct{})
 	var barrierOnce sync.Once
 
-	tm.healthDiscoverFunc = func(_ context.Context, _ string, _ *tsnet.Server) ([]healthPeerStatus, []healthVIPService) {
+	tm.healthDiscoverFunc = func(_ context.Context, _ string, _ *tsnet.Server) tailnetHealthDetails {
 		callCount.Add(1)
 		cur := inFlight.Add(1)
 		for {
@@ -1090,7 +1069,17 @@ func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
 			}
 		}
 		inFlight.Add(-1)
-		return []healthPeerStatus{{HostName: "peer-1", Online: true}}, []healthVIPService{{Name: "svc-a"}}
+		return tailnetHealthDetails{
+			TailnetName:     "example.com",
+			MagicDNSSuffix:  "tail88356.ts.net",
+			MagicDNSEnabled: true,
+			Self: healthSelfStatus{
+				BackendState: "Running",
+				Online:       true,
+			},
+			Peers:       []healthPeerStatus{{HostName: "peer-1", Online: true}},
+			VIPServices: []healthVIPService{{Name: "svc-a"}},
+		}
 	}
 	defer tm.closeAll()
 
@@ -1134,6 +1123,34 @@ func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
 	handler.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if callCount.Load() != 4 {
 		t.Fatalf("expected /healthz after invalidateHealthCache to make 2 new calls (total 4), got %d", callCount.Load())
+	}
+
+	// Verify tailnet health warnings or non-Running backend state results in "degraded" (200 OK)
+	tm.healthDiscoverFunc = func(_ context.Context, name string, _ *tsnet.Server) tailnetHealthDetails {
+		if name == "alpha" {
+			return tailnetHealthDetails{
+				Self: healthSelfStatus{
+					BackendState:   "Running",
+					HealthWarnings: []string{"control plane unreachable"},
+				},
+			}
+		}
+		return tailnetHealthDetails{
+			Self: healthSelfStatus{BackendState: "Running"},
+		}
+	}
+	tm.invalidateHealthCache()
+	rec4 := httptest.NewRecorder()
+	handler.ServeHTTP(rec4, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec4.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK when tailnet has health warnings, got %d", rec4.Code)
+	}
+	var hrDegraded healthResponse
+	if err := json.Unmarshal(rec4.Body.Bytes(), &hrDegraded); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
+	}
+	if hrDegraded.Status != "degraded" || len(hrDegraded.Tailnets[0].Self.HealthWarnings) != 1 {
+		t.Errorf("expected status 'degraded' with health warning on alpha, got %+v", hrDegraded)
 	}
 }
 
