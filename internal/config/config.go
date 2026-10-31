@@ -115,7 +115,6 @@ type TailnetConfig struct {
 	AutoProxyVIPs *bool         `yaml:"auto_proxy_vips,omitempty"` // Automatically discover and proxy Tailscale VIP services (optional, defaults to true)
 	Tags          []string      `yaml:"tags,omitempty"`            // Tailscale ACL tags to advertise (e.g., ["tag:proxy"])
 	WireGuardPort uint16        `yaml:"wireguard_port,omitempty"`  // Optional UDP port for direct peer-to-peer WireGuard traffic
-	WebClient     bool          `yaml:"web_client,omitempty"`      // Optional Tailscale web management client on port 5252
 	Ports         []PortMapping `yaml:"ports"`                     // Ports to forward for this tailnet
 }
 
@@ -153,7 +152,6 @@ func (t TailnetConfig) ConnectionSettingsEqual(other TailnetConfig) bool {
 		t.ControlURL == other.ControlURL &&
 		t.IsEphemeral() == other.IsEphemeral() &&
 		t.WireGuardPort == other.WireGuardPort &&
-		t.WebClient == other.WebClient &&
 		slices.Equal(t.Tags, other.Tags)
 }
 

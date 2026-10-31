@@ -8,6 +8,10 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+### Removed
+- **Tailscale Node Management Web Client (`web_client`)**:
+  - Removed the unused `tailnets[].web_client` (`tsnet.Server.RunWebClient` on port `5252`) configuration option.
+
 ## [0.4.0] - 2026-10-31
 
 ### Added

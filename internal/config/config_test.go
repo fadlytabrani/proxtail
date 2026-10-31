@@ -369,7 +369,6 @@ tailnets:
   - name: 'prod'
     tags: ['proxy', 'tag:ingress']
     wireguard_port: 41641
-    web_client: true
     ports:
       - port: 8080
         destination: 'web-server'
@@ -390,8 +389,8 @@ proxy:
 	if len(tn.Tags) != 2 || tn.Tags[0] != "tag:proxy" || tn.Tags[1] != "tag:ingress" {
 		t.Errorf("expected normalized ACL tags [tag:proxy tag:ingress], got %v", tn.Tags)
 	}
-	if tn.WireGuardPort != 41641 || !tn.WebClient {
-		t.Errorf("expected WireGuardPort=41641 and WebClient=true, got %d, %v", tn.WireGuardPort, tn.WebClient)
+	if tn.WireGuardPort != 41641 {
+		t.Errorf("expected WireGuardPort=41641, got %d", tn.WireGuardPort)
 	}
 
 	authKey, clientSecret, err := tn.ResolveCredentials(false)
@@ -1093,6 +1092,15 @@ tailnets:
 `)
 	if _, err := Parse(unknownFieldYAML); err == nil {
 		t.Fatalf("expected Parse to fail on unknown YAML field 'listen_adress'")
+	}
+
+	// Removed web_client field must also fail under KnownFields(true)
+	if _, err := Parse([]byte(`
+tailnets:
+  - name: 'prod'
+    web_client: true
+`)); err == nil {
+		t.Fatalf("expected Parse to fail on removed YAML field 'web_client'")
 	}
 
 	// UDP probe mode validation & env override

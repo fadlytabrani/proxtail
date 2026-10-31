@@ -419,9 +419,9 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `tags` | `list` | Auto-discovered from OAuth | Tailscale ACL tags to advertise (e.g., `["tag:proxy"]`). Discovered automatically for OAuth secrets. |
 | `ephemeral` | `bool` | `true` | If `true`, state is in-memory and the node deregisters on exit. If `false`, persists to disk. |
 | `auto_proxy_vips` | `bool` | `true` | Automatically discover and proxy Tailscale VIP services in this tailnet onto `proxy.vip_port_range`. |
+| `listen_address` | `string` | `proxy.listen_address` | Default local bind IP for all manual ports and auto-proxied VIPs in this tailnet (e.g., `"127.0.0.2"`). |
 | `control_url` | `string` | Tailscale Control Plane | Custom coordination URL (e.g., for Headscale). |
 | `wireguard_port` | `int` | `0` *(auto)* | Optional static UDP port for direct peer-to-peer WireGuard traffic. |
-| `web_client` | `bool` | `false` | Serve Tailscale's built-in node management web UI on port `5252` inside the tailnet. |
 
 ### `tailnets[].ports[]` Settings
 
@@ -430,7 +430,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `port` *(or `source_port`)* | `int` | *(required)* | Local port `proxtail` listens on (`1`–`65535`, must be outside `proxy.vip_port_range`). |
 | `destination` | `string` | *(required)* | Destination `host:port` or `host` inside the tailnet (supports MagicDNS hostnames, VIP services, FQDNs, or Tailscale IPs). If `:port` is omitted, reuses `port`. Supports `${ENV_VAR}`. |
 | `protocol` | `string` | `"tcp"` | Layer 4 protocol: `"tcp"` or `"udp"`. |
-| `listen_address` | `string` | `proxy.listen_address` *(all)* | Local IP to bind on (e.g., `"127.0.0.1"` for loopback only). |
+| `listen_address` | `string` | `tailnet.listen_address` *(or `proxy.listen_address`)* | Local IP to bind on (e.g., `"127.0.0.1"` for loopback only). |
 | `timeout` | `int` | `30` | Idle connection / session timeout in seconds (`1`–`3600`). |
 | `probe` | `bool` | *(inherits global)* | Optional per-port override to enable (`true`) or disable (`false`) active reachability probing. |
 
@@ -439,6 +439,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `listen_address` | `string` | `""` *(all interfaces)* | Default local bind IP for all ports and health probes (e.g., `"127.0.0.1"`). |
+| `health_listen_address` | `string` | `proxy.listen_address` | Optional dedicated local bind IP for the HTTP health & metrics server (`/healthz`, `/readyz`, `/metrics`). |
 | `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz`, `/readyz`, and `/metrics` (must be outside `vip_port_range`). |
 | `vip_port_range` | `string` | `"30000-30999"` | Reserved local `"start-end"` port range allocated exclusively to auto-proxied VIP services. |
 | `vip_refresh_interval` | `int` | `30` | Fallback VIP service discovery refresh interval in seconds (`1`–`3600`), alongside real-time IPN bus events. |
@@ -451,6 +452,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `probe.timeout` | `int` | `2` | Probe dial and read deadline in seconds (`1`–`60`). |
 | `probe.consecutive_failures` | `int` | `2` | Consecutive failures before suspending the local listener (`1`–`10`). |
 | `probe.cooldown` | `int` | `10` | Traffic-aware activity cooldown in seconds; skips background probes when real client traffic is active. |
+| `probe.udp_probe_mode` | `string` | `"payload"` | UDP probing strategy: `"payload"` (0-byte UDP packet + ICMP Port Unreachable detection) or `"netmap"` (peer online + route check only). |
 
 ### Environment Variables & CLI Flags
 

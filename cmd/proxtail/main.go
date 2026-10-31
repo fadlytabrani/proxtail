@@ -207,7 +207,6 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 		Ephemeral:     ephemeral,
 		AdvertiseTags: tags,
 		Port:          tailnetCfg.WireGuardPort,
-		RunWebClient:  tailnetCfg.WebClient,
 	}
 
 	// Use in-memory store for ephemeral nodes so node state is never persisted across restarts.
