@@ -8,16 +8,40 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-31
+
 ### Changed
+- **Renamed Local Tailnet Identifier from `name` to `profile`**:
+  - Renamed `tailnets[].name` (`TailnetConfig.Name`) to `tailnets[].profile` (`TailnetConfig.Profile`) in `config.yaml` (still optional and defaulting to `"default"` when a single tailnet is configured) so the local configuration/state-directory key is never confused with Tailscale-derived names (`tailnet_name`, `magic_dns_suffix`, `hostname`, `dns_name`).
+  - Renamed `tailnets[].name` to `tailnets[].profile` and `ports[].tailnet` to `ports[].profile` in `GET /healthz`.
+  - Renamed the `tailnet` label on `proxtail_port_up` in `GET /metrics` to `profile` (`proxtail_port_up{profile="...", ...}`).
+- **Simplified Bind Address Hierarchy & Renamed API Server Settings (`api_port` / `api_listen_address`)**:
+  - Removed global `proxy.listen_address` and `PROXTAIL_LISTEN_ADDRESS`.
+  - Renamed `proxy.health_port` (`PROXTAIL_HEALTH_PORT`) to `proxy.api_port` (`PROXTAIL_API_PORT`) and `proxy.health_listen_address` (`PROXTAIL_HEALTH_LISTEN_ADDRESS`) to `proxy.api_listen_address` (`PROXTAIL_API_LISTEN_ADDRESS`, defaulting independently to `"0.0.0.0"`).
+  - Updated `tailnets[].listen_address` to default independently to `"0.0.0.0"`, while `tailnets[].ports[].listen_address` and auto-proxied VIP ports inherit from their parent `tailnets[].listen_address`.
+  - Added `proxy.state_dir` (overridable via `PROXTAIL_STATE_DIR` or `TS_STATE_DIR`), automatically scoping each tailnet profile's state directory under `<state_dir>/<profile>`.
+  - Standardized `PROXTAIL_*` environment variable precedence (`PROXTAIL_API_LISTEN_ADDRESS`, `PROXTAIL_API_PORT`, `PROXTAIL_STATE_DIR`, `PROXTAIL_VIP_PORT_RANGE`, `PROXTAIL_PROBE_ENABLED`, `PROXTAIL_PROBE_UDP_MODE`, and `TS_AUTHKEY_<PROFILE>` / `TS_CLIENT_SECRET_<PROFILE>`) so environment variables always override `config.yaml`.
+- **Standardized Port Field Name (`port` Only)**:
+  - Removed the legacy `tailnets[].ports[].source_port` YAML alias in favor of `tailnets[].ports[].port`.
+  - Renamed `ports[].source_port` to `ports[].port` in `GET /healthz` and renamed the `source_port` label on `proxtail_port_up` in `GET /metrics` to `port` (`proxtail_port_up{..., port="...", ...}`).
+- **Configuration Validation Hardening**:
+  - Preserved negative values for `proxy.buffer_size`, `proxy.worker_pool_size`, and `tailnets[].ports[].timeout` through `ApplyDefaults` so `Validate` rejects them instead of silently substituting defaults.
+  - Added auto-bracketing for bare IPv6 literals in `tailnets[].ports[].destination` when the destination port is omitted (e.g. `fd7a:115c:a1e0::1` → `[fd7a:115c:a1e0::1]:<port>`), and rejected URL schemes (`http://`, `https://`), path slashes (`/`), and whitespace in `destination`.
+  - Added validation for `tailnets[].wireguard_port` collisions across tailnets, against manual UDP `ports[].port` bindings, and against active `vip_port_range` reservations.
+  - Added validation for `tailnets[].control_url` (`http://` or `https://` with non-empty host), safe `[a-zA-Z0-9._-]` characters on `tailnets[].profile` and `tailnets[].hostname` (preventing path traversal), and explicit error messages for missing `port` (`0`) and invalid `PROXTAIL_API_PORT` values.
 - **Unified & Enriched `GET /healthz` Endpoint**:
   - Consolidated readiness and liveness reporting into `GET /healthz`: top-level `status` dynamically reflects `"ok"` (`200 OK`), `"degraded"` (`200 OK` when partial listeners are suspended or a tailnet reports health warnings / non-`Running` state), or `"down"` (`503 Service Unavailable` during startup/shutdown or when all configured listeners are down), alongside `active_listeners`.
   - Separated ProxTail's own node metadata on each tailnet into `tailnets[].self` (`id`, `hostname`, `dns_name`, `ipv4`, `ipv6`, `backend_state`, `online`, `relay`, `tags`, `key_expiry`, `cert_domains`, `health_warnings`).
   - Enriched `tailnets[]` (`tailnet_name`, `magic_dns_suffix`, `magic_dns_enabled`) and `tailnets[].peers[]` (`id`, `active`, `cur_addr`, `relay`, `rx_bytes`, `tx_bytes`, `last_handshake`, `last_seen`, `tags`, `primary_routes`, `expired`) at zero extra RPC cost from the cached 2-second `lc.Status(ctx)` snapshot.
-  - Updated `proxtail -healthcheck` to probe `GET /healthz` when `proxy.health_port` is configured.
+  - Updated `proxtail -healthcheck` to probe `GET /healthz` when `proxy.api_port` is configured.
 
 ### Removed
 - **Redundant `/readyz` Endpoint**:
   - Removed `GET /readyz` in favor of the unified `GET /healthz` endpoint (which now returns `200 OK` for `"ok"` / `"degraded"` and `503 Service Unavailable` for `"down"`).
+- **Removed Periodic `METRICS:` Stdout Logger & Legacy Config Options**:
+  - Removed `proxy.enable_metrics` and `proxy.metrics_interval` in favor of `GET /metrics` and `GET /healthz`.
+  - Removed `proxy.vip_refresh_interval` and `PROXTAIL_VIP_REFRESH_INTERVAL` (the 30-second periodic safety check alongside real-time IPN bus events remains internal).
+  - Removed the legacy `TSNET_PROXY_CONFIG` environment variable fallback in favor of `PROXTAIL_CONFIG`.
 
 ## [0.4.1] - 2026-10-31
 

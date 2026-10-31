@@ -35,7 +35,7 @@ func TestTailnetManagerSyncTailnets(t *testing.T) {
 	tm := newTailnetManager()
 	tm.initFunc = func(cfg config.TailnetConfig) (*tsnet.Server, error) {
 		mu.Lock()
-		initialized = append(initialized, cfg.Name+":"+cfg.Hostname)
+		initialized = append(initialized, cfg.Profile+":"+cfg.Hostname)
 		mu.Unlock()
 		return &tsnet.Server{Hostname: cfg.Hostname}, nil
 	}
@@ -50,8 +50,8 @@ func TestTailnetManagerSyncTailnets(t *testing.T) {
 
 	// 1. Initial sync with two tailnets
 	initialCfg := []config.TailnetConfig{
-		{Name: "prod", Hostname: "proxy-prod-v1", AuthKey: "TS_AUTHKEY_PROD", Ephemeral: &tVal},
-		{Name: "staging", Hostname: "proxy-staging", AuthKey: "TS_AUTHKEY_STAGING", Ephemeral: &tVal},
+		{Profile: "prod", Hostname: "proxy-prod-v1", AuthKey: "TS_AUTHKEY_PROD", Ephemeral: &tVal},
+		{Profile: "staging", Hostname: "proxy-staging", AuthKey: "TS_AUTHKEY_STAGING", Ephemeral: &tVal},
 	}
 
 	servers, restarted, cleanup, err := tm.syncTailnets(initialCfg)
@@ -69,8 +69,8 @@ func TestTailnetManagerSyncTailnets(t *testing.T) {
 
 	// 2. Modify prod hostname, remove staging, add dev
 	updatedCfg := []config.TailnetConfig{
-		{Name: "prod", Hostname: "proxy-prod-v2", AuthKey: "TS_AUTHKEY_PROD", Ephemeral: &fVal},
-		{Name: "dev", Hostname: "proxy-dev", AuthKey: "TS_AUTHKEY_DEV", Ephemeral: &tVal},
+		{Profile: "prod", Hostname: "proxy-prod-v2", AuthKey: "TS_AUTHKEY_PROD", Ephemeral: &fVal},
+		{Profile: "dev", Hostname: "proxy-dev", AuthKey: "TS_AUTHKEY_DEV", Ephemeral: &tVal},
 	}
 
 	servers2, restarted2, cleanup2, err := tm.syncTailnets(updatedCfg)
@@ -130,17 +130,17 @@ func TestMultiTailnetReloadConfigEndToEnd(t *testing.T) {
 
 	initialYAML := fmt.Sprintf(`
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     hostname: 'prod-v1'
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.1:8080'
-  - name: 'staging'
+  - profile: 'staging'
     hostname: 'staging-v1'
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.1:8080'
 `, port1, port2)
 
@@ -185,17 +185,17 @@ tailnets:
 	// Reload 1: Add 'development' tailnet on port3, modify 'production' hostname to 'prod-v2', remove 'staging'
 	updatedYAML := fmt.Sprintf(`
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     hostname: 'prod-v2'
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.1:8080'
-  - name: 'development'
+  - profile: 'development'
     hostname: 'dev-v1'
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.1:9000'
 `, port1, port3)
 
@@ -214,15 +214,15 @@ tailnets:
 	// Reload 2: Attempt invalid reload with conflicting port across two tailnets; verify it fails cleanly
 	invalidYAML := fmt.Sprintf(`
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.1:8080'
-  - name: 'development'
+  - profile: 'development'
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.2:8080'
 `, port1, port1)
 
@@ -268,14 +268,8 @@ func TestConfigWatcherDebouncedReloadSignal(t *testing.T) {
 
 func TestResolveConfigPath(t *testing.T) {
 	t.Setenv("PROXTAIL_CONFIG", "")
-	t.Setenv("TSNET_PROXY_CONFIG", "")
 	if got := resolveConfigPath(""); got != "/etc/proxtail/config.yaml" {
 		t.Errorf("expected default path, got %q", got)
-	}
-
-	t.Setenv("TSNET_PROXY_CONFIG", "/legacy/config.yaml")
-	if got := resolveConfigPath(""); got != "/legacy/config.yaml" {
-		t.Errorf("expected legacy path, got %q", got)
 	}
 
 	t.Setenv("PROXTAIL_CONFIG", "/custom/config.yaml")
@@ -296,8 +290,8 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	tm.cleanupFunc = func(*tsnet.Server, string) {}
 
 	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{
-		{Name: "production", Hostname: "proxy-prod"},
-		{Name: "staging", Hostname: "proxy-staging"},
+		{Profile: "production", Hostname: "proxy-prod"},
+		{Profile: "staging", Hostname: "proxy-staging"},
 	})
 	if err != nil {
 		t.Fatalf("syncTailnets failed: %v", err)
@@ -318,7 +312,7 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
 		t.Fatalf("failed to decode /healthz JSON: %v", err)
 	}
-	if hr.Status != "ok" || len(hr.Tailnets) != 2 || hr.Tailnets[0].Name != "production" || hr.Tailnets[0].Self.HostName != "proxy-prod" || hr.Tailnets[1].Name != "staging" || hr.Tailnets[1].Self.HostName != "proxy-staging" {
+	if hr.Status != "ok" || len(hr.Tailnets) != 2 || hr.Tailnets[0].Profile != "production" || hr.Tailnets[0].Self.HostName != "proxy-prod" || hr.Tailnets[1].Profile != "staging" || hr.Tailnets[1].Self.HostName != "proxy-staging" {
 		t.Errorf("unexpected /healthz response: %+v", hr)
 	}
 
@@ -386,10 +380,10 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		t.Fatalf("startHealthServer failed: %v", err)
 	}
 	cfgWithHealth := &config.Config{
-		Proxy: config.ProxySettings{ListenAddress: "127.0.0.1", HealthPort: healthPort},
+		Proxy: config.ProxySettings{APIListenAddress: "127.0.0.1", APIPort: healthPort},
 	}
 	if err := runHealthCheck(cfgWithHealth); err != nil {
-		t.Errorf("runHealthCheck with HealthPort failed: %v", err)
+		t.Errorf("runHealthCheck with APIPort failed: %v", err)
 	}
 
 	// After Stop: down (503)
@@ -409,7 +403,7 @@ func TestZeroPortsDiscoveryModeLifecycle(t *testing.T) {
 	tm.cleanupFunc = func(*tsnet.Server, string) {}
 
 	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{
-		{Name: "discovery-tailnet", Hostname: "discovery-node"},
+		{Profile: "discovery-tailnet", Hostname: "discovery-node"},
 	})
 	if err != nil {
 		t.Fatalf("syncTailnets failed: %v", err)
@@ -436,28 +430,28 @@ func TestZeroPortsDiscoveryModeLifecycle(t *testing.T) {
 	if err := json.Unmarshal(recHealth.Body.Bytes(), &hr); err != nil {
 		t.Fatalf("failed decoding /healthz: %v", err)
 	}
-	if hr.Status != "ok" || hr.ActiveListeners != 0 || len(hr.Tailnets) != 1 || hr.Tailnets[0].Name != "discovery-tailnet" || hr.Tailnets[0].Self.HostName != "discovery-node" {
+	if hr.Status != "ok" || hr.ActiveListeners != 0 || len(hr.Tailnets) != 1 || hr.Tailnets[0].Profile != "discovery-tailnet" || hr.Tailnets[0].Self.HostName != "discovery-node" {
 		t.Errorf("unexpected healthResponse in discovery mode: %+v", hr)
 	}
 
-	// 2. runHealthCheck with HealthPort succeeds
+	// 2. runHealthCheck with APIPort succeeds
 	healthPort := getFreePort(t)
 	if err := startHealthServer(ctx, "127.0.0.1", healthPort, zeroProxy, tm); err != nil {
 		t.Fatalf("startHealthServer failed: %v", err)
 	}
 	cfgWithHealth := &config.Config{
-		Proxy: config.ProxySettings{ListenAddress: "127.0.0.1", HealthPort: healthPort},
+		Proxy: config.ProxySettings{APIListenAddress: "127.0.0.1", APIPort: healthPort},
 	}
 	if err := runHealthCheck(cfgWithHealth); err != nil {
 		t.Errorf("runHealthCheck failed: %v", err)
 	}
 
-	// 3. runHealthCheck without HealthPort and with 0 TCP listeners fails with informative error
+	// 3. runHealthCheck without APIPort and with 0 TCP listeners fails with informative error
 	cfgWithoutHealth := &config.Config{
-		Tailnets: []config.TailnetConfig{{Name: "discovery-tailnet"}},
+		Tailnets: []config.TailnetConfig{{Profile: "discovery-tailnet"}},
 	}
 	if err := runHealthCheck(cfgWithoutHealth); err == nil {
-		t.Errorf("expected runHealthCheck without health_port and 0 TCP listeners to fail, but succeeded")
+		t.Errorf("expected runHealthCheck without api_port and 0 TCP listeners to fail, but succeeded")
 	}
 }
 
@@ -536,6 +530,26 @@ func TestResolveTailnetDirReadOnlyFallback(t *testing.T) {
 	if _, _, err := resolveTailnetDir("prod", false); err == nil {
 		t.Errorf("expected non-ephemeral resolveTailnetDir to fail when TS_STATE_DIR is unwritable")
 	}
+
+	// Configured proxy.state_dir passed to resolveTailnetDir creates <state_dir>/<profile> and detects tailscaled.state
+	t.Setenv("TS_STATE_DIR", "")
+	t.Setenv("PROXTAIL_STATE_DIR", "")
+	customBase := filepath.Join(t.TempDir(), "custom-state")
+	dirCfg, hasStateCfg, err := resolveTailnetDir("prod", false, customBase)
+	if err != nil {
+		t.Fatalf("expected resolveTailnetDir with configuredStateDir to succeed, got: %v", err)
+	}
+	wantDir := filepath.Join(customBase, "prod")
+	if dirCfg != wantDir || hasStateCfg {
+		t.Errorf("expected dir=%q hasState=false, got dir=%q hasState=%v", wantDir, dirCfg, hasStateCfg)
+	}
+	if err := os.WriteFile(filepath.Join(wantDir, "tailscaled.state"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, hasStateAfter, err := resolveTailnetDir("prod", false, customBase)
+	if err != nil || !hasStateAfter {
+		t.Errorf("expected hasState=true when tailscaled.state exists, got hasState=%v err=%v", hasStateAfter, err)
+	}
 }
 
 func TestNetnsDisabledByDefault(t *testing.T) {
@@ -607,7 +621,7 @@ func TestHealthzAndReadyzWhenListenersSuspended(t *testing.T) {
 		return &tsnet.Server{Hostname: cfg.Hostname}, nil
 	}
 	tm.cleanupFunc = func(*tsnet.Server, string) {}
-	if _, _, _, err := tm.syncTailnets([]config.TailnetConfig{{Name: "prod", Hostname: "proxy-prod"}}); err != nil {
+	if _, _, _, err := tm.syncTailnets([]config.TailnetConfig{{Profile: "prod", Hostname: "proxy-prod"}}); err != nil {
 		t.Fatalf("syncTailnets failed: %v", err)
 	}
 
@@ -706,7 +720,6 @@ func TestZeroTailnetsStandbyModeAndHotReloadLifecycle(t *testing.T) {
 	standbyYAML := `
 tailnets: []
 proxy:
-  listen_address: '127.0.0.1'
   probe:
     enabled: false
 `
@@ -786,15 +799,15 @@ proxy:
 	port1 := getFreePort(t)
 	activeYAML := fmt.Sprintf(`
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     hostname: 'prod-node'
+    listen_address: '127.0.0.1'
     auto_proxy_vips: false
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.1:8080'
 proxy:
-  listen_address: '127.0.0.1'
   probe:
     enabled: false
 `, port1)
@@ -861,15 +874,15 @@ func TestReloadConfigTransactionalRollbackPreservesRemovedTailnet(t *testing.T) 
 
 	initialYAML := fmt.Sprintf(`
 tailnets:
-  - name: 'alpha'
+  - profile: 'alpha'
     hostname: 'alpha-node'
+    listen_address: '127.0.0.1'
     auto_proxy_vips: false
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.1:8080'
 proxy:
-  listen_address: '127.0.0.1'
   probe:
     enabled: false
 `, port1)
@@ -923,15 +936,15 @@ proxy:
 	// Attempt to reload to a config that removes 'alpha', adds 'beta', and binds occupiedPort (which fails)
 	failingYAML := fmt.Sprintf(`
 tailnets:
-  - name: 'beta'
+  - profile: 'beta'
     hostname: 'beta-node'
+    listen_address: '127.0.0.1'
     auto_proxy_vips: false
     ports:
       - protocol: 'tcp'
-        source_port: %d
+        port: %d
         destination: '100.64.0.2:8080'
 proxy:
-  listen_address: '127.0.0.1'
   probe:
     enabled: false
 `, occupiedPort)
@@ -996,7 +1009,7 @@ func TestMetricsPerPortGaugesAndPortsConfigured(t *testing.T) {
 	tm.cleanupFunc = func(*tsnet.Server, string) {}
 	defer tm.closeAll()
 
-	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{{Name: "prod", Hostname: "prod-proxy"}})
+	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{{Profile: "prod", Hostname: "prod-proxy"}})
 	if err != nil {
 		t.Fatalf("syncTailnets failed: %v", err)
 	}
@@ -1032,7 +1045,7 @@ func TestMetricsPerPortGaugesAndPortsConfigured(t *testing.T) {
 	if !strings.Contains(body, "proxtail_ports_configured 1\n") {
 		t.Errorf("expected proxtail_ports_configured 1 in /metrics, got:\n%s", body)
 	}
-	wantLine := fmt.Sprintf(`proxtail_port_up{tailnet="prod",protocol="tcp",listen_address="127.0.0.1",source_port="%d",destination="100.64.0.1:8080",vip_service="api"} 1`, port)
+	wantLine := fmt.Sprintf(`proxtail_port_up{profile="prod",protocol="tcp",listen_address="127.0.0.1",port="%d",destination="100.64.0.1:8080",vip_service="api"} 1`, port)
 	if !strings.Contains(body, wantLine) {
 		t.Errorf("expected %q in /metrics, got:\n%s", wantLine, body)
 	}
@@ -1084,8 +1097,8 @@ func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
 	defer tm.closeAll()
 
 	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{
-		{Name: "alpha", Hostname: "alpha-host"},
-		{Name: "beta", Hostname: "beta-host"},
+		{Profile: "alpha", Hostname: "alpha-host"},
+		{Profile: "beta", Hostname: "beta-host"},
 	})
 	if err != nil {
 		t.Fatalf("syncTailnets failed: %v", err)
@@ -1161,18 +1174,16 @@ func TestWarnNonReloadableProxyChangesOnReload(t *testing.T) {
 	defer log.SetOutput(origOut)
 
 	oldProxy := config.ProxySettings{
-		WorkerPoolSize:      100,
-		BufferSize:          64,
-		ListenAddress:       "127.0.0.1",
-		HealthListenAddress: "127.0.0.1",
-		HealthPort:          9090,
+		WorkerPoolSize:   100,
+		BufferSize:       64,
+		APIListenAddress: "127.0.0.1",
+		APIPort:          9090,
 	}
 	newProxy := config.ProxySettings{
-		WorkerPoolSize:      200,
-		BufferSize:          128,
-		ListenAddress:       "127.0.0.1",
-		HealthListenAddress: "0.0.0.0",
-		HealthPort:          9091,
+		WorkerPoolSize:   200,
+		BufferSize:       128,
+		APIListenAddress: "0.0.0.0",
+		APIPort:          9091,
 	}
 
 	warnNonReloadableProxyChanges(oldProxy, newProxy)
@@ -1180,8 +1191,8 @@ func TestWarnNonReloadableProxyChangesOnReload(t *testing.T) {
 	for _, want := range []string{
 		"WARN: proxy.worker_pool_size changed (100 -> 200)",
 		"WARN: proxy.buffer_size changed (64 -> 128)",
-		"WARN: proxy.health_port changed (9090 -> 9091)",
-		"WARN: proxy.health_listen_address changed (\"127.0.0.1\" -> \"0.0.0.0\")",
+		"WARN: proxy.api_port changed (9090 -> 9091)",
+		"WARN: proxy.api_listen_address changed (\"127.0.0.1\" -> \"0.0.0.0\")",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected log output to contain %q, got:\n%s", want, out)
@@ -1189,12 +1200,12 @@ func TestWarnNonReloadableProxyChangesOnReload(t *testing.T) {
 	}
 }
 
-func TestRunHealthCheckDescriptiveErrorsAndHealthListenAddress(t *testing.T) {
-	t.Run("standby mode without health_port returns actionable error", func(t *testing.T) {
+func TestRunHealthCheckDescriptiveErrorsAndAPIListenAddress(t *testing.T) {
+	t.Run("standby mode without api_port returns actionable error", func(t *testing.T) {
 		cfg, err := config.Parse([]byte(`
 tailnets: []
 proxy:
-  health_port: 0
+  api_port: 0
 `))
 		if err != nil {
 			t.Fatal(err)
@@ -1205,13 +1216,13 @@ proxy:
 		}
 	})
 
-	t.Run("auto_proxy_vips-only without health_port returns actionable error", func(t *testing.T) {
+	t.Run("auto_proxy_vips-only without api_port returns actionable error", func(t *testing.T) {
 		cfg, err := config.Parse([]byte(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
     auto_proxy_vips: true
 proxy:
-  health_port: 0
+  api_port: 0
 `))
 		if err != nil {
 			t.Fatal(err)
@@ -1222,17 +1233,17 @@ proxy:
 		}
 	})
 
-	t.Run("UDP-only without health_port returns actionable error", func(t *testing.T) {
+	t.Run("UDP-only without api_port returns actionable error", func(t *testing.T) {
 		cfg, err := config.Parse([]byte(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
     auto_proxy_vips: false
     ports:
       - port: 15353
         destination: '100.64.0.1:53'
         protocol: 'udp'
 proxy:
-  health_port: 0
+  api_port: 0
 `))
 		if err != nil {
 			t.Fatal(err)
@@ -1243,14 +1254,13 @@ proxy:
 		}
 	})
 
-	t.Run("health_listen_address is used by startHealthServer and runHealthCheck", func(t *testing.T) {
+	t.Run("api_listen_address is used by startHealthServer and runHealthCheck", func(t *testing.T) {
 		healthPort := getFreePort(t)
 		cfg, err := config.Parse([]byte(fmt.Sprintf(`
 tailnets: []
 proxy:
-  listen_address: '0.0.0.0'
-  health_listen_address: '127.0.0.1'
-  health_port: %d
+  api_listen_address: '127.0.0.1'
+  api_port: %d
 `, healthPort)))
 		if err != nil {
 			t.Fatal(err)
@@ -1265,11 +1275,11 @@ proxy:
 		defer p.Stop()
 		<-p.Started()
 
-		if err := startHealthServer(ctx, cfg.Proxy.EffectiveHealthListenAddress(), cfg.Proxy.HealthPort, p, tm); err != nil {
+		if err := startHealthServer(ctx, cfg.Proxy.EffectiveAPIListenAddress(), cfg.Proxy.APIPort, p, tm); err != nil {
 			t.Fatalf("startHealthServer failed: %v", err)
 		}
 		if err := runHealthCheck(cfg); err != nil {
-			t.Fatalf("expected runHealthCheck to succeed against health_listen_address, got: %v", err)
+			t.Fatalf("expected runHealthCheck to succeed against api_listen_address, got: %v", err)
 		}
 	})
 }

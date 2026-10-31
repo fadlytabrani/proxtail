@@ -63,7 +63,7 @@ proxtail/
 ## Commit Message Conventions
 
 We follow [Conventional Commits](https://www.conventionalcommits.org/):
-- `feat:` — New user-facing feature (e.g., `feat: add readiness probe endpoint /readyz`)
+- `feat:` — New user-facing feature (e.g., `feat: enrich unified /healthz endpoint with self and peer metadata`)
 - `fix:` — Bug fix (e.g., `fix: prevent UDP session leak on listener stop`)
 - `perf:` — Performance optimization
 - `docs:` — Documentation or example updates

@@ -369,14 +369,13 @@ func resolveVIPPortRange(cfg *config.Config) (int, int, error) {
 	return config.ParsePortRange(spec)
 }
 
-func resolveVIPRefreshInterval(tm *tailnetManager, cfg *config.Config) time.Duration {
+const defaultVIPRefreshInterval = 30 * time.Second
+
+func resolveVIPRefreshInterval(tm *tailnetManager) time.Duration {
 	if tm.vipRefreshOverride > 0 {
 		return tm.vipRefreshOverride
 	}
-	if cfg != nil && cfg.Proxy.VIPRefreshInterval > 0 {
-		return time.Duration(cfg.Proxy.VIPRefreshInterval) * time.Second
-	}
-	return time.Duration(config.DefaultVIPRefreshInterval) * time.Second
+	return defaultVIPRefreshInterval
 }
 
 // computeVIPMappingsLocked queries VIP services across enabled tailnets and computes sticky local port mappings.
@@ -409,7 +408,7 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 			continue
 		}
 		idx := i
-		tName := tailnetCfg.Name
+		tName := tailnetCfg.Profile
 		srv := servers[tName]
 		wg.Add(1)
 		go func() {
@@ -432,23 +431,23 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 		if dErr != nil {
 			if errors.Is(dErr, errNoNetmap) {
 				if isInitial {
-					log.Printf("Tailnet '%s' awaiting initial netmap for VIP service discovery", tailnetCfg.Name)
-				} else if prev, ok := tm.lastTailnetVIPs[tailnetCfg.Name]; ok {
+					log.Printf("Tailnet '%s' awaiting initial netmap for VIP service discovery", tailnetCfg.Profile)
+				} else if prev, ok := tm.lastTailnetVIPs[tailnetCfg.Profile]; ok {
 					svcs = prev
 				}
 			} else {
-				return nil, nil, nil, nil, fmt.Errorf("discovering VIP services for tailnet '%s': %w", tailnetCfg.Name, dErr)
+				return nil, nil, nil, nil, fmt.Errorf("discovering VIP services for tailnet '%s': %w", tailnetCfg.Profile, dErr)
 			}
 		}
 		if len(svcs) > 0 {
-			discoveredSnap[tailnetCfg.Name] = maps.Clone(svcs)
+			discoveredSnap[tailnetCfg.Profile] = maps.Clone(svcs)
 		}
 
-		targets, expErr := expandVIPServicesForTailnet(tailnetCfg.Name, svcs, rangeCapacity)
+		targets, expErr := expandVIPServicesForTailnet(tailnetCfg.Profile, svcs, rangeCapacity)
 		if expErr != nil {
 			return nil, nil, nil, nil, expErr
 		}
-		tailnetListenAddr := tailnetCfg.EffectiveListenAddress(cfg.Proxy.ListenAddress)
+		tailnetListenAddr := tailnetCfg.EffectiveListenAddress()
 		for j := range targets {
 			targets[j].ListenAddress = tailnetListenAddr
 		}
@@ -462,7 +461,7 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 		tm.vipAllocations,
 		vipStart,
 		vipEnd,
-		cfg.Proxy.ListenAddress,
+		config.DefaultListenAddress,
 	)
 	if allocErr != nil {
 		return nil, nil, nil, nil, allocErr
@@ -613,7 +612,7 @@ func (tm *tailnetManager) startVIPReconciler(ctx context.Context, proxyServer *p
 	if tm.vipWatchers == nil {
 		tm.vipWatchers = make(map[string]vipWatcherEntry)
 	}
-	interval := resolveVIPRefreshInterval(tm, cfg)
+	interval := resolveVIPRefreshInterval(tm)
 	tm.vipInterval = interval
 	triggerCh := tm.vipTriggerCh
 	tickerCh := tm.vipTickerCh
@@ -703,8 +702,8 @@ func (tm *tailnetManager) syncVIPWatchers(cfg *config.Config, servers map[string
 		if !tailnetCfg.IsAutoProxyVIPs() {
 			continue
 		}
-		if srv := servers[tailnetCfg.Name]; srv != nil && srv.Sys() != nil {
-			desired[tailnetCfg.Name] = srv
+		if srv := servers[tailnetCfg.Profile]; srv != nil && srv.Sys() != nil {
+			desired[tailnetCfg.Profile] = srv
 		}
 	}
 
@@ -728,7 +727,7 @@ func (tm *tailnetManager) syncVIPWatchers(cfg *config.Config, servers map[string
 		go tm.watchTailnetIPNBus(wCtx, name, srv)
 	}
 
-	newInterval := resolveVIPRefreshInterval(tm, cfg)
+	newInterval := resolveVIPRefreshInterval(tm)
 	if newInterval != tm.vipInterval && newInterval > 0 {
 		tm.vipInterval = newInterval
 		select {

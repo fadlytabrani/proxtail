@@ -83,12 +83,12 @@ func (info *listenerInfo) isTrafficActive(cooldown time.Duration) bool {
 
 // PortStatus describes the runtime status of a single configured port mapping.
 type PortStatus struct {
-	Source        int    `json:"source_port"`
+	Source        int    `json:"port"`
 	ListenAddress string `json:"listen_address,omitempty"`
 	ListenAddr    string `json:"listen_addr"`
 	Destination   string `json:"destination"`
 	Protocol      string `json:"protocol"`
-	Tailnet       string `json:"tailnet"`
+	Tailnet       string `json:"profile"`
 	VIPService    string `json:"vip_service,omitempty"`
 	Up            bool   `json:"up"`
 	LastError     string `json:"last_error,omitempty"`

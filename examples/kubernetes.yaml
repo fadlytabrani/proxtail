@@ -8,7 +8,7 @@ metadata:
 data:
   config.yaml: |
     tailnets:
-      - name: 'production'
+      - profile: 'production'
         hostname: 'proxtail-prod-${HOSTNAME}'
         tags:
           - 'tag:k8s-proxy'
@@ -18,7 +18,7 @@ data:
           - port: 8443
             destination: 'api-server:443'
 
-      - name: 'staging'
+      - profile: 'staging'
         hostname: 'proxtail-staging-${HOSTNAME}'
         tags:
           - 'tag:k8s-proxy'
@@ -27,8 +27,7 @@ data:
             destination: 'staging-web:8080'
 
     proxy:
-      health_port: 9090
-      metrics_interval: 60
+      api_port: 9090
 ---
 apiVersion: v1
 kind: Secret
@@ -81,7 +80,7 @@ spec:
           env:
             - name: PROXTAIL_CONFIG
               value: /etc/proxtail/config.yaml
-            - name: PROXTAIL_HEALTH_PORT
+            - name: PROXTAIL_API_PORT
               value: "9090"
             - name: TS_STATE_DIR
               value: /var/lib/tsnet

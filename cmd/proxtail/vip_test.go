@@ -225,12 +225,12 @@ func TestVIPAutoProxyEndToEndTCPAndUDPWithHealthz(t *testing.T) {
 
 	yamlCfg := fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
     ports:
       - port: %d
         destination: '100.64.0.5:8080'
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, manualPort, vipStart, vipEnd)
 
@@ -339,9 +339,9 @@ func TestVIPStickyDynamicReconciliationAndBackgroundLoop(t *testing.T) {
 
 	cfg, err := config.Parse([]byte(fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, vipStart, vipEnd)))
 	if err != nil {
@@ -484,11 +484,12 @@ func TestVIPHotReloadToggleAutoProxyAndRangeChange(t *testing.T) {
 	// Initial config: prod auto_proxy_vips defaults to true; staging explicitly false
 	yaml1 := fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
-  - name: 'staging'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
+  - profile: 'staging'
+    listen_address: '127.0.0.1'
     auto_proxy_vips: false
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, range1Start, range1End)
 	if err := os.WriteFile(cfgPath, []byte(yaml1), 0o600); err != nil {
@@ -558,11 +559,12 @@ proxy:
 	// Reload 1: Enable auto_proxy_vips on staging too -> prod stays on range1Start, staging gets range1Start+1
 	yaml2 := fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
-  - name: 'staging'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
+  - profile: 'staging'
+    listen_address: '127.0.0.1'
     auto_proxy_vips: true
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, range1Start, range1End)
 	if err := os.WriteFile(cfgPath, []byte(yaml2), 0o600); err != nil {
@@ -577,12 +579,13 @@ proxy:
 	// Reload 2: Disable prod auto_proxy_vips and migrate vip_port_range to range2Start-range2End
 	yaml3 := fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
     auto_proxy_vips: false
-  - name: 'staging'
+  - profile: 'staging'
+    listen_address: '127.0.0.1'
     auto_proxy_vips: true
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, range2Start, range2End)
 	if err := os.WriteFile(cfgPath, []byte(yaml3), 0o600); err != nil {
@@ -611,9 +614,9 @@ func TestVIPFailureAndAtomicRollback(t *testing.T) {
 		vipStart, vipEnd := getFreePortBlock(t, 3)
 		cfg, err := config.Parse([]byte(fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, vipStart, vipEnd)))
 		if err != nil {
@@ -644,9 +647,9 @@ proxy:
 		vipStart, _ := getFreePortBlock(t, 1)
 		cfg, err := config.Parse([]byte(fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, vipStart, vipStart)))
 		if err != nil {
@@ -689,9 +692,9 @@ proxy:
 
 		cfg, err := config.Parse([]byte(fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, vipStart, vipEnd)))
 		if err != nil {
@@ -740,12 +743,12 @@ proxy:
 
 		cfg, err := config.Parse([]byte(fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
     ports:
       - port: %d
         destination: '100.64.0.1:8080'
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, manualPort, vipStart, vipEnd)))
 		if err != nil {
@@ -835,9 +838,9 @@ func TestVIPInitialNoNetmapGracefulThenDiscovers(t *testing.T) {
 	vipStart, vipEnd := getFreePortBlock(t, 2)
 	cfg, err := config.Parse([]byte(fmt.Sprintf(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
 proxy:
-  listen_address: '127.0.0.1'
   vip_port_range: '%d-%d'
 `, vipStart, vipEnd)))
 	if err != nil {
@@ -911,9 +914,9 @@ func TestMultiTailnetPerAddressVIPPortAllocationAndParallelDiscovery(t *testing.
 	t.Run("disjoint listen_address tailnets reuse same VIP port range and discover in parallel", func(t *testing.T) {
 		cfg, err := config.Parse([]byte(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
     listen_address: '127.0.0.1'
-  - name: 'staging'
+  - profile: 'staging'
     listen_address: '127.0.0.2'
 proxy:
   vip_port_range: '31000-31005'
@@ -990,9 +993,9 @@ proxy:
 	t.Run("overlapping wildcard and loopback listen_address tailnets allocate distinct VIP ports", func(t *testing.T) {
 		cfg, err := config.Parse([]byte(`
 tailnets:
-  - name: 'prod'
+  - profile: 'prod'
     listen_address: '0.0.0.0'
-  - name: 'staging'
+  - profile: 'staging'
     listen_address: '127.0.0.1'
 proxy:
   vip_port_range: '31010-31015'

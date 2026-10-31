@@ -93,8 +93,17 @@ func newTailnetManager() *tailnetManager {
 // Even in ephemeral mode (which uses mem.Store for state), tsnet writes log configuration
 // and buffer files to Server.Dir (falling back to os.UserConfigDir() if Dir is empty, which
 // fails in Kubernetes when running with readOnlyRootFilesystem: true or without a HOME dir).
-func resolveTailnetDir(tailnetName string, ephemeral bool) (string, bool, error) {
-	stateDir := strings.TrimSpace(os.Getenv("TS_STATE_DIR"))
+func resolveTailnetDir(tailnetName string, ephemeral bool, configuredStateDir ...string) (string, bool, error) {
+	var stateDir string
+	if len(configuredStateDir) > 0 {
+		stateDir = strings.TrimSpace(configuredStateDir[0])
+	}
+	if stateDir == "" {
+		stateDir = strings.TrimSpace(os.Getenv("PROXTAIL_STATE_DIR"))
+	}
+	if stateDir == "" {
+		stateDir = strings.TrimSpace(os.Getenv("TS_STATE_DIR"))
+	}
 	if stateDir != "" {
 		candidate := filepath.Join(stateDir, tailnetName)
 		if !ephemeral {
@@ -180,12 +189,12 @@ func resolveOAuthTags(clientSecret, controlURL string) []string {
 // initializeServer creates and starts a tsnet.Server for a specific tailnet configuration.
 func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 	ephemeral := tailnetCfg.IsEphemeral()
-	tailnetDir, hasPersistedState, err := resolveTailnetDir(tailnetCfg.Name, ephemeral)
+	tailnetDir, hasPersistedState, err := resolveTailnetDir(tailnetCfg.Profile, ephemeral, tailnetCfg.StateDir)
 	if err != nil {
 		return nil, err
 	}
 
-	authKey, clientSecret, err := tailnetCfg.ResolveCredentials(tailnetCfg.Name == "default")
+	authKey, clientSecret, err := tailnetCfg.ResolveCredentials(tailnetCfg.Profile == "default")
 	if err != nil && !hasPersistedState {
 		return nil, err
 	}
@@ -193,7 +202,7 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 	tags := tailnetCfg.Tags
 	if len(tags) == 0 && clientSecret != "" {
 		if discovered := resolveOAuthTags(clientSecret, tailnetCfg.ControlURL); len(discovered) > 0 {
-			log.Printf("Auto-discovered OAuth ACL tags for tailnet '%s': %v", tailnetCfg.Name, discovered)
+			log.Printf("Auto-discovered OAuth ACL tags for tailnet '%s': %v", tailnetCfg.Profile, discovered)
 			tags = discovered
 		}
 	}
@@ -219,7 +228,7 @@ func initializeServer(tailnetCfg config.TailnetConfig) (*tsnet.Server, error) {
 	}
 
 	log.Printf("Tailnet '%s' server started successfully (hostname: %s, ephemeral: %v)",
-		tailnetCfg.Name, tailnetCfg.Hostname, ephemeral)
+		tailnetCfg.Profile, tailnetCfg.Hostname, ephemeral)
 	return server, nil
 }
 
@@ -261,7 +270,7 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 
 	newConfigs := make(map[string]config.TailnetConfig, len(tailnets))
 	for _, t := range tailnets {
-		newConfigs[t.Name] = t
+		newConfigs[t.Profile] = t
 	}
 
 	addedServers := make(map[string]*tsnet.Server)
@@ -276,19 +285,19 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 	var tasks []initTask
 
 	for _, t := range tailnets {
-		existingSrv, exists := tm.servers[t.Name]
+		existingSrv, exists := tm.servers[t.Profile]
 		if !exists {
 			tasks = append(tasks, initTask{cfg: t, restart: false})
 			continue
 		}
 
-		oldCfg := tm.configs[t.Name]
+		oldCfg := tm.configs[t.Profile]
 		if !oldCfg.ConnectionSettingsEqual(t) {
-			log.Printf("Tailnet '%s' connection settings changed, reinitializing...", t.Name)
+			log.Printf("Tailnet '%s' connection settings changed, reinitializing...", t.Profile)
 			// Close and log out existing server first to release state dir lock and avoid duplicate hostname suffix.
-			tm.cleanupFunc(existingSrv, t.Name)
-			delete(tm.servers, t.Name)
-			delete(tm.configs, t.Name)
+			tm.cleanupFunc(existingSrv, t.Profile)
+			delete(tm.servers, t.Profile)
+			delete(tm.configs, t.Profile)
 			tasks = append(tasks, initTask{cfg: t, restart: true})
 		}
 	}
@@ -307,7 +316,7 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 			wg.Go(func() {
 				srv, err := tm.initFunc(tk.cfg)
 				results[idx] = initResult{
-					name:    tk.cfg.Name,
+					name:    tk.cfg.Profile,
 					srv:     srv,
 					restart: tk.restart,
 					err:     err,
@@ -517,11 +526,11 @@ func warnNonReloadableProxyChanges(oldProxy, newProxy config.ProxySettings) {
 	if oldProxy.BufferSize != newProxy.BufferSize {
 		log.Printf("WARN: proxy.buffer_size changed (%d -> %d); process restart required to take effect", oldProxy.BufferSize, newProxy.BufferSize)
 	}
-	if oldProxy.HealthPort != newProxy.HealthPort {
-		log.Printf("WARN: proxy.health_port changed (%d -> %d); process restart required to take effect", oldProxy.HealthPort, newProxy.HealthPort)
+	if oldProxy.APIPort != newProxy.APIPort {
+		log.Printf("WARN: proxy.api_port changed (%d -> %d); process restart required to take effect", oldProxy.APIPort, newProxy.APIPort)
 	}
-	if oldProxy.EffectiveHealthListenAddress() != newProxy.EffectiveHealthListenAddress() {
-		log.Printf("WARN: proxy.health_listen_address changed (%q -> %q); process restart required to take effect", oldProxy.EffectiveHealthListenAddress(), newProxy.EffectiveHealthListenAddress())
+	if oldProxy.EffectiveAPIListenAddress() != newProxy.EffectiveAPIListenAddress() {
+		log.Printf("WARN: proxy.api_listen_address changed (%q -> %q); process restart required to take effect", oldProxy.EffectiveAPIListenAddress(), newProxy.EffectiveAPIListenAddress())
 	}
 }
 
@@ -594,7 +603,7 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 
 // healthTailnetStatus describes the runtime status of a single tailnet for /healthz.
 type healthTailnetStatus struct {
-	Name            string             `json:"name"`
+	Profile         string             `json:"profile"`
 	TailnetName     string             `json:"tailnet_name,omitempty"`
 	MagicDNSSuffix  string             `json:"magic_dns_suffix,omitempty"`
 	MagicDNSEnabled bool               `json:"magic_dns_enabled"`
@@ -662,7 +671,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		for i, name := range names {
 			i, name := i, name
 			srv := servers[name]
-			st := healthTailnetStatus{Name: name}
+			st := healthTailnetStatus{Profile: name}
 			if srv != nil {
 				st.Self.HostName = srv.Hostname
 				if srv.Sys() != nil || tm.healthDiscoverFunc != nil {
@@ -743,7 +752,7 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 				if ps.Up {
 					upVal = 1
 				}
-				fmt.Fprintf(&b, "proxtail_port_up{tailnet=%q,protocol=%q,listen_address=%q,source_port=\"%d\",destination=%q,vip_service=%q} %d\n",
+				fmt.Fprintf(&b, "proxtail_port_up{profile=%q,protocol=%q,listen_address=%q,port=\"%d\",destination=%q,vip_service=%q} %d\n",
 					ps.Tailnet,
 					ps.Protocol,
 					ps.ListenAddress,
@@ -793,14 +802,14 @@ func startHealthServer(ctx context.Context, listenAddress string, port int, prox
 	return nil
 }
 
-// runHealthCheck probes the running proxtail instance via its configured health port or TCP listeners.
+// runHealthCheck probes the running proxtail instance via its configured API port or TCP listeners.
 func runHealthCheck(cfg *config.Config) error {
-	if cfg.Proxy.HealthPort > 0 {
-		probeHost := strings.TrimSpace(cfg.Proxy.EffectiveHealthListenAddress())
+	if cfg.Proxy.APIPort > 0 {
+		probeHost := strings.TrimSpace(cfg.Proxy.EffectiveAPIListenAddress())
 		if probeHost == "" || probeHost == "0.0.0.0" || probeHost == "::" {
 			probeHost = "127.0.0.1"
 		}
-		url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(probeHost, strconv.Itoa(cfg.Proxy.HealthPort)))
+		url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(probeHost, strconv.Itoa(cfg.Proxy.APIPort)))
 		client := &http.Client{Timeout: 3 * time.Second}
 		resp, err := client.Get(url)
 		if err != nil {
@@ -813,7 +822,7 @@ func runHealthCheck(cfg *config.Config) error {
 		return nil
 	}
 
-	// If health_port is not enabled, verify that at least one configured TCP listener is accepting connections.
+	// If api_port is not enabled, verify that at least one configured TCP listener is accepting connections.
 	mappings := cfg.ToProxyPortMappings()
 	for _, mapping := range mappings {
 		if mapping.Protocol == "tcp" {
@@ -832,31 +841,28 @@ func runHealthCheck(cfg *config.Config) error {
 	}
 
 	if len(cfg.Tailnets) == 0 {
-		return fmt.Errorf("cannot probe running instance in standby mode (0 tailnets configured): configure proxy.health_port to enable HTTP health checks")
+		return fmt.Errorf("cannot probe running instance in standby mode (0 tailnets configured): configure proxy.api_port to enable HTTP health checks")
 	}
 
 	if len(mappings) == 0 {
 		for _, t := range cfg.Tailnets {
 			if t.IsAutoProxyVIPs() {
-				return fmt.Errorf("cannot probe running instance with only auto_proxy_vips mappings when health_port is disabled: configure proxy.health_port to probe dynamic VIP listeners")
+				return fmt.Errorf("cannot probe running instance with only auto_proxy_vips mappings when api_port is disabled: configure proxy.api_port to probe dynamic VIP listeners")
 			}
 		}
-		return fmt.Errorf("cannot probe running instance: neither health_port nor TCP listeners are configured (configure proxy.health_port to enable HTTP health checks)")
+		return fmt.Errorf("cannot probe running instance: neither api_port nor TCP listeners are configured (configure proxy.api_port to enable HTTP health checks)")
 	}
 
-	return fmt.Errorf("cannot probe running instance with UDP-only port mappings when health_port is disabled: configure proxy.health_port to enable HTTP health checks")
+	return fmt.Errorf("cannot probe running instance with UDP-only port mappings when api_port is disabled: configure proxy.api_port to enable HTTP health checks")
 }
 
-// resolveConfigPath determines the configuration file path from CLI flag, environment variables,
+// resolveConfigPath determines the configuration file path from CLI flag, PROXTAIL_CONFIG,
 // a local ./config.yaml in the current working directory, or /etc/proxtail/config.yaml.
 func resolveConfigPath(flagConfig string) string {
 	if flagConfig != "" {
 		return flagConfig
 	}
 	if p := os.Getenv("PROXTAIL_CONFIG"); p != "" {
-		return p
-	}
-	if p := os.Getenv("TSNET_PROXY_CONFIG"); p != "" {
 		return p
 	}
 	if _, err := os.Stat("config.yaml"); err == nil {
@@ -978,8 +984,8 @@ func main() {
 	)
 	proxyServer.SetProbeConfig(cfg.ToProxyProbeConfig())
 
-	if cfg.Proxy.HealthPort > 0 {
-		if err := startHealthServer(ctx, cfg.Proxy.EffectiveHealthListenAddress(), cfg.Proxy.HealthPort, proxyServer, tm); err != nil {
+	if cfg.Proxy.APIPort > 0 {
+		if err := startHealthServer(ctx, cfg.Proxy.EffectiveAPIListenAddress(), cfg.Proxy.APIPort, proxyServer, tm); err != nil {
 			tm.closeAll()
 			log.Fatalf("Failed to start health server: %v", err)
 		}
@@ -988,14 +994,14 @@ func main() {
 	fmt.Printf("Starting proxtail with %d tailnets, %d workers, %dKB buffers...\n",
 		len(tailnetServers), cfg.Proxy.WorkerPoolSize, cfg.Proxy.BufferSize)
 	if len(tailnetServers) == 0 {
-		if cfg.Proxy.HealthPort > 0 {
-			log.Printf("Running in standby mode (0 tailnets configured; health server active on :%d)", cfg.Proxy.HealthPort)
+		if cfg.Proxy.APIPort > 0 {
+			log.Printf("Running in standby mode (0 tailnets configured; health server active on :%d)", cfg.Proxy.APIPort)
 		} else {
 			log.Printf("Running in standby mode (0 tailnets configured)")
 		}
 	} else if len(initialPorts) == 0 {
-		if cfg.Proxy.HealthPort > 0 {
-			log.Printf("Running in tailnet discovery mode (0 port mappings configured; health & discovery active on :%d)", cfg.Proxy.HealthPort)
+		if cfg.Proxy.APIPort > 0 {
+			log.Printf("Running in tailnet discovery mode (0 port mappings configured; health & discovery active on :%d)", cfg.Proxy.APIPort)
 		} else {
 			log.Printf("Running with 0 port mappings configured")
 		}
@@ -1043,24 +1049,6 @@ func main() {
 				}
 			}
 		}()
-
-		if cfg.Proxy.EnableMetrics {
-			go func() {
-				ticker := time.NewTicker(time.Duration(cfg.Proxy.MetricsInterval) * time.Second)
-				defer ticker.Stop()
-
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						stats := proxyServer.GetStats()
-						log.Printf("METRICS: TCP_Connections=%d, UDP_Packets=%d, Bytes_Transferred=%d, Errors=%d",
-							stats.TCPConnections, stats.UDPPackets, stats.BytesTransferred, stats.ErrorCount)
-					}
-				}
-			}()
-		}
 
 		select {
 		case startupErr = <-proxyErrChan:

@@ -223,7 +223,7 @@ func TestExtractTailnetDetailsFromStatus(t *testing.T) {
 
 func TestHealthTailnetStatusJSONMarshaling(t *testing.T) {
 	st := healthTailnetStatus{
-		Name:            "corp-net",
+		Profile:         "corp-net",
 		TailnetName:     "example.com",
 		MagicDNSSuffix:  "corp-net.ts.net",
 		MagicDNSEnabled: true,
@@ -273,8 +273,8 @@ func TestHealthTailnetStatusJSONMarshaling(t *testing.T) {
 		t.Fatalf("failed to unmarshal healthTailnetStatus: %v", err)
 	}
 
-	if decoded.Self.HostName != "proxtail-lb" || decoded.Self.IPv4 != "100.64.0.1" || decoded.Self.BackendState != "Running" {
-		t.Errorf("unexpected decoded self: %+v", decoded.Self)
+	if decoded.Profile != "corp-net" || decoded.Self.HostName != "proxtail-lb" || decoded.Self.IPv4 != "100.64.0.1" || decoded.Self.BackendState != "Running" {
+		t.Errorf("unexpected decoded self/profile: %+v", decoded)
 	}
 	if len(decoded.VIPServices) != 1 || decoded.VIPServices[0].Name != "postgres" || decoded.VIPServices[0].DNSName != "postgres.corp-net.ts.net" || decoded.VIPServices[0].IPv4 != "100.64.0.50" {
 		t.Errorf("unexpected decoded VIP services: %+v", decoded.VIPServices)

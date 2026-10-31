@@ -168,7 +168,7 @@ flowchart TD
 - **Cross-Platform Standalone Binaries**: Precompiled standalone binaries for Linux, macOS, Windows, and FreeBSD with zero external dependencies.
 - **Tailscale OAuth & Auto ACL Tag Discovery**: Authenticate with non-expiring OAuth client secrets (`tskey-client-...`). When `tags:` are omitted in YAML, `proxtail` automatically queries the Tailscale API to discover and advertise authorized tags.
 - **Zero-Downtime Hot Reload**: Dynamic file watching and Kubernetes atomic symlink detection (`..data`) reload routes in **< 100 ms** without dropping active connections.
-- **Native Observability**: Prometheus metrics (`/metrics`), unified Kubernetes health and readiness endpoint (`/healthz`), and optional periodic traffic summaries.
+- **Native Observability**: Prometheus metrics (`/metrics`) and unified Kubernetes health and readiness endpoint (`/healthz`).
 
 ---
 
@@ -258,7 +258,7 @@ kubectl apply -f examples/kubernetes.yaml
 ## Configuration Recipes
 
 ### Recipe 1: Single Tailnet with Mixed TCP & UDP
-In single-tailnet mode, `name` and `auth_key` can be omitted—`proxtail` automatically reads `TS_AUTHKEY` (or `TS_CLIENT_SECRET`) from the environment:
+In single-tailnet mode, `profile` and `auth_key` can be omitted—`proxtail` automatically uses `"default"` as the profile and reads `TS_AUTHKEY` (or `TS_CLIENT_SECRET`) from the environment:
 
 ```yaml
 tailnets:
@@ -279,16 +279,16 @@ tailnets:
 ```
 
 ### Recipe 2: Multi-Tailnet Gateway (Production + Staging)
-Connect to multiple tailnets simultaneously. Each tailnet automatically reads its credentials from `TS_AUTHKEY_<NAME>` or `TS_CLIENT_SECRET_<NAME>`:
+Connect to multiple tailnets simultaneously. Each tailnet profile automatically reads its credentials from `TS_AUTHKEY_<PROFILE>` or `TS_CLIENT_SECRET_<PROFILE>`:
 
 ```yaml
 tailnets:
-  - name: 'production' # Reads TS_AUTHKEY_PRODUCTION or TS_CLIENT_SECRET_PRODUCTION
+  - profile: 'production' # Reads TS_AUTHKEY_PRODUCTION or TS_CLIENT_SECRET_PRODUCTION
     ports:
       - port: 8080
         destination: '100.64.0.10:8080'
 
-  - name: 'staging'    # Reads TS_AUTHKEY_STAGING or TS_CLIENT_SECRET_STAGING
+  - profile: 'staging'    # Reads TS_AUTHKEY_STAGING or TS_CLIENT_SECRET_STAGING
     ports:
       - port: 9080
         destination: '100.64.0.10:8080' # Complete isolation! Overlapping IPs never collide.
@@ -306,7 +306,7 @@ Tailscale OAuth client secrets (`tskey-client-...`) never expire. `proxtail` aut
 
 ```yaml
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     # 'tags:' omitted: proxtail automatically discovers authorized ACL tags
     ports:
       - port: 5432
@@ -323,7 +323,7 @@ When running multiple pod replicas in Kubernetes, each pod dynamically names its
 
 ```yaml
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     hostname: 'proxtail-prod-${HOSTNAME}' # Expands pod hostname (e.g. proxtail-prod-7d4b9b94b-xk29)
     ports:
       - port: 8080
@@ -335,12 +335,15 @@ By default, `ephemeral: true` keeps state in memory and cleans up on exit. To ma
 
 ```yaml
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     hostname: 'proxtail-gateway'
-    ephemeral: false # State saved to TS_STATE_DIR (/var/lib/tsnet/production)
+    ephemeral: false # State saved to <state_dir>/production (default in container: /var/lib/tsnet/production)
     ports:
       - port: 5432
         destination: 'postgres-db'
+
+proxy:
+  state_dir: '/var/lib/tsnet' # Or set via PROXTAIL_STATE_DIR / TS_STATE_DIR
 ```
 
 ### Recipe 6: Self-Hosted Headscale
@@ -348,7 +351,7 @@ Point any tailnet to an open-source [Headscale](https://github.com/juanfont/head
 
 ```yaml
 tailnets:
-  - name: 'selfhosted'
+  - profile: 'selfhosted'
     control_url: 'https://headscale.example.com'
     ports:
       - port: 8080
@@ -360,15 +363,14 @@ By default (`auto_proxy_vips: true`), `proxtail` automatically discovers all Tai
 
 ```yaml
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     # auto_proxy_vips defaults to true (no manual port entries needed for VIP services!)
-  - name: 'development'
+  - profile: 'development'
     auto_proxy_vips: false # Optional: opt out of automatic VIP proxying for a specific tailnet
 
 proxy:
-  health_port: 9090
+  api_port: 9090
   vip_port_range: '30000-30999' # Reserved exclusively for auto-proxied VIP services
-  vip_refresh_interval: 30      # Fallback poll interval in seconds alongside real-time IPN bus events
 ```
 
 Inspect active VIP local port allocations at any time via `/healthz` (`ports[].vip_service`):
@@ -383,11 +385,11 @@ Start `proxtail` with zero port mappings (`ports: []` or omitted) to discover ac
 
 ```yaml
 tailnets:
-  - name: 'production'
+  - profile: 'production'
     # 'ports:' omitted or set to []
 
 proxy:
-  health_port: 9090
+  api_port: 9090
 ```
 
 Once running, query `/healthz` to inspect discovered services:
@@ -404,7 +406,7 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 ### Config File Discovery Order
 `proxtail` checks the following locations in order:
 1. **CLI Flag**: `proxtail -c /path/to/config.yaml` (or `-config`)
-2. **Environment Variable**: `PROXTAIL_CONFIG` (or `TSNET_PROXY_CONFIG`)
+2. **Environment Variable**: `PROXTAIL_CONFIG`
 3. **Current Working Directory**: `./config.yaml`
 4. **Default System Path**: `/etc/proxtail/config.yaml` (default in container)
 
@@ -412,25 +414,25 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `name` | `string` | `"default"` *(if 1 tailnet)* | Identifier for the tailnet. Required when multiple tailnets are defined. |
+| `profile` | `string` | `"default"` *(if 1 tailnet)* | Local profile identifier for the tailnet (binds persistent state under `<TS_STATE_DIR>/<profile>` and hot-reload identity). Required when multiple tailnets are defined. |
 | `ports` | `list` | `[]` *(discovery mode)* | List of TCP and UDP port mappings for this tailnet. Omit or set to `[]` for discovery mode. |
-| `hostname` | `string` | `<system-hostname>-<name>` | Hostname registered in Tailscale. Supports `${ENV_VAR}` expansion. |
-| `auth_key` | `string` | `TS_AUTHKEY_<NAME>` *(or `TS_AUTHKEY`)* | Env var name or literal auth key (`tskey-auth-...`) / OAuth secret (`tskey-client-...`). |
+| `hostname` | `string` | `<system-hostname>-<profile>` | Hostname registered in Tailscale. Supports `${ENV_VAR}` expansion. |
+| `auth_key` | `string` | `TS_AUTHKEY_<PROFILE>` *(or `TS_AUTHKEY`)* | Env var name or literal auth key (`tskey-auth-...`) / OAuth secret (`tskey-client-...`). |
 | `tags` | `list` | Auto-discovered from OAuth | Tailscale ACL tags to advertise (e.g., `["tag:proxy"]`). Discovered automatically for OAuth secrets. |
 | `ephemeral` | `bool` | `true` | If `true`, state is in-memory and the node deregisters on exit. If `false`, persists to disk. |
 | `auto_proxy_vips` | `bool` | `true` | Automatically discover and proxy Tailscale VIP services in this tailnet onto `proxy.vip_port_range`. |
-| `listen_address` | `string` | `proxy.listen_address` | Default local bind IP for all manual ports and auto-proxied VIPs in this tailnet (e.g., `"127.0.0.2"`). |
-| `control_url` | `string` | Tailscale Control Plane | Custom coordination URL (e.g., for Headscale). |
-| `wireguard_port` | `int` | `0` *(auto)* | Optional static UDP port for direct peer-to-peer WireGuard traffic. |
+| `listen_address` | `string` | `"0.0.0.0"` | Default local bind IP for all manual ports and auto-proxied VIPs in this tailnet (e.g., `"127.0.0.2"`). |
+| `control_url` | `string` | Tailscale Control Plane | Custom `http://` or `https://` coordination URL (e.g., for Headscale). |
+| `wireguard_port` | `int` | `0` *(auto)* | Optional static UDP port for direct peer-to-peer WireGuard traffic (must not conflict across tailnets, static UDP ports, or `vip_port_range`). |
 
 ### `tailnets[].ports[]` Settings
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `port` *(or `source_port`)* | `int` | *(required)* | Local port `proxtail` listens on (`1`–`65535`, must be outside `proxy.vip_port_range`). |
-| `destination` | `string` | *(required)* | Destination `host:port` or `host` inside the tailnet (supports MagicDNS hostnames, VIP services, FQDNs, or Tailscale IPs). If `:port` is omitted, reuses `port`. Supports `${ENV_VAR}`. |
+| `port` | `int` | *(required)* | Local port `proxtail` listens on (`1`–`65535`, must be outside `proxy.vip_port_range`). |
+| `destination` | `string` | *(required)* | Destination `host:port` or `host` inside the tailnet (supports MagicDNS hostnames, VIP services, FQDNs, or Tailscale IPv4/IPv6 IPs). If `:port` is omitted, reuses `port` (bare IPv6 addresses like `fd7a:115c:a1e0::1` are automatically bracketed). Supports `${ENV_VAR}`. |
 | `protocol` | `string` | `"tcp"` | Layer 4 protocol: `"tcp"` or `"udp"`. |
-| `listen_address` | `string` | `tailnet.listen_address` *(or `proxy.listen_address`)* | Local IP to bind on (e.g., `"127.0.0.1"` for loopback only). |
+| `listen_address` | `string` | `tailnet.listen_address` | Local IP to bind on (inherits from parent `tailnets[].listen_address`; e.g., `"127.0.0.1"` for loopback only). |
 | `timeout` | `int` | `30` | Idle connection / session timeout in seconds (`1`–`3600`). |
 | `probe` | `bool` | *(inherits global)* | Optional per-port override to enable (`true`) or disable (`false`) active reachability probing. |
 
@@ -438,13 +440,10 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `listen_address` | `string` | `""` *(all interfaces)* | Default local bind IP for all ports and health probes (e.g., `"127.0.0.1"`). |
-| `health_listen_address` | `string` | `proxy.listen_address` | Optional dedicated local bind IP for the HTTP health & metrics server (`/healthz`, `/metrics`). |
-| `health_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz` and `/metrics` (must be outside `vip_port_range`). |
+| `api_listen_address` | `string` | `"0.0.0.0"` | Local bind IP for the HTTP API server (`/healthz`, `/metrics`). Does not inherit from `tailnets[].listen_address`. |
+| `api_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz` and `/metrics` (must be outside `vip_port_range`). |
+| `state_dir` | `string` | `PROXTAIL_STATE_DIR` / `TS_STATE_DIR` | Base directory for Tailscale node state storage; each tailnet uses `<state_dir>/<profile>`. |
 | `vip_port_range` | `string` | `"30000-30999"` | Reserved local `"start-end"` port range allocated exclusively to auto-proxied VIP services. |
-| `vip_refresh_interval` | `int` | `30` | Fallback VIP service discovery refresh interval in seconds (`1`–`3600`), alongside real-time IPN bus events. |
-| `metrics_interval` | `int` | Disabled (`60` if enabled) | Frequency (in seconds) to log periodic `METRICS:` summaries. |
-| `enable_metrics` | `bool` | `false` | Explicitly enable/disable metrics logging. |
 | `buffer_size` | `int` | `512` | Per-connection I/O copy buffer size in KB (`1`–`8192`). |
 | `worker_pool_size` | `int` | `200` | Maximum concurrent forwarding workers (`1`–`10000`). |
 | `probe.enabled` | `bool` | `false` | Enable active upstream TCP/UDP probing and automatic listener suspension for load balancers. |
@@ -463,16 +462,17 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 | `-healthcheck` | Probe a running `proxtail` instance (`/healthz` or TCP listener) and exit (`0` healthy, `1` error). |
 | `-v`, `-version` | Print build version and exit. |
 | `TS_AUTHKEY` / `TS_CLIENT_SECRET` | Default auth key or OAuth client secret for single-tailnet mode. |
-| `TS_AUTHKEY_<NAME>` | Per-tailnet auth key (`<NAME>` is uppercase with hyphens/dots converted to `_`). |
-| `TS_CLIENT_SECRET_<NAME>` | Per-tailnet OAuth secret (`tskey-client-...`). |
+| `TS_AUTHKEY_<PROFILE>` | Per-tailnet auth key (`<PROFILE>` is uppercase with hyphens/dots converted to `_`). |
+| `TS_CLIENT_SECRET_<PROFILE>` | Per-tailnet OAuth secret (`tskey-client-...`). |
 | `PROXTAIL_CONFIG` | Path to configuration file. |
-| `PROXTAIL_HEALTH_PORT` | Sets `proxy.health_port` via environment variable. |
-| `PROXTAIL_LISTEN_ADDRESS` | Sets `proxy.listen_address` via environment variable. |
-| `PROXTAIL_VIP_PORT_RANGE` | Sets `proxy.vip_port_range` (e.g., `"30000-30999"`) via environment variable. |
-| `PROXTAIL_VIP_REFRESH_INTERVAL` | Sets `proxy.vip_refresh_interval` (in seconds) via environment variable. |
-| `PROXTAIL_PROBE_ENABLED` | Set to `"true"` to enable active upstream probing and listener suspension via environment variable. |
+| `PROXTAIL_API_PORT` | Overrides `proxy.api_port` via environment variable. |
+| `PROXTAIL_API_LISTEN_ADDRESS` | Overrides `proxy.api_listen_address` via environment variable. |
+| `PROXTAIL_STATE_DIR` | Overrides `proxy.state_dir` via environment variable (`TS_STATE_DIR` is also supported as an alias; default in container: `/var/lib/tsnet`). |
+| `PROXTAIL_VIP_PORT_RANGE` | Overrides `proxy.vip_port_range` (e.g., `"30000-30999"`) via environment variable. |
+| `PROXTAIL_PROBE_ENABLED` | Set to `"true"` or `"false"` to override `proxy.probe.enabled` via environment variable. |
+| `PROXTAIL_PROBE_UDP_MODE` | Set to `"payload"` or `"netmap"` to override `proxy.probe.udp_probe_mode` via environment variable. |
 | `PROXTAIL_NETNS_ENABLED` | Set to `"true"` to enable `tailscale.com/net/netns` (disabled by default in userspace mode). |
-| `TS_STATE_DIR` | Directory used for Tailscale state storage (default in container: `/var/lib/tsnet`). |
+| `TS_STATE_DIR` | Alias for `PROXTAIL_STATE_DIR` / `proxy.state_dir` (default in container: `/var/lib/tsnet`). |
 
 ---
 
@@ -531,13 +531,13 @@ When placing `proxtail` behind an external L4 load balancer or Application Deliv
 
 ### Unified Health, Readiness & Tailnet Discovery (`/healthz`)
 
-When `health_port` is configured (or via `PROXTAIL_HEALTH_PORT=9090`), the `GET /healthz` HTTP endpoint acts as both the readiness probe and a zero-extra-RPC-cost ("Tier 0") operational status snapshot (cached for 2 seconds per tailnet):
+When `api_port` is configured (or via `PROXTAIL_API_PORT=9090`), the `GET /healthz` HTTP endpoint acts as both the readiness probe and a zero-extra-RPC-cost ("Tier 0") operational status snapshot (cached for 2 seconds per tailnet):
 - **Dynamic Status & HTTP Codes**:
   - `"ok"` (`200 OK`): All configured port listeners are bound (`up: true`) and all connected tailnet nodes are `Running` with no health warnings (also `"ok"` in zero-port discovery or zero-tailnet standby mode).
   - `"degraded"` (`200 OK`): At least one port listener remains active (`active_listeners > 0`), **but** one or more ports are suspended (`up: false`), **or** a tailnet node has `self.backend_state != "Running"` or `self.health_warnings`.
   - `"down"` (`503 Service Unavailable`): Proxy is starting up or shutting down, **or** ports are configured (`len(ports) > 0`) and all local listeners are down (`active_listeners == 0`).
-- **Tailnet & Self-Node Details (`tailnets[]` & `tailnets[].self`)**: Tailnet organization name (`tailnet_name`), MagicDNS suffix/status, and ProxTail's own node details (`id`, `hostname`, `dns_name`, `ipv4`, `ipv6`, `backend_state`, `online`, `relay`, `tags`, `key_expiry`, `cert_domains`, `health_warnings`).
-- **Per-Port Reachability (`ports[]`)**: Live local bind state (`up: true/false`), `listen_address`, `listen_addr`, `destination`, `protocol`, `tailnet`, `vip_service`, and `last_error` when suspended by upstream probing.
+- **Tailnet & Self-Node Details (`tailnets[]` & `tailnets[].self`)**: Local profile key (`profile`), Tailscale organization name (`tailnet_name`), MagicDNS suffix/status, and ProxTail's own node details (`id`, `hostname`, `dns_name`, `ipv4`, `ipv6`, `backend_state`, `online`, `relay`, `tags`, `key_expiry`, `cert_domains`, `health_warnings`).
+- **Per-Port Reachability (`ports[]`)**: Live local bind state (`up: true/false`), `listen_address`, `listen_addr`, `destination`, `protocol`, `profile`, `vip_service`, and `last_error` when suspended by upstream probing.
 - **Active Peers (`tailnets[].peers[]`)**: Discovered tailnet peer nodes with stable node ID, hostname, MagicDNS FQDN, IPv4/IPv6 addresses, online/active status, direct P2P `cur_addr` vs. DERP `relay`, `rx_bytes`/`tx_bytes` counters, `last_handshake`, `last_seen`, ACL `tags`, advertised `primary_routes`, and `expired` flag.
 - **VIP Services (`tailnets[].vip_services[]`)**: Discovered Tailscale Virtual IP (VIP) services with service names, display names, resolved MagicDNS FQDNs (`<service-name>.<magic-dns-suffix>`), IPv4/IPv6 VIPs, and exposed proto-ports.
 
@@ -552,7 +552,7 @@ Example JSON response:
   "active_listeners": 2,
   "tailnets": [
     {
-      "name": "production",
+      "profile": "production",
       "tailnet_name": "example.com",
       "magic_dns_suffix": "tail88356.ts.net",
       "magic_dns_enabled": true,
@@ -610,21 +610,21 @@ Example JSON response:
   ],
   "ports": [
     {
-      "source_port": 5432,
+      "port": 5432,
       "listen_address": "127.0.0.1",
       "listen_addr": "127.0.0.1:5432",
       "destination": "postgres-prod-01:5432",
       "protocol": "tcp",
-      "tailnet": "production",
+      "profile": "production",
       "up": true
     },
     {
-      "source_port": 30000,
+      "port": 30000,
       "listen_address": "127.0.0.1",
       "listen_addr": "127.0.0.1:30000",
       "destination": "100.64.0.100:443",
       "protocol": "tcp",
-      "tailnet": "production",
+      "profile": "production",
       "vip_service": "api-backend",
       "up": true
     }
@@ -637,7 +637,7 @@ Example JSON response:
 ```
 
 ### Prometheus Metrics
-When `health_port` is enabled (e.g. `PROXTAIL_HEALTH_PORT=9090`):
+When `api_port` is enabled (e.g. `PROXTAIL_API_PORT=9090`):
 
 ```bash
 curl http://localhost:9090/metrics
@@ -649,14 +649,16 @@ Key exported metrics:
 - `proxtail_bytes_transferred_total`: Total network throughput in bytes.
 - `proxtail_errors_total`: Count of connection or session errors.
 - `proxtail_tailnets_configured`: Number of active tailnet instances.
+- `proxtail_ports_configured`: Total number of configured port mappings.
 - `proxtail_listeners_active`: Number of healthy listening ports.
+- `proxtail_port_up{profile,protocol,listen_address,port,destination,vip_service}`: Per-port listener state (`1` = up, `0` = suspended/down).
 
 ---
 
 ## Troubleshooting
 
 - **`environment variable TS_AUTHKEY_... not set`**  
-  Ensure you have exported `TS_AUTHKEY` (for single tailnet) or `TS_AUTHKEY_<NAME>` (for multi-tailnet, matching the uppercase tailnet name with hyphens replaced by underscores).
+  Ensure you have exported `TS_AUTHKEY` (for single tailnet) or `TS_AUTHKEY_<PROFILE>` (for multi-tailnet, matching the uppercase tailnet profile with hyphens replaced by underscores).
 - **Ephemeral node stuck in `NeedsMachineAuth`**  
   If your tailnet has Device Approval enabled, approve the node in the Tailscale Admin Console, or generate auth keys with pre-approval enabled.
 - **Docker volume edits not triggering automatic reload**  
