@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"tailscale.com/ipn"
@@ -38,9 +39,10 @@ type vipAllocKey struct {
 
 // vipTargetSpec describes a normalized VIP destination port and its enabled transport protocols.
 type vipTargetSpec struct {
-	Key        vipAllocKey
-	TargetAddr string
-	Protocols  []string
+	Key           vipAllocKey
+	TargetAddr    string
+	Protocols     []string
+	ListenAddress string
 }
 
 type vipWatcherEntry struct {
@@ -238,36 +240,67 @@ func allocateVIPPorts(
 	listenAddress string,
 ) ([]proxy.PortMapping, map[vipAllocKey]int, []string, error) {
 	nextAllocations := make(map[vipAllocKey]int, len(targets))
-	usedPorts := make(map[int]bool, len(targets))
+	usedPorts := make(map[int][]string, len(targets))
+
+	defaultListenAddr := strings.TrimSpace(listenAddress)
+	if canon, err := config.CanonicalListenAddress(defaultListenAddr); err == nil {
+		defaultListenAddr = canon
+	}
+
+	effectiveTargetListenAddr := func(targetAddr string) string {
+		trimmed := strings.TrimSpace(targetAddr)
+		if trimmed == "" {
+			return defaultListenAddr
+		}
+		if canon, err := config.CanonicalListenAddress(trimmed); err == nil {
+			return canon
+		}
+		return trimmed
+	}
+
+	isPortConflict := func(port int, addr string) bool {
+		for _, boundAddr := range usedPorts[port] {
+			if config.ListenAddressesConflict(boundAddr, addr) {
+				return true
+			}
+		}
+		return false
+	}
 
 	// Pass 1: Retain existing allocations that remain valid within [vipStart, vipEnd].
 	for _, target := range targets {
+		targetAddr := effectiveTargetListenAddr(target.ListenAddress)
 		if prevPort, ok := prevAllocations[target.Key]; ok {
-			if prevPort >= vipStart && prevPort <= vipEnd && !usedPorts[prevPort] {
+			if prevPort >= vipStart && prevPort <= vipEnd && !isPortConflict(prevPort, targetAddr) {
 				nextAllocations[target.Key] = prevPort
-				usedPorts[prevPort] = true
+				usedPorts[prevPort] = append(usedPorts[prevPort], targetAddr)
 			}
 		}
 	}
 
 	// Pass 2: Assign the lowest available port in [vipStart, vipEnd] to new targets.
-	nextCandidate := vipStart
+	nextCandidateByAddr := make(map[string]int)
 	for _, target := range targets {
 		if _, exists := nextAllocations[target.Key]; exists {
 			continue
 		}
-		for nextCandidate <= vipEnd && usedPorts[nextCandidate] {
-			nextCandidate++
+		targetAddr := effectiveTargetListenAddr(target.ListenAddress)
+		candidate, ok := nextCandidateByAddr[targetAddr]
+		if !ok {
+			candidate = vipStart
 		}
-		if nextCandidate > vipEnd {
+		for candidate <= vipEnd && isPortConflict(candidate, targetAddr) {
+			candidate++
+		}
+		if candidate > vipEnd {
 			return nil, nil, nil, fmt.Errorf(
 				"vip_port_range %d-%d exhausted while allocating local port for VIP service '%s' (target port %d) in tailnet '%s'",
 				vipStart, vipEnd, target.Key.Service, target.Key.TargetPort, target.Key.Tailnet,
 			)
 		}
-		nextAllocations[target.Key] = nextCandidate
-		usedPorts[nextCandidate] = true
-		nextCandidate++
+		nextAllocations[target.Key] = candidate
+		usedPorts[candidate] = append(usedPorts[candidate], targetAddr)
+		nextCandidateByAddr[targetAddr] = candidate + 1
 	}
 
 	var diffLogs []string
@@ -297,11 +330,11 @@ func allocateVIPPorts(
 		}
 	}
 
-	listenAddrClean := strings.TrimSpace(listenAddress)
 	mappings := make([]proxy.PortMapping, 0, len(targets))
 
 	for _, target := range targets {
 		localPort := nextAllocations[target.Key]
+		targetAddr := effectiveTargetListenAddr(target.ListenAddress)
 		dest := net.JoinHostPort(target.TargetAddr, strconv.Itoa(target.Key.TargetPort))
 		if prevPort, existed := prevAllocations[target.Key]; !existed || prevPort != localPort {
 			diffLogs = append(diffLogs, fmt.Sprintf(
@@ -312,7 +345,7 @@ func allocateVIPPorts(
 		for _, proto := range target.Protocols {
 			mappings = append(mappings, proxy.PortMapping{
 				Source:            localPort,
-				ListenAddress:     listenAddrClean,
+				ListenAddress:     targetAddr,
 				Destination:       dest,
 				Protocol:          proto,
 				Tailnet:           target.Key.Tailnet,
@@ -365,15 +398,37 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 		discover = defaultDiscoverVIPServices
 	}
 
-	discoveredSnap := make(map[string]map[tailcfg.ServiceName]tailcfg.ServiceDetails)
-	var allTargets []vipTargetSpec
-
-	for _, tailnetCfg := range cfg.Tailnets {
+	type discoverResult struct {
+		svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails
+		err  error
+	}
+	results := make([]discoverResult, len(cfg.Tailnets))
+	var wg sync.WaitGroup
+	for i, tailnetCfg := range cfg.Tailnets {
 		if !tailnetCfg.IsAutoProxyVIPs() {
 			continue
 		}
-		srv := servers[tailnetCfg.Name]
-		svcs, dErr := discover(ctx, tailnetCfg.Name, srv)
+		idx := i
+		tName := tailnetCfg.Name
+		srv := servers[tName]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			svcs, dErr := discover(ctx, tName, srv)
+			results[idx] = discoverResult{svcs: svcs, err: dErr}
+		}()
+	}
+	wg.Wait()
+
+	discoveredSnap := make(map[string]map[tailcfg.ServiceName]tailcfg.ServiceDetails)
+	var allTargets []vipTargetSpec
+
+	for i, tailnetCfg := range cfg.Tailnets {
+		if !tailnetCfg.IsAutoProxyVIPs() {
+			continue
+		}
+		svcs := results[i].svcs
+		dErr := results[i].err
 		if dErr != nil {
 			if errors.Is(dErr, errNoNetmap) {
 				if isInitial {
@@ -392,6 +447,10 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 		targets, expErr := expandVIPServicesForTailnet(tailnetCfg.Name, svcs, rangeCapacity)
 		if expErr != nil {
 			return nil, nil, nil, nil, expErr
+		}
+		tailnetListenAddr := tailnetCfg.EffectiveListenAddress(cfg.Proxy.ListenAddress)
+		for j := range targets {
+			targets[j].ListenAddress = tailnetListenAddr
 		}
 		allTargets = append(allTargets, targets...)
 	}
@@ -506,6 +565,7 @@ func (tm *tailnetManager) reconcileVIPs(ctx context.Context, proxyServer *proxy.
 	tm.vipAllocations = nextAllocs
 	tm.lastTailnetVIPs = discoveredSnap
 	tm.appliedPorts = slices.Clone(desiredPorts)
+	tm.invalidateHealthCache()
 
 	for _, line := range diffLogs {
 		log.Println(line)

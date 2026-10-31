@@ -101,6 +101,7 @@ type ProbeConfig struct {
 	Timeout             time.Duration // Probe dial/read timeout (default: 2s)
 	ConsecutiveFailures int           // Consecutive probe failures before suspending (default: 2)
 	Cooldown            time.Duration // Traffic-aware activity cooldown to skip redundant probes (default: 10s)
+	UDPProbeMode        string        // UDP probe strategy: "payload" (default, 0-byte packet + ICMP wait) or "netmap" (netmap + dial only)
 }
 
 // udpSessionKey identifies a client UDP endpoint without heap allocations when using UDPAddrPort.
@@ -533,6 +534,17 @@ func (p *Proxy) getProbeSettings() (interval, timeout, cooldown time.Duration, m
 		maxFailures = 2
 	}
 	return interval, timeout, cooldown, maxFailures, wakeCh
+}
+
+func (p *Proxy) getUDPProbeMode() string {
+	p.mu.RLock()
+	mode := p.probeConfig.UDPProbeMode
+	p.mu.RUnlock()
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return "payload"
+	}
+	return mode
 }
 
 // UpdateTailnetServers updates the active tailnet servers map during a configuration reload.
@@ -1802,6 +1814,10 @@ func (p *Proxy) probeUDPUpstream(ctx context.Context, dialer Dialer, destination
 		return err
 	}
 	defer probeConn.Close()
+
+	if p.getUDPProbeMode() == "netmap" {
+		return nil
+	}
 
 	stopProbe := context.AfterFunc(ctx, func() {
 		_ = probeConn.Close()

@@ -2,14 +2,24 @@ package main
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
+
+const tailnetHealthCacheTTL = 2 * time.Second
+
+type cachedTailnetHealth struct {
+	expiresAt   time.Time
+	peers       []healthPeerStatus
+	vipServices []healthVIPService
+}
 
 // healthPeerStatus describes a discovered peer on a tailnet for /healthz.
 type healthPeerStatus struct {
@@ -127,7 +137,7 @@ func extractVIPServices(svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails, mag
 	return result
 }
 
-// discoverTailnetDetails queries the live tsnet LocalClient for tailnet peers and VIP services.
+// discoverTailnetDetails queries the live tsnet LocalClient for tailnet peers and VIP services concurrently.
 func discoverTailnetDetails(ctx context.Context, srv *tsnet.Server) ([]healthPeerStatus, []healthVIPService) {
 	if srv == nil || srv.Sys() == nil {
 		return nil, nil
@@ -139,11 +149,28 @@ func discoverTailnetDetails(ctx context.Context, srv *tsnet.Server) ([]healthPee
 	stCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
+	var (
+		tsStatus *ipnstate.Status
+		stErr    error
+		svcs     map[tailcfg.ServiceName]tailcfg.ServiceDetails
+		svcErr   error
+		wg       sync.WaitGroup
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		tsStatus, stErr = lc.Status(stCtx)
+	}()
+	go func() {
+		defer wg.Done()
+		svcs, svcErr = lc.GetServices(stCtx)
+	}()
+	wg.Wait()
+
 	var peers []healthPeerStatus
 	var magicDNSSuffix string
-
-	tsStatus, err := lc.Status(stCtx)
-	if err == nil && tsStatus != nil {
+	if stErr == nil && tsStatus != nil {
 		peers = extractPeersFromStatus(tsStatus)
 		if tsStatus.CurrentTailnet != nil && tsStatus.CurrentTailnet.MagicDNSSuffix != "" {
 			magicDNSSuffix = tsStatus.CurrentTailnet.MagicDNSSuffix
@@ -153,10 +180,49 @@ func discoverTailnetDetails(ctx context.Context, srv *tsnet.Server) ([]healthPee
 	}
 
 	var vipServices []healthVIPService
-	svcs, err := lc.GetServices(stCtx)
-	if err == nil && len(svcs) > 0 {
+	if svcErr == nil && len(svcs) > 0 {
 		vipServices = extractVIPServices(svcs, magicDNSSuffix)
 	}
 
 	return peers, vipServices
+}
+
+func (tm *tailnetManager) invalidateHealthCache() {
+	tm.healthCacheMu.Lock()
+	clear(tm.healthCache)
+	tm.healthCacheMu.Unlock()
+}
+
+func (tm *tailnetManager) getCachedTailnetDetails(ctx context.Context, name string, srv *tsnet.Server) ([]healthPeerStatus, []healthVIPService) {
+	now := time.Now()
+	tm.healthCacheMu.Lock()
+	if entry, ok := tm.healthCache[name]; ok && now.Before(entry.expiresAt) {
+		peers := slices.Clone(entry.peers)
+		vips := slices.Clone(entry.vipServices)
+		tm.healthCacheMu.Unlock()
+		return peers, vips
+	}
+	discoverFn := tm.healthDiscoverFunc
+	tm.healthCacheMu.Unlock()
+
+	if discoverFn == nil {
+		discoverFn = func(qCtx context.Context, _ string, s *tsnet.Server) ([]healthPeerStatus, []healthVIPService) {
+			return discoverTailnetDetails(qCtx, s)
+		}
+	}
+
+	peers, vips := discoverFn(ctx, name, srv)
+
+	tm.healthCacheMu.Lock()
+	if tm.healthCache == nil {
+		tm.healthCache = make(map[string]cachedTailnetHealth)
+	}
+	tm.healthCache[name] = cachedTailnetHealth{
+		expiresAt:   time.Now().Add(tailnetHealthCacheTTL),
+		peers:       slices.Clone(peers),
+		vipServices: slices.Clone(vips),
+	}
+	tm.healthCacheMu.Unlock()
+
+	return peers, vips
 }

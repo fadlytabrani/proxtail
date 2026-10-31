@@ -68,6 +68,10 @@ type tailnetManager struct {
 	vipInterval        time.Duration
 	vipRefreshOverride time.Duration
 	vipDebounceDelay   time.Duration
+
+	healthCacheMu      sync.Mutex
+	healthCache        map[string]cachedTailnetHealth
+	healthDiscoverFunc func(context.Context, string, *tsnet.Server) ([]healthPeerStatus, []healthVIPService)
 }
 
 func newTailnetManager() *tailnetManager {
@@ -80,6 +84,7 @@ func newTailnetManager() *tailnetManager {
 		vipAllocations:  make(map[vipAllocKey]int),
 		lastTailnetVIPs: make(map[string]map[tailcfg.ServiceName]tailcfg.ServiceDetails),
 		vipWatchers:     make(map[string]vipWatcherEntry),
+		healthCache:     make(map[string]cachedTailnetHealth),
 	}
 }
 
@@ -485,10 +490,16 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 
 	commitTailnets()
 
+	oldCfg := tm.activeCfg
 	tm.activeCfg = newCfg
 	tm.vipAllocations = nextAllocs
 	tm.lastTailnetVIPs = discoveredSnap
 	tm.appliedPorts = slices.Clone(desiredPorts)
+	tm.invalidateHealthCache()
+
+	if oldCfg != nil {
+		warnNonReloadableProxyChanges(oldCfg.Proxy, newCfg.Proxy)
+	}
 
 	for _, line := range diffLogs {
 		log.Println(line)
@@ -497,6 +508,22 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 	tm.syncVIPWatchers(newCfg, servers)
 
 	return nil
+}
+
+// warnNonReloadableProxyChanges logs warnings when process-scoped ProxySettings are changed during a hot-reload.
+func warnNonReloadableProxyChanges(oldProxy, newProxy config.ProxySettings) {
+	if oldProxy.WorkerPoolSize != newProxy.WorkerPoolSize {
+		log.Printf("WARN: proxy.worker_pool_size changed (%d -> %d); process restart required to take effect", oldProxy.WorkerPoolSize, newProxy.WorkerPoolSize)
+	}
+	if oldProxy.BufferSize != newProxy.BufferSize {
+		log.Printf("WARN: proxy.buffer_size changed (%d -> %d); process restart required to take effect", oldProxy.BufferSize, newProxy.BufferSize)
+	}
+	if oldProxy.HealthPort != newProxy.HealthPort {
+		log.Printf("WARN: proxy.health_port changed (%d -> %d); process restart required to take effect", oldProxy.HealthPort, newProxy.HealthPort)
+	}
+	if oldProxy.EffectiveHealthListenAddress() != newProxy.EffectiveHealthListenAddress() {
+		log.Printf("WARN: proxy.health_listen_address changed (%q -> %q); process restart required to take effect", oldProxy.EffectiveHealthListenAddress(), newProxy.EffectiveHealthListenAddress())
+	}
 }
 
 // startConfigWatcher watches the configuration file's directory for updates and signals reloadChan.
@@ -609,24 +636,36 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		}
 		sort.Strings(names)
 
-		tailnets := make([]healthTailnetStatus, 0, len(names))
-		for _, name := range names {
+		tailnets := make([]healthTailnetStatus, len(names))
+		var wg sync.WaitGroup
+		for i, name := range names {
+			i, name := i, name
+			srv := servers[name]
 			st := healthTailnetStatus{Name: name}
-			if srv := servers[name]; srv != nil {
+			if srv != nil {
 				st.Hostname = srv.Hostname
-				if srv.Sys() != nil {
-					ip4, ip6 := srv.TailscaleIPs()
-					if ip4.IsValid() {
-						st.IPv4 = ip4.String()
-					}
-					if ip6.IsValid() {
-						st.IPv6 = ip6.String()
-					}
-					st.Peers, st.VIPServices = discoverTailnetDetails(r.Context(), srv)
+				if srv.Sys() != nil || tm.healthDiscoverFunc != nil {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						if srv.Sys() != nil {
+							ip4, ip6 := srv.TailscaleIPs()
+							if ip4.IsValid() {
+								st.IPv4 = ip4.String()
+							}
+							if ip6.IsValid() {
+								st.IPv6 = ip6.String()
+							}
+						}
+						st.Peers, st.VIPServices = tm.getCachedTailnetDetails(r.Context(), name, srv)
+						tailnets[i] = st
+					}()
+					continue
 				}
 			}
-			tailnets = append(tailnets, st)
+			tailnets[i] = st
 		}
+		wg.Wait()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(healthResponse{
@@ -665,6 +704,8 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		stats := proxyServer.GetStats()
 		servers := tm.snapshotServers()
+		portStatuses := proxyServer.GetPortStatuses()
+		configuredPorts := proxyServer.ConfiguredPortCount()
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		var b strings.Builder
@@ -683,9 +724,31 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		fmt.Fprintf(&b, "# HELP proxtail_tailnets_configured Number of currently active tailnet instances.\n")
 		fmt.Fprintf(&b, "# TYPE proxtail_tailnets_configured gauge\n")
 		fmt.Fprintf(&b, "proxtail_tailnets_configured %d\n", len(servers))
+		fmt.Fprintf(&b, "# HELP proxtail_ports_configured Number of currently configured port mappings.\n")
+		fmt.Fprintf(&b, "# TYPE proxtail_ports_configured gauge\n")
+		fmt.Fprintf(&b, "proxtail_ports_configured %d\n", configuredPorts)
 		fmt.Fprintf(&b, "# HELP proxtail_listeners_active Number of currently bound local TCP and UDP listeners.\n")
 		fmt.Fprintf(&b, "# TYPE proxtail_listeners_active gauge\n")
 		fmt.Fprintf(&b, "proxtail_listeners_active %d\n", proxyServer.ActiveListenerCount())
+		if len(portStatuses) > 0 {
+			fmt.Fprintf(&b, "# HELP proxtail_port_up Whether the local listener for a configured port mapping is currently bound and active (1 = up, 0 = down).\n")
+			fmt.Fprintf(&b, "# TYPE proxtail_port_up gauge\n")
+			for _, ps := range portStatuses {
+				upVal := 0
+				if ps.Up {
+					upVal = 1
+				}
+				fmt.Fprintf(&b, "proxtail_port_up{tailnet=%q,protocol=%q,listen_address=%q,source_port=\"%d\",destination=%q,vip_service=%q} %d\n",
+					ps.Tailnet,
+					ps.Protocol,
+					ps.ListenAddress,
+					ps.Source,
+					ps.Destination,
+					ps.VIPService,
+					upVal,
+				)
+			}
+		}
 		_, _ = w.Write([]byte(b.String()))
 	})
 
@@ -727,12 +790,11 @@ func startHealthServer(ctx context.Context, listenAddress string, port int, prox
 
 // runHealthCheck probes the running proxtail instance via its configured health port or TCP listeners.
 func runHealthCheck(cfg *config.Config) error {
-	probeHost := strings.TrimSpace(cfg.Proxy.ListenAddress)
-	if probeHost == "" || probeHost == "0.0.0.0" || probeHost == "::" {
-		probeHost = "127.0.0.1"
-	}
-
 	if cfg.Proxy.HealthPort > 0 {
+		probeHost := strings.TrimSpace(cfg.Proxy.EffectiveHealthListenAddress())
+		if probeHost == "" || probeHost == "0.0.0.0" || probeHost == "::" {
+			probeHost = "127.0.0.1"
+		}
 		url := fmt.Sprintf("http://%s/readyz", net.JoinHostPort(probeHost, strconv.Itoa(cfg.Proxy.HealthPort)))
 		client := &http.Client{Timeout: 3 * time.Second}
 		resp, err := client.Get(url)
@@ -764,11 +826,20 @@ func runHealthCheck(cfg *config.Config) error {
 		}
 	}
 
-	if len(mappings) == 0 {
-		return fmt.Errorf("cannot probe running instance: neither health_port nor TCP listeners are configured")
+	if len(cfg.Tailnets) == 0 {
+		return fmt.Errorf("cannot probe running instance in standby mode (0 tailnets configured): configure proxy.health_port to enable HTTP health checks")
 	}
 
-	return nil
+	if len(mappings) == 0 {
+		for _, t := range cfg.Tailnets {
+			if t.IsAutoProxyVIPs() {
+				return fmt.Errorf("cannot probe running instance with only auto_proxy_vips mappings when health_port is disabled: configure proxy.health_port to probe dynamic VIP listeners")
+			}
+		}
+		return fmt.Errorf("cannot probe running instance: neither health_port nor TCP listeners are configured (configure proxy.health_port to enable HTTP health checks)")
+	}
+
+	return fmt.Errorf("cannot probe running instance with UDP-only port mappings when health_port is disabled: configure proxy.health_port to enable HTTP health checks")
 }
 
 // resolveConfigPath determines the configuration file path from CLI flag, environment variables,
@@ -903,7 +974,7 @@ func main() {
 	proxyServer.SetProbeConfig(cfg.ToProxyProbeConfig())
 
 	if cfg.Proxy.HealthPort > 0 {
-		if err := startHealthServer(ctx, cfg.Proxy.ListenAddress, cfg.Proxy.HealthPort, proxyServer, tm); err != nil {
+		if err := startHealthServer(ctx, cfg.Proxy.EffectiveHealthListenAddress(), cfg.Proxy.HealthPort, proxyServer, tm); err != nil {
 			tm.closeAll()
 			log.Fatalf("Failed to start health server: %v", err)
 		}

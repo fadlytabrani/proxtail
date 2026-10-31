@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1004,3 +1007,253 @@ func TestFormatVersion(t *testing.T) {
 		t.Fatalf("expected 'proxtail v0.3.1 (2026-10-31)', got %q", got)
 	}
 }
+
+func TestMetricsPerPortGaugesAndPortsConfigured(t *testing.T) {
+	port := getFreePort(t)
+	tm := newTailnetManager()
+	tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: c.Hostname}, nil
+	}
+	tm.cleanupFunc = func(*tsnet.Server, string) {}
+	defer tm.closeAll()
+
+	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{{Name: "prod", Hostname: "prod-proxy"}})
+	if err != nil {
+		t.Fatalf("syncTailnets failed: %v", err)
+	}
+
+	ports := []proxy.PortMapping{
+		{
+			Source:        port,
+			Destination:   "100.64.0.1:8080",
+			Protocol:      "tcp",
+			Tailnet:       "prod",
+			ListenAddress: "127.0.0.1",
+			VIPService:    "api",
+		},
+	}
+
+	p := proxy.NewProxyWithMultiTailnet(ports, servers, 32*1024, 10)
+	p.SetProbeConfig(proxy.ProbeConfig{Enabled: false})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+	<-p.Started()
+
+	handler := newHealthHandler(p, tm)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected /metrics 200 OK, got %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "proxtail_ports_configured 1\n") {
+		t.Errorf("expected proxtail_ports_configured 1 in /metrics, got:\n%s", body)
+	}
+	wantLine := fmt.Sprintf(`proxtail_port_up{tailnet="prod",protocol="tcp",listen_address="127.0.0.1",source_port="%d",destination="100.64.0.1:8080",vip_service="api"} 1`, port)
+	if !strings.Contains(body, wantLine) {
+		t.Errorf("expected %q in /metrics, got:\n%s", wantLine, body)
+	}
+}
+
+func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
+	tm := newTailnetManager()
+	tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: c.Hostname}, nil
+	}
+	tm.cleanupFunc = func(*tsnet.Server, string) {}
+
+	var callCount atomic.Int32
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	barrier := make(chan struct{})
+	var barrierOnce sync.Once
+
+	tm.healthDiscoverFunc = func(_ context.Context, _ string, _ *tsnet.Server) ([]healthPeerStatus, []healthVIPService) {
+		callCount.Add(1)
+		cur := inFlight.Add(1)
+		for {
+			prev := maxInFlight.Load()
+			if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		if cur >= 2 {
+			barrierOnce.Do(func() { close(barrier) })
+		} else {
+			select {
+			case <-barrier:
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
+		inFlight.Add(-1)
+		return []healthPeerStatus{{HostName: "peer-1", Online: true}}, []healthVIPService{{Name: "svc-a"}}
+	}
+	defer tm.closeAll()
+
+	servers, _, _, err := tm.syncTailnets([]config.TailnetConfig{
+		{Name: "alpha", Hostname: "alpha-host"},
+		{Name: "beta", Hostname: "beta-host"},
+	})
+	if err != nil {
+		t.Fatalf("syncTailnets failed: %v", err)
+	}
+
+	p := proxy.NewProxyWithMultiTailnet(nil, servers, 32*1024, 10)
+	handler := newHealthHandler(p, tm)
+
+	// First /healthz request populates the 2s TTL cache and queries alpha & beta concurrently
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK, got %d", rec1.Code)
+	}
+	if maxInFlight.Load() < 2 {
+		t.Errorf("expected concurrent tailnet health discovery (maxInFlight >= 2), got %d", maxInFlight.Load())
+	}
+	if callCount.Load() != 2 {
+		t.Fatalf("expected 2 discovery calls on initial /healthz, got %d", callCount.Load())
+	}
+
+	// Second /healthz request within 2s TTL serves cached tailnet details without invoking healthDiscoverFunc again
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK, got %d", rec2.Code)
+	}
+	if callCount.Load() != 2 {
+		t.Fatalf("expected cached /healthz to make 0 additional discovery calls (total 2), got %d", callCount.Load())
+	}
+
+	// Explicit cache invalidation forces fresh discovery on the next /healthz call
+	tm.invalidateHealthCache()
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if callCount.Load() != 4 {
+		t.Fatalf("expected /healthz after invalidateHealthCache to make 2 new calls (total 4), got %d", callCount.Load())
+	}
+}
+
+func TestWarnNonReloadableProxyChangesOnReload(t *testing.T) {
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origOut)
+
+	oldProxy := config.ProxySettings{
+		WorkerPoolSize:      100,
+		BufferSize:          64,
+		ListenAddress:       "127.0.0.1",
+		HealthListenAddress: "127.0.0.1",
+		HealthPort:          9090,
+	}
+	newProxy := config.ProxySettings{
+		WorkerPoolSize:      200,
+		BufferSize:          128,
+		ListenAddress:       "127.0.0.1",
+		HealthListenAddress: "0.0.0.0",
+		HealthPort:          9091,
+	}
+
+	warnNonReloadableProxyChanges(oldProxy, newProxy)
+	out := logBuf.String()
+	for _, want := range []string{
+		"WARN: proxy.worker_pool_size changed (100 -> 200)",
+		"WARN: proxy.buffer_size changed (64 -> 128)",
+		"WARN: proxy.health_port changed (9090 -> 9091)",
+		"WARN: proxy.health_listen_address changed (\"127.0.0.1\" -> \"0.0.0.0\")",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected log output to contain %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunHealthCheckDescriptiveErrorsAndHealthListenAddress(t *testing.T) {
+	t.Run("standby mode without health_port returns actionable error", func(t *testing.T) {
+		cfg, err := config.Parse([]byte(`
+tailnets: []
+proxy:
+  health_port: 0
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = runHealthCheck(cfg)
+		if err == nil || !strings.Contains(err.Error(), "standby mode (0 tailnets configured)") {
+			t.Fatalf("expected standby mode guidance error, got: %v", err)
+		}
+	})
+
+	t.Run("auto_proxy_vips-only without health_port returns actionable error", func(t *testing.T) {
+		cfg, err := config.Parse([]byte(`
+tailnets:
+  - name: 'prod'
+    auto_proxy_vips: true
+proxy:
+  health_port: 0
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = runHealthCheck(cfg)
+		if err == nil || !strings.Contains(err.Error(), "only auto_proxy_vips mappings") {
+			t.Fatalf("expected auto_proxy_vips guidance error, got: %v", err)
+		}
+	})
+
+	t.Run("UDP-only without health_port returns actionable error", func(t *testing.T) {
+		cfg, err := config.Parse([]byte(`
+tailnets:
+  - name: 'prod'
+    auto_proxy_vips: false
+    ports:
+      - port: 15353
+        destination: '100.64.0.1:53'
+        protocol: 'udp'
+proxy:
+  health_port: 0
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = runHealthCheck(cfg)
+		if err == nil || !strings.Contains(err.Error(), "UDP-only port mappings") {
+			t.Fatalf("expected UDP-only guidance error, got: %v", err)
+		}
+	})
+
+	t.Run("health_listen_address is used by startHealthServer and runHealthCheck", func(t *testing.T) {
+		healthPort := getFreePort(t)
+		cfg, err := config.Parse([]byte(fmt.Sprintf(`
+tailnets: []
+proxy:
+  listen_address: '0.0.0.0'
+  health_listen_address: '127.0.0.1'
+  health_port: %d
+`, healthPort)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		tm := newTailnetManager()
+		defer tm.closeAll()
+		p := proxy.NewProxyWithMultiTailnet(nil, nil, 32*1024, 10)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() { _ = p.Start(ctx) }()
+		defer p.Stop()
+		<-p.Started()
+
+		if err := startHealthServer(ctx, cfg.Proxy.EffectiveHealthListenAddress(), cfg.Proxy.HealthPort, p, tm); err != nil {
+			t.Fatalf("startHealthServer failed: %v", err)
+		}
+		if err := runHealthCheck(cfg); err != nil {
+			t.Fatalf("expected runHealthCheck to succeed against health_listen_address, got: %v", err)
+		}
+	})
+}
+

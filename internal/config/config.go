@@ -1,8 +1,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"strconv"
@@ -43,18 +46,85 @@ func ParsePortRange(spec string) (int, int, error) {
 	return start, end, nil
 }
 
+// CanonicalListenAddress normalizes a local bind IP string (unmapping IPv4-in-IPv6
+// and compressing IPv6 representations). An empty string is returned as-is.
+func CanonicalListenAddress(addr string) (string, error) {
+	trimmed := strings.TrimSpace(addr)
+	if trimmed == "" {
+		return "", nil
+	}
+	if net.ParseIP(trimmed) == nil {
+		return trimmed, fmt.Errorf("must be a valid IP address")
+	}
+	parsed, err := netip.ParseAddr(trimmed)
+	if err != nil {
+		return trimmed, fmt.Errorf("must be a valid IP address")
+	}
+	return parsed.Unmap().String(), nil
+}
+
+// normalizeListenAddressIfValid canonicalizes addr if it is a valid IP address,
+// or returns the trimmed input unchanged so Validate can report the exact invalid value.
+func normalizeListenAddressIfValid(addr string) string {
+	trimmed := strings.TrimSpace(addr)
+	if trimmed == "" {
+		return ""
+	}
+	if canon, err := CanonicalListenAddress(trimmed); err == nil {
+		return canon
+	}
+	return trimmed
+}
+
+// ListenAddressesConflict reports whether two local bind addresses overlap on the same
+// OS socket namespace for dual-stack "tcp"/"udp" listeners:
+//   - Empty ("") or "::" (unspecified IPv6 on dual-stack sockets) conflicts with every address.
+//   - "0.0.0.0" (unspecified IPv4) conflicts with "", "::", "0.0.0.0", and any IPv4 address.
+//   - Two specific IPs conflict iff their canonical unmapped addresses are equal.
+func ListenAddressesConflict(a, b string) bool {
+	ca, errA := CanonicalListenAddress(a)
+	cb, errB := CanonicalListenAddress(b)
+	if errA != nil || errB != nil {
+		return strings.TrimSpace(a) == strings.TrimSpace(b)
+	}
+	if ca == cb {
+		return true
+	}
+	if ca == "" || cb == "" || ca == "::" || cb == "::" {
+		return true
+	}
+	if ca == "0.0.0.0" {
+		pb, err := netip.ParseAddr(cb)
+		return err == nil && pb.Unmap().Is4()
+	}
+	if cb == "0.0.0.0" {
+		pa, err := netip.ParseAddr(ca)
+		return err == nil && pa.Unmap().Is4()
+	}
+	return false
+}
+
 // TailnetConfig defines settings for a specific Tailscale network.
 type TailnetConfig struct {
 	Name          string        `yaml:"name"`                      // Unique identifier for this tailnet (defaults to "default" if single tailnet)
 	Hostname      string        `yaml:"hostname,omitempty"`        // Hostname for this tailnet (optional, defaults to "<system-hostname>-<name>")
 	AuthKey       string        `yaml:"auth_key,omitempty"`        // Auth key or OAuth secret env var / literal (optional, defaults to "TS_AUTHKEY_<NAME>")
 	ControlURL    string        `yaml:"control_url,omitempty"`     // Coordination server URL (optional, defaults to Tailscale control plane)
+	ListenAddress string        `yaml:"listen_address,omitempty"`  // Optional default local bind IP for all ports and auto-proxied VIPs in this tailnet
 	Ephemeral     *bool         `yaml:"ephemeral,omitempty"`       // Whether this node is ephemeral (optional, defaults to true)
 	AutoProxyVIPs *bool         `yaml:"auto_proxy_vips,omitempty"` // Automatically discover and proxy Tailscale VIP services (optional, defaults to true)
 	Tags          []string      `yaml:"tags,omitempty"`            // Tailscale ACL tags to advertise (e.g., ["tag:proxy"])
 	WireGuardPort uint16        `yaml:"wireguard_port,omitempty"`  // Optional UDP port for direct peer-to-peer WireGuard traffic
 	WebClient     bool          `yaml:"web_client,omitempty"`      // Optional Tailscale web management client on port 5252
 	Ports         []PortMapping `yaml:"ports"`                     // Ports to forward for this tailnet
+}
+
+// EffectiveListenAddress returns the tailnet's canonical listen_address, falling back to proxyListenAddress.
+func (t TailnetConfig) EffectiveListenAddress(proxyListenAddress string) string {
+	if addr := normalizeListenAddressIfValid(t.ListenAddress); addr != "" {
+		return addr
+	}
+	return normalizeListenAddressIfValid(proxyListenAddress)
 }
 
 // IsEphemeral returns the configured ephemeral value, defaulting to true if unset.
@@ -156,24 +226,34 @@ type PortMapping struct {
 
 // ProbeSettings defines active upstream reachability probing and listener suspension options.
 type ProbeSettings struct {
-	Enabled             bool `yaml:"enabled,omitempty"`              // Enable active upstream reachability probing and listener suspension (default: false)
-	Interval            int  `yaml:"interval,omitempty"`             // Background probe interval in seconds (default: 10)
-	Timeout             int  `yaml:"timeout,omitempty"`              // Probe dial/read timeout in seconds (default: 2)
-	ConsecutiveFailures int  `yaml:"consecutive_failures,omitempty"` // Consecutive failures before suspending listener (default: 2)
-	Cooldown            int  `yaml:"cooldown,omitempty"`             // Traffic-aware activity cooldown in seconds (default: 10)
+	Enabled             bool   `yaml:"enabled,omitempty"`              // Enable active upstream reachability probing and listener suspension (default: false)
+	Interval            int    `yaml:"interval,omitempty"`             // Background probe interval in seconds (default: 10)
+	Timeout             int    `yaml:"timeout,omitempty"`              // Probe dial/read timeout in seconds (default: 2)
+	ConsecutiveFailures int    `yaml:"consecutive_failures,omitempty"` // Consecutive failures before suspending listener (default: 2)
+	Cooldown            int    `yaml:"cooldown,omitempty"`             // Traffic-aware activity cooldown in seconds (default: 10)
+	UDPProbeMode        string `yaml:"udp_probe_mode,omitempty"`       // UDP probe strategy: "payload" (default) or "netmap"
 }
 
 // ProxySettings defines performance, binding, health check, and monitoring settings for the proxy server.
 type ProxySettings struct {
-	ListenAddress      string        `yaml:"listen_address,omitempty"`       // Default local bind IP for all ports (default: all interfaces)
-	BufferSize         int           `yaml:"buffer_size,omitempty"`          // Buffer size in KB (default: 512)
-	WorkerPoolSize     int           `yaml:"worker_pool_size,omitempty"`     // Max concurrent workers (default: 200)
-	EnableMetrics      bool          `yaml:"enable_metrics,omitempty"`       // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
-	MetricsInterval    int           `yaml:"metrics_interval,omitempty"`     // Metrics logging interval in seconds (default: 60 when metrics enabled)
-	HealthPort         int           `yaml:"health_port,omitempty"`          // Optional HTTP port for /healthz and Prometheus /metrics endpoints
-	VIPPortRange       string        `yaml:"vip_port_range,omitempty"`       // Reserved local port range for auto-proxied VIP services (default: "30000-30999")
-	VIPRefreshInterval int           `yaml:"vip_refresh_interval,omitempty"` // Fallback VIP discovery refresh interval in seconds (default: 30)
-	Probe              ProbeSettings `yaml:"probe,omitempty"`                // Active upstream reachability probing and listener suspension
+	ListenAddress       string        `yaml:"listen_address,omitempty"`        // Default local bind IP for all ports (default: all interfaces)
+	HealthListenAddress string        `yaml:"health_listen_address,omitempty"` // Optional local bind IP for /healthz and /metrics (defaults to listen_address)
+	BufferSize          int           `yaml:"buffer_size,omitempty"`           // Buffer size in KB (default: 512)
+	WorkerPoolSize      int           `yaml:"worker_pool_size,omitempty"`      // Max concurrent workers (default: 200)
+	EnableMetrics       bool          `yaml:"enable_metrics,omitempty"`        // Enable performance metrics logging (auto-enabled if metrics_interval > 0)
+	MetricsInterval     int           `yaml:"metrics_interval,omitempty"`      // Metrics logging interval in seconds (default: 60 when metrics enabled)
+	HealthPort          int           `yaml:"health_port,omitempty"`           // Optional HTTP port for /healthz and Prometheus /metrics endpoints
+	VIPPortRange        string        `yaml:"vip_port_range,omitempty"`        // Reserved local port range for auto-proxied VIP services (default: "30000-30999")
+	VIPRefreshInterval  int           `yaml:"vip_refresh_interval,omitempty"`  // Fallback VIP discovery refresh interval in seconds (default: 30)
+	Probe               ProbeSettings `yaml:"probe,omitempty"`                 // Active upstream reachability probing and listener suspension
+}
+
+// EffectiveHealthListenAddress returns the canonical health server bind IP, falling back to ListenAddress.
+func (p ProxySettings) EffectiveHealthListenAddress() string {
+	if addr := normalizeListenAddressIfValid(p.HealthListenAddress); addr != "" {
+		return addr
+	}
+	return normalizeListenAddressIfValid(p.ListenAddress)
 }
 
 // Config defines the structure for the YAML configuration file.
@@ -219,7 +299,9 @@ func Load(file string) (*Config, error) {
 func Parse(data []byte) (*Config, error) {
 	expanded := os.ExpandEnv(string(data))
 	var cfg Config
-	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
+	dec := yaml.NewDecoder(strings.NewReader(expanded))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parsing config YAML: %w", err)
 	}
 
@@ -249,6 +331,17 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.Proxy.ListenAddress == "" {
 		cfg.Proxy.ListenAddress = strings.TrimSpace(os.Getenv("PROXTAIL_LISTEN_ADDRESS"))
 	}
+	cfg.Proxy.ListenAddress = normalizeListenAddressIfValid(cfg.Proxy.ListenAddress)
+
+	cfg.Proxy.HealthListenAddress = strings.TrimSpace(cfg.Proxy.HealthListenAddress)
+	if cfg.Proxy.HealthListenAddress == "" {
+		cfg.Proxy.HealthListenAddress = strings.TrimSpace(os.Getenv("PROXTAIL_HEALTH_LISTEN_ADDRESS"))
+	}
+	if cfg.Proxy.HealthListenAddress == "" && cfg.Proxy.ListenAddress != "" {
+		cfg.Proxy.HealthListenAddress = cfg.Proxy.ListenAddress
+	}
+	cfg.Proxy.HealthListenAddress = normalizeListenAddressIfValid(cfg.Proxy.HealthListenAddress)
+
 	if cfg.Proxy.HealthPort == 0 {
 		if hpStr := strings.TrimSpace(os.Getenv("PROXTAIL_HEALTH_PORT")); hpStr != "" {
 			if hp, err := strconv.Atoi(hpStr); err == nil && hp > 0 {
@@ -300,6 +393,13 @@ func ApplyDefaults(cfg *Config) {
 			cfg.Proxy.Probe.Cooldown = 10
 		}
 	}
+	cfg.Proxy.Probe.UDPProbeMode = strings.ToLower(strings.TrimSpace(cfg.Proxy.Probe.UDPProbeMode))
+	if cfg.Proxy.Probe.UDPProbeMode == "" {
+		cfg.Proxy.Probe.UDPProbeMode = strings.ToLower(strings.TrimSpace(os.Getenv("PROXTAIL_PROBE_UDP_MODE")))
+	}
+	if cfg.Proxy.Probe.UDPProbeMode == "" {
+		cfg.Proxy.Probe.UDPProbeMode = "payload"
+	}
 
 	sysHostname, err := os.Hostname()
 	if err != nil || sysHostname == "" {
@@ -315,6 +415,11 @@ func ApplyDefaults(cfg *Config) {
 		if cfg.Tailnets[i].Hostname == "" && cfg.Tailnets[i].Name != "" {
 			cfg.Tailnets[i].Hostname = fmt.Sprintf("%s-%s", sysHostname, cfg.Tailnets[i].Name)
 		}
+		cfg.Tailnets[i].ListenAddress = strings.TrimSpace(cfg.Tailnets[i].ListenAddress)
+		if cfg.Tailnets[i].ListenAddress == "" && cfg.Proxy.ListenAddress != "" {
+			cfg.Tailnets[i].ListenAddress = cfg.Proxy.ListenAddress
+		}
+		cfg.Tailnets[i].ListenAddress = normalizeListenAddressIfValid(cfg.Tailnets[i].ListenAddress)
 		if cfg.Tailnets[i].Ephemeral == nil {
 			defaultEphemeral := true
 			cfg.Tailnets[i].Ephemeral = &defaultEphemeral
@@ -346,9 +451,12 @@ func ApplyDefaults(cfg *Config) {
 				p.Source = p.Port
 			}
 			p.ListenAddress = strings.TrimSpace(p.ListenAddress)
-			if p.ListenAddress == "" && cfg.Proxy.ListenAddress != "" {
+			if p.ListenAddress == "" && cfg.Tailnets[i].ListenAddress != "" {
+				p.ListenAddress = cfg.Tailnets[i].ListenAddress
+			} else if p.ListenAddress == "" && cfg.Proxy.ListenAddress != "" {
 				p.ListenAddress = cfg.Proxy.ListenAddress
 			}
+			p.ListenAddress = normalizeListenAddressIfValid(p.ListenAddress)
 			if strings.TrimSpace(p.Protocol) == "" {
 				p.Protocol = "tcp"
 			} else {
@@ -374,8 +482,11 @@ func ApplyDefaults(cfg *Config) {
 // Validate performs comprehensive validation of the configuration.
 // Zero tailnets (len(cfg.Tailnets) == 0) is permitted for standby/unconfigured deployments.
 func Validate(cfg *Config) error {
-	if cfg.Proxy.ListenAddress != "" && net.ParseIP(cfg.Proxy.ListenAddress) == nil {
+	if _, err := CanonicalListenAddress(cfg.Proxy.ListenAddress); err != nil {
 		return fmt.Errorf("invalid proxy listen_address '%s': must be a valid IP address", cfg.Proxy.ListenAddress)
+	}
+	if _, err := CanonicalListenAddress(cfg.Proxy.HealthListenAddress); err != nil {
+		return fmt.Errorf("invalid proxy health_listen_address '%s': must be a valid IP address", cfg.Proxy.HealthListenAddress)
 	}
 
 	if cfg.Proxy.HealthPort < 0 || cfg.Proxy.HealthPort > 65535 {
@@ -393,12 +504,9 @@ func Validate(cfg *Config) error {
 	if cfg.Proxy.VIPRefreshInterval != 0 && (cfg.Proxy.VIPRefreshInterval < 1 || cfg.Proxy.VIPRefreshInterval > 3600) {
 		return fmt.Errorf("invalid vip_refresh_interval %d: must be between 1 and 3600 seconds", cfg.Proxy.VIPRefreshInterval)
 	}
-	if cfg.Proxy.HealthPort >= vipStart && cfg.Proxy.HealthPort <= vipEnd {
-		return fmt.Errorf("port conflict: health_port %d falls within reserved vip_port_range %d-%d",
-			cfg.Proxy.HealthPort, vipStart, vipEnd)
-	}
 
 	tailnetNames := make(map[string]bool)
+	var autoVIPListenAddrs []string
 	for _, tailnet := range cfg.Tailnets {
 		if strings.TrimSpace(tailnet.Name) == "" {
 			return fmt.Errorf("tailnet name cannot be empty")
@@ -408,6 +516,14 @@ func Validate(cfg *Config) error {
 		}
 		tailnetNames[tailnet.Name] = true
 
+		if _, err := CanonicalListenAddress(tailnet.ListenAddress); err != nil {
+			return fmt.Errorf("invalid listen_address '%s' in tailnet %s: must be a valid IP address", tailnet.ListenAddress, tailnet.Name)
+		}
+
+		if tailnet.IsAutoProxyVIPs() {
+			autoVIPListenAddrs = append(autoVIPListenAddrs, tailnet.EffectiveListenAddress(cfg.Proxy.ListenAddress))
+		}
+
 		for _, tag := range tailnet.Tags {
 			if tag == "" || tag == "tag:" || strings.ContainsAny(tag, " \t\n") {
 				return fmt.Errorf("invalid ACL tag '%s' in tailnet %s", tag, tailnet.Name)
@@ -415,10 +531,29 @@ func Validate(cfg *Config) error {
 		}
 	}
 
-	portMap := make(map[string]string) // "<port>-<protocol>" -> tailnet name
+	overlapsAutoVIPListenAddr := func(addr string) bool {
+		for _, vipAddr := range autoVIPListenAddrs {
+			if ListenAddressesConflict(addr, vipAddr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if cfg.Proxy.HealthPort >= vipStart && cfg.Proxy.HealthPort <= vipEnd && overlapsAutoVIPListenAddr(cfg.Proxy.EffectiveHealthListenAddress()) {
+		return fmt.Errorf("port conflict: health_port %d falls within reserved vip_port_range %d-%d",
+			cfg.Proxy.HealthPort, vipStart, vipEnd)
+	}
+
+	type boundPortEntry struct {
+		tailnet    string
+		listenAddr string
+	}
+	portBindings := make(map[string][]boundPortEntry) // "<port>-<protocol>" -> entries
 	totalPorts := 0
 
 	for _, tailnet := range cfg.Tailnets {
+		tailnetListenAddr := tailnet.EffectiveListenAddress(cfg.Proxy.ListenAddress)
 		for _, port := range tailnet.Ports {
 			totalPorts++
 			if port.Port != 0 && port.Source != port.Port {
@@ -427,13 +562,17 @@ func Validate(cfg *Config) error {
 			if port.Source <= 0 || port.Source > 65535 {
 				return fmt.Errorf("invalid source port %d in tailnet %s: must be between 1 and 65535", port.Source, tailnet.Name)
 			}
-			if port.Source >= vipStart && port.Source <= vipEnd {
-				return fmt.Errorf("port conflict: manual source port %d in tailnet '%s' falls within reserved vip_port_range %d-%d",
-					port.Source, tailnet.Name, vipStart, vipEnd)
-			}
-			if port.ListenAddress != "" && net.ParseIP(port.ListenAddress) == nil {
+			portListenAddr, err := CanonicalListenAddress(port.ListenAddress)
+			if err != nil {
 				return fmt.Errorf("invalid listen_address '%s' in tailnet %s, port %d: must be a valid IP address",
 					port.ListenAddress, tailnet.Name, port.Source)
+			}
+			if portListenAddr == "" {
+				portListenAddr = tailnetListenAddr
+			}
+			if port.Source >= vipStart && port.Source <= vipEnd && overlapsAutoVIPListenAddr(portListenAddr) {
+				return fmt.Errorf("port conflict: manual source port %d in tailnet '%s' falls within reserved vip_port_range %d-%d",
+					port.Source, tailnet.Name, vipStart, vipEnd)
 			}
 			dest := strings.TrimSpace(port.Destination)
 			if dest == "" {
@@ -456,25 +595,29 @@ func Validate(cfg *Config) error {
 				return fmt.Errorf("invalid protocol '%s' in tailnet %s, port %d: must be 'tcp' or 'udp'", port.Protocol, tailnet.Name, port.Source)
 			}
 
-			portListenAddr := strings.TrimSpace(port.ListenAddress)
-			if portListenAddr == "" {
-				portListenAddr = strings.TrimSpace(cfg.Proxy.ListenAddress)
-			}
-
 			if cfg.Proxy.HealthPort > 0 && protocol == "tcp" && port.Source == cfg.Proxy.HealthPort {
-				healthBind := strings.TrimSpace(cfg.Proxy.ListenAddress)
-				if portListenAddr == "" || healthBind == "" || portListenAddr == "0.0.0.0" || healthBind == "0.0.0.0" || portListenAddr == healthBind {
+				healthBind := cfg.Proxy.EffectiveHealthListenAddress()
+				if ListenAddressesConflict(portListenAddr, healthBind) {
 					return fmt.Errorf("port conflict: health_port %d conflicts with TCP source port %d in tailnet '%s'",
 						cfg.Proxy.HealthPort, port.Source, tailnet.Name)
 				}
 			}
 
-			portKey := fmt.Sprintf("%s:%d-%s", portListenAddr, port.Source, protocol)
-			if existingTailnet, exists := portMap[portKey]; exists {
-				return fmt.Errorf("port conflict: port %d (%s) is used by both tailnet '%s' and tailnet '%s'",
-					port.Source, protocol, existingTailnet, tailnet.Name)
+			portProtoKey := fmt.Sprintf("%d-%s", port.Source, protocol)
+			for _, existing := range portBindings[portProtoKey] {
+				if ListenAddressesConflict(existing.listenAddr, portListenAddr) {
+					if existing.tailnet == tailnet.Name {
+						return fmt.Errorf("port conflict: duplicate port %d (%s) in tailnet '%s'",
+							port.Source, protocol, tailnet.Name)
+					}
+					return fmt.Errorf("port conflict: port %d (%s) is used by both tailnet '%s' and tailnet '%s'",
+						port.Source, protocol, existing.tailnet, tailnet.Name)
+				}
 			}
-			portMap[portKey] = tailnet.Name
+			portBindings[portProtoKey] = append(portBindings[portProtoKey], boundPortEntry{
+				tailnet:    tailnet.Name,
+				listenAddr: portListenAddr,
+			})
 
 			if port.ConnectionTimeout < 1 || port.ConnectionTimeout > 3600 {
 				return fmt.Errorf("invalid timeout %d in tailnet %s, port %d: must be between 1 and 3600 seconds",
@@ -497,6 +640,11 @@ func Validate(cfg *Config) error {
 		if _, err := strconv.ParseBool(val); err != nil {
 			return fmt.Errorf("invalid PROXTAIL_PROBE_ENABLED '%s': must be a boolean", val)
 		}
+	}
+
+	udpMode := strings.ToLower(strings.TrimSpace(cfg.Proxy.Probe.UDPProbeMode))
+	if udpMode != "" && udpMode != "payload" && udpMode != "netmap" {
+		return fmt.Errorf("invalid probe.udp_probe_mode '%s': must be 'payload' or 'netmap'", cfg.Proxy.Probe.UDPProbeMode)
 	}
 
 	probeEnabled := cfg.Proxy.Probe.Enabled
@@ -534,6 +682,7 @@ func Validate(cfg *Config) error {
 func (c *Config) ToProxyPortMappings() []proxy.PortMapping {
 	var mappings []proxy.PortMapping
 	for _, tailnet := range c.Tailnets {
+		tailnetListenAddr := tailnet.EffectiveListenAddress(c.Proxy.ListenAddress)
 		for _, port := range tailnet.Ports {
 			timeout := port.ConnectionTimeout
 			if timeout <= 0 {
@@ -543,9 +692,9 @@ func (c *Config) ToProxyPortMappings() []proxy.PortMapping {
 			if protocol == "" {
 				protocol = "tcp"
 			}
-			listenAddr := strings.TrimSpace(port.ListenAddress)
+			listenAddr := normalizeListenAddressIfValid(port.ListenAddress)
 			if listenAddr == "" {
-				listenAddr = strings.TrimSpace(c.Proxy.ListenAddress)
+				listenAddr = tailnetListenAddr
 			}
 			mappings = append(mappings, proxy.PortMapping{
 				Source:            port.Source,
@@ -579,11 +728,16 @@ func (c *Config) ToProxyProbeConfig() proxy.ProbeConfig {
 	if cooldown <= 0 {
 		cooldown = interval
 	}
+	udpMode := strings.ToLower(strings.TrimSpace(c.Proxy.Probe.UDPProbeMode))
+	if udpMode == "" {
+		udpMode = "payload"
+	}
 	return proxy.ProbeConfig{
 		Enabled:             c.Proxy.Probe.Enabled,
 		Interval:            time.Duration(interval) * time.Second,
 		Timeout:             time.Duration(timeout) * time.Second,
 		ConsecutiveFailures: consecutiveFailures,
 		Cooldown:            time.Duration(cooldown) * time.Second,
+		UDPProbeMode:        udpMode,
 	}
 }

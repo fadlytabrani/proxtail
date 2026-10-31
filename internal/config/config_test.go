@@ -770,7 +770,7 @@ tailnets:
 			errContains: "falls within reserved vip_port_range 30000-30999",
 		},
 		{
-			name: "manual port alias at end of default vip_port_range even when auto_proxy_vips false",
+			name: "manual port alias at end of default vip_port_range when another tailnet has auto_proxy_vips true on overlapping listen_address",
 			yaml: `
 tailnets:
   - name: 'prod'
@@ -778,6 +778,8 @@ tailnets:
     ports:
       - port: 30999
         destination: 'web:80'
+  - name: 'staging'
+    auto_proxy_vips: true
 `,
 			errContains: "falls within reserved vip_port_range 30000-30999",
 		},
@@ -853,5 +855,265 @@ proxy:
 				t.Fatalf("expected error containing %q, got %q", tc.errContains, err.Error())
 			}
 		})
+	}
+
+	// 5. Conditional & per-address vip_port_range reservation:
+	// Allowed when all tailnets have auto_proxy_vips: false, or when auto_proxy_vips: true is on a non-overlapping listen_address.
+	allowedAllDisabledYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    auto_proxy_vips: false
+    ports:
+      - port: 30000
+        destination: 'web:80'
+proxy:
+  health_port: 30500
+`)
+	if _, err := Parse(allowedAllDisabledYAML); err != nil {
+		t.Fatalf("expected manual port 30000 and health_port 30500 to be allowed when auto_proxy_vips is false on all tailnets, got: %v", err)
+	}
+
+	allowedDisjointListenAddrYAML := []byte(`
+tailnets:
+  - name: 'vip-tailnet'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: true
+  - name: 'manual-tailnet'
+    listen_address: '127.0.0.2'
+    auto_proxy_vips: false
+    ports:
+      - port: 30000
+        destination: 'web:80'
+proxy:
+  health_listen_address: '127.0.0.3'
+  health_port: 30500
+`)
+	if _, err := Parse(allowedDisjointListenAddrYAML); err != nil {
+		t.Fatalf("expected manual port 30000 on 127.0.0.2 and health_port 30500 on 127.0.0.3 to be allowed when auto_proxy_vips tailnet is on 127.0.0.1, got: %v", err)
+	}
+}
+
+func TestListenAddressCanonicalizationAndConflictDetection(t *testing.T) {
+	// 1. CanonicalListenAddress normalizes IPv4-mapped IPv6 and expanded IPv6
+	canonCases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"127.0.0.1", "127.0.0.1"},
+		{"::ffff:127.0.0.1", "127.0.0.1"},
+		{"0:0:0:0:0:0:0:1", "::1"},
+		{"0:0:0:0:0:0:0:0", "::"},
+	}
+	for _, tc := range canonCases {
+		got, err := CanonicalListenAddress(tc.in)
+		if err != nil {
+			t.Fatalf("CanonicalListenAddress(%q) unexpected error: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("CanonicalListenAddress(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	// 2. Wildcard vs specific IP conflicts must be rejected
+	conflictCases := []struct {
+		name        string
+		yaml        string
+		errContains string
+	}{
+		{
+			name: "wildcard empty vs specific IPv4 across tailnets",
+			yaml: `
+tailnets:
+  - name: 't1'
+    ports:
+      - port: 8080
+        destination: 'a:80'
+  - name: 't2'
+    ports:
+      - port: 8080
+        listen_address: '127.0.0.1'
+        destination: 'b:80'
+`,
+			errContains: "port conflict: port 8080 (tcp) is used by both tailnet 't1' and tailnet 't2'",
+		},
+		{
+			name: "0.0.0.0 vs specific IPv4 across tailnets",
+			yaml: `
+tailnets:
+  - name: 't1'
+    listen_address: '0.0.0.0'
+    ports:
+      - port: 8080
+        destination: 'a:80'
+  - name: 't2'
+    listen_address: '127.0.0.1'
+    ports:
+      - port: 8080
+        destination: 'b:80'
+`,
+			errContains: "port conflict: port 8080 (tcp) is used by both tailnet 't1' and tailnet 't2'",
+		},
+		{
+			name: "IPv6 unspecified :: vs specific IPv4 across tailnets",
+			yaml: `
+tailnets:
+  - name: 't1'
+    listen_address: '::'
+    ports:
+      - port: 8080
+        destination: 'a:80'
+  - name: 't2'
+    listen_address: '127.0.0.1'
+    ports:
+      - port: 8080
+        destination: 'b:80'
+`,
+			errContains: "port conflict: port 8080 (tcp) is used by both tailnet 't1' and tailnet 't2'",
+		},
+		{
+			name: "IPv4-mapped IPv6 ::ffff:127.0.0.1 vs 127.0.0.1",
+			yaml: `
+tailnets:
+  - name: 't1'
+    listen_address: '::ffff:127.0.0.1'
+    ports:
+      - port: 8080
+        destination: 'a:80'
+  - name: 't2'
+    listen_address: '127.0.0.1'
+    ports:
+      - port: 8080
+        destination: 'b:80'
+`,
+			errContains: "port conflict: port 8080 (tcp) is used by both tailnet 't1' and tailnet 't2'",
+		},
+		{
+			name: "expanded IPv6 0:0:0:0:0:0:0:1 vs ::1",
+			yaml: `
+tailnets:
+  - name: 't1'
+    listen_address: '0:0:0:0:0:0:0:1'
+    ports:
+      - port: 8080
+        destination: 'a:80'
+  - name: 't2'
+    listen_address: '::1'
+    ports:
+      - port: 8080
+        destination: 'b:80'
+`,
+			errContains: "port conflict: port 8080 (tcp) is used by both tailnet 't1' and tailnet 't2'",
+		},
+		{
+			name: "same-tailnet duplicate port error wording",
+			yaml: `
+tailnets:
+  - name: 'prod'
+    ports:
+      - port: 8080
+        destination: 'a:80'
+      - port: 8080
+        destination: 'b:80'
+`,
+			errContains: "port conflict: duplicate port 8080 (tcp) in tailnet 'prod'",
+		},
+		{
+			name: "health_port on :: conflicts with port on 127.0.0.1",
+			yaml: `
+tailnets:
+  - name: 'prod'
+    listen_address: '127.0.0.1'
+    ports:
+      - port: 9090
+        destination: 'a:80'
+proxy:
+  health_listen_address: '::'
+  health_port: 9090
+`,
+			errContains: "port conflict: health_port 9090 conflicts with TCP source port 9090 in tailnet 'prod'",
+		},
+	}
+
+	for _, tc := range conflictCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.yaml))
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.errContains)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Fatalf("expected error containing %q, got %q", tc.errContains, err.Error())
+			}
+		})
+	}
+
+	// 3. Disjoint listen addresses (e.g., 127.0.0.1 vs 127.0.0.2, or 0.0.0.0 vs ::1) must succeed
+	disjointYAML := []byte(`
+tailnets:
+  - name: 't1'
+    listen_address: '127.0.0.1'
+    ports:
+      - port: 8080
+        destination: 'a:80'
+  - name: 't2'
+    listen_address: '127.0.0.2'
+    ports:
+      - port: 8080
+        destination: 'b:80'
+      - port: 8080
+        listen_address: '127.0.0.3'
+        destination: 'c:80'
+proxy:
+  listen_address: '127.0.0.9'
+  health_listen_address: '127.0.0.4'
+  health_port: 8080
+`)
+	cfg, err := Parse(disjointYAML)
+	if err != nil {
+		t.Fatalf("expected disjoint listen_address config to succeed, got: %v", err)
+	}
+	mappings := cfg.ToProxyPortMappings()
+	if len(mappings) != 3 {
+		t.Fatalf("expected 3 mappings, got %d", len(mappings))
+	}
+	if mappings[0].ListenAddress != "127.0.0.1" || mappings[1].ListenAddress != "127.0.0.2" || mappings[2].ListenAddress != "127.0.0.3" {
+		t.Errorf("unexpected mapping listen addresses: %+v", mappings)
+	}
+	if cfg.Proxy.EffectiveHealthListenAddress() != "127.0.0.4" {
+		t.Errorf("expected EffectiveHealthListenAddress='127.0.0.4', got %q", cfg.Proxy.EffectiveHealthListenAddress())
+	}
+}
+
+func TestStrictYAMLKnownFieldsAndUDPProbeMode(t *testing.T) {
+	// Unknown YAML field must fail
+	unknownFieldYAML := []byte(`
+tailnets:
+  - name: 'prod'
+    listen_adress: '127.0.0.1'
+`)
+	if _, err := Parse(unknownFieldYAML); err == nil {
+		t.Fatalf("expected Parse to fail on unknown YAML field 'listen_adress'")
+	}
+
+	// UDP probe mode validation & env override
+	t.Setenv("PROXTAIL_PROBE_UDP_MODE", "netmap")
+	cfg, err := Parse([]byte(`tailnets: []`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Proxy.Probe.UDPProbeMode != "netmap" {
+		t.Errorf("expected UDPProbeMode='netmap', got %q", cfg.Proxy.Probe.UDPProbeMode)
+	}
+	if cfg.ToProxyProbeConfig().UDPProbeMode != "netmap" {
+		t.Errorf("expected ToProxyProbeConfig().UDPProbeMode='netmap', got %q", cfg.ToProxyProbeConfig().UDPProbeMode)
+	}
+	t.Setenv("PROXTAIL_PROBE_UDP_MODE", "")
+
+	if _, err := Parse([]byte(`
+proxy:
+  probe:
+    udp_probe_mode: 'invalid-mode'
+`)); err == nil || !strings.Contains(err.Error(), "invalid probe.udp_probe_mode") {
+		t.Fatalf("expected invalid probe.udp_probe_mode error, got: %v", err)
 	}
 }

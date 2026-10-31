@@ -906,3 +906,132 @@ proxy:
 	}
 	assertTCPRoundTrip(t, vipStart, "still-up", "vip:still-up")
 }
+
+func TestMultiTailnetPerAddressVIPPortAllocationAndParallelDiscovery(t *testing.T) {
+	t.Run("disjoint listen_address tailnets reuse same VIP port range and discover in parallel", func(t *testing.T) {
+		cfg, err := config.Parse([]byte(`
+tailnets:
+  - name: 'prod'
+    listen_address: '127.0.0.1'
+  - name: 'staging'
+    listen_address: '127.0.0.2'
+proxy:
+  vip_port_range: '31000-31005'
+`))
+		if err != nil {
+			t.Fatalf("config.Parse failed: %v", err)
+		}
+
+		var inFlight int32
+		var maxInFlight int32
+		barrier := make(chan struct{})
+
+		tm := newTailnetManager()
+		tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+			return &tsnet.Server{Hostname: c.Hostname}, nil
+		}
+		tm.cleanupFunc = func(*tsnet.Server, string) {}
+		tm.vipDiscoverFunc = func(_ context.Context, tailnetName string, _ *tsnet.Server) (map[tailcfg.ServiceName]tailcfg.ServiceDetails, error) {
+			cur := atomic.AddInt32(&inFlight, 1)
+			for {
+				prev := atomic.LoadInt32(&maxInFlight)
+				if cur <= prev || atomic.CompareAndSwapInt32(&maxInFlight, prev, cur) {
+					break
+				}
+			}
+			if cur == 2 {
+				close(barrier)
+			} else {
+				select {
+				case <-barrier:
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+			atomic.AddInt32(&inFlight, -1)
+
+			ip := "100.101.1.1"
+			if tailnetName == "staging" {
+				ip = "100.101.2.1"
+			}
+			return map[tailcfg.ServiceName]tailcfg.ServiceDetails{
+				"svc:api": {
+					Name:  "svc:api",
+					Addrs: []netip.Addr{netip.MustParseAddr(ip)},
+					Ports: []tailcfg.ProtoPortRange{{Proto: 6, Ports: tailcfg.PortRange{First: 443, Last: 443}}},
+				},
+			}, nil
+		}
+		defer tm.closeAll()
+
+		servers, _, _, err := tm.syncTailnets(cfg.Tailnets)
+		if err != nil {
+			t.Fatalf("syncTailnets failed: %v", err)
+		}
+
+		ports, err := tm.prepareInitialPorts(context.Background(), cfg, servers)
+		if err != nil {
+			t.Fatalf("prepareInitialPorts failed: %v", err)
+		}
+		if atomic.LoadInt32(&maxInFlight) < 2 {
+			t.Errorf("expected parallel VIP discovery across tailnets (maxInFlight >= 2), got %d", atomic.LoadInt32(&maxInFlight))
+		}
+		if len(ports) != 2 {
+			t.Fatalf("expected 2 VIP port mappings, got %d: %+v", len(ports), ports)
+		}
+		// Both prod (127.0.0.1) and staging (127.0.0.2) should independently allocate port 31000
+		if ports[0].Tailnet != "prod" || ports[0].ListenAddress != "127.0.0.1" || ports[0].Source != 31000 {
+			t.Errorf("unexpected prod VIP mapping: %+v", ports[0])
+		}
+		if ports[1].Tailnet != "staging" || ports[1].ListenAddress != "127.0.0.2" || ports[1].Source != 31000 {
+			t.Errorf("unexpected staging VIP mapping: %+v", ports[1])
+		}
+	})
+
+	t.Run("overlapping wildcard and loopback listen_address tailnets allocate distinct VIP ports", func(t *testing.T) {
+		cfg, err := config.Parse([]byte(`
+tailnets:
+  - name: 'prod'
+    listen_address: '0.0.0.0'
+  - name: 'staging'
+    listen_address: '127.0.0.1'
+proxy:
+  vip_port_range: '31010-31015'
+`))
+		if err != nil {
+			t.Fatalf("config.Parse failed: %v", err)
+		}
+
+		tm := newTailnetManager()
+		tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+			return &tsnet.Server{Hostname: c.Hostname}, nil
+		}
+		tm.cleanupFunc = func(*tsnet.Server, string) {}
+		tm.vipDiscoverFunc = func(_ context.Context, tailnetName string, _ *tsnet.Server) (map[tailcfg.ServiceName]tailcfg.ServiceDetails, error) {
+			return map[tailcfg.ServiceName]tailcfg.ServiceDetails{
+				"svc:api": {
+					Name:  "svc:api",
+					Addrs: []netip.Addr{netip.MustParseAddr("100.101.1.1")},
+					Ports: []tailcfg.ProtoPortRange{{Proto: 6, Ports: tailcfg.PortRange{First: 443, Last: 443}}},
+				},
+			}, nil
+		}
+		defer tm.closeAll()
+
+		servers, _, _, err := tm.syncTailnets(cfg.Tailnets)
+		if err != nil {
+			t.Fatalf("syncTailnets failed: %v", err)
+		}
+
+		ports, err := tm.prepareInitialPorts(context.Background(), cfg, servers)
+		if err != nil {
+			t.Fatalf("prepareInitialPorts failed: %v", err)
+		}
+		if len(ports) != 2 {
+			t.Fatalf("expected 2 VIP port mappings, got %d: %+v", len(ports), ports)
+		}
+		if ports[0].Source != 31010 || ports[1].Source != 31011 {
+			t.Errorf("expected overlapping tailnets to allocate 31010 and 31011, got %d and %d", ports[0].Source, ports[1].Source)
+		}
+	})
+}
+

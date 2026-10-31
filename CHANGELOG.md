@@ -8,6 +8,27 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-31
+
+### Added
+- **Multi-Tailnet IP Isolation & Per-Tailnet `listen_address`** ([#19](https://github.com/fadlytabrani/proxtail/issues/19)):
+  - Added optional `listen_address` on `TailnetConfig` (`tailnets[].listen_address`), enabling multiple tailnets to bind identical manual and `auto_proxy_vips` local ports on distinct local IP addresses (e.g., `127.0.0.1` and `127.0.0.2`).
+  - Added canonical IP comparison (`CanonicalListenAddress`) and wildcard/specific IP overlap detection (`ListenAddressesConflict`) across IPv4, IPv6, IPv4-mapped IPv6 (`::ffff:127.0.0.1`), and wildcard binds (`""`, `"0.0.0.0"`, `"::"`).
+  - Updated `allocateVIPPorts` and `config.Validate` so `vip_port_range` reservation and dynamic VIP port allocations are scoped per non-conflicting `listen_address` and only enforced when at least one tailnet on a conflicting bind address has `auto_proxy_vips: true`.
+- **Dedicated Health Server Bind Address (`proxy.health_listen_address`)**:
+  - Added `proxy.health_listen_address` (and `PROXTAIL_HEALTH_LISTEN_ADDRESS` environment variable) to allow binding `/healthz`, `/readyz`, and `/metrics` on a separate address (such as `127.0.0.1`) when `proxy.listen_address` is `0.0.0.0`.
+- **Configurable UDP Probing Strategy (`proxy.probe.udp_probe_mode`)**:
+  - Added `proxy.probe.udp_probe_mode` (`PROXTAIL_PROBE_UDP_MODE`) supporting `"payload"` (default: sends a 0-byte UDP packet to detect `ICMP Port Unreachable`) and `"netmap"` (verifies Tailscale peer online status and local route without transmitting synthetic 0-byte UDP packets to sensitive datagram backends).
+- **Per-Port Prometheus Metrics**:
+  - Exposed `proxtail_ports_configured` and per-port `proxtail_port_up{tailnet,protocol,listen_address,source_port,destination,vip_service}` gauges (`1` = up, `0` = suspended/down) on `GET /metrics`.
+- **Strict YAML Configuration Validation & Reload Warnings**:
+  - Enabled `yaml.Decoder.KnownFields(true)` in `config.Parse` to catch misspelled configuration keys early instead of silently ignoring them.
+  - Added `WARN:` log messages during `SIGHUP` / `fsnotify` hot reloads when non-reloadable process-scoped `ProxySettings` (`worker_pool_size`, `buffer_size`, `health_port`, `health_listen_address`) are modified.
+  - Improved `-healthcheck` (`runHealthCheck`) error messages with actionable guidance when `health_port` is disabled in standby (`0` tailnets), `auto_proxy_vips`-only, or UDP-only configurations.
+- **Parallel Multi-Tailnet Discovery & `/healthz` TTL Caching**:
+  - Parallelized `discoverVIPServices` across all `auto_proxy_vips` tailnets in `computeVIPMappingsLocked`.
+  - Parallelized `LocalClient().Status()` and `LocalClient().GetServices()` within `discoverTailnetDetails` and across tailnets in `GET /healthz`, backed by a 2-second per-tailnet TTL cache invalidated on config reload and VIP reconciliation.
+
 ### Fixed
 - **Transactional Hot-Reload Rollback (`reloadConfig` & `Proxy.ReloadConfig`)**:
   - Deferred closing removed `tsnet.Server` instances until after VIP resolution and `Proxy.ReloadConfig` succeed; if a configuration reload fails, newly started tailnet servers are cleaned up and previously running tailnet servers, probe settings, and port listeners are transactionally restored.

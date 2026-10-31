@@ -2820,3 +2820,71 @@ func TestReloadConfigPartialFailureAndRollback(t *testing.T) {
 		t.Fatalf("expected 1 active listener after rollback, got %d", p.ActiveListenerCount())
 	}
 }
+
+func TestUDPProbeModeNetmapSkipsZeroBytePayload(t *testing.T) {
+	backendUDP, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend UDP listener: %v", err)
+	}
+	defer backendUDP.Close()
+
+	var zeroBytePackets atomic.Int32
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			n, _, err := backendUDP.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n == 0 {
+				zeroBytePackets.Add(1)
+			}
+		}
+	}()
+
+	proxyUDPPort := getFreeUDPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyUDPPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendUDP.LocalAddr().String(),
+			Protocol:          "udp",
+			Tailnet:           "test-tailnet",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"test-tailnet": &localDialer{}}, 32*1024, 50)
+	p.forceUpstreamProbe = true
+	p.probeInitialDelay = 10 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            25 * time.Millisecond,
+		Timeout:             50 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            10 * time.Millisecond,
+		UDPProbeMode:        "netmap",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	select {
+	case <-p.Started():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxy to start")
+	}
+
+	// Let several probe intervals elapse
+	time.Sleep(100 * time.Millisecond)
+
+	st := p.GetPortStatuses()
+	if len(st) != 1 || !st[0].Up {
+		t.Fatalf("expected UDP listener to stay UP in netmap probe mode, got %+v", st)
+	}
+	if got := zeroBytePackets.Load(); got != 0 {
+		t.Fatalf("expected 0 zero-byte UDP packets in netmap probe mode, got %d", got)
+	}
+}

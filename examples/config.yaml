@@ -28,6 +28,8 @@ tailnets:
         timeout: 10
 
   - name: 'staging'
+    # Optional per-tailnet bind IP override (allows multiple tailnets to bind identical local ports on distinct IPs)
+    # listen_address: '127.0.0.2'
     ports:
       - port: 9080
         destination: 'staging-web:8080'
@@ -40,6 +42,8 @@ tailnets:
 
 # Optional proxy tuning & monitoring (omit entirely to use defaults: 512KB buffer, 200 workers)
 proxy:
+  # listen_address: '0.0.0.0'         # Default bind address for proxy listeners
+  # health_listen_address: '127.0.0.1' # Optional separate bind address for the health & metrics server
   metrics_interval: 30        # Log performance metrics every 30s (omit or set 0 to disable)
   health_port: 9090           # Exposes /healthz, /readyz, and /metrics
   vip_port_range: '30000-30999' # Reserved local port range for auto-proxied VIP services (manual ports cannot overlap)
@@ -52,6 +56,7 @@ proxy:
     timeout: 2               # Dial probe timeout in seconds (default: 2)
     consecutive_failures: 2  # Failures before suspending listener (default: 2; dial-failure is instant)
     cooldown: 10             # Skip probing if client traffic occurred in last 10s (default: 10)
+    udp_probe_mode: 'payload' # 'payload' (default: 0-byte UDP packet + ICMP Port Unreachable detection) or 'netmap' (route/peer-online check only without sending UDP packets)
 
 # Environment variables for this configuration:
 #   TS_AUTHKEY_PRODUCTION=tskey-auth-xxxxx
