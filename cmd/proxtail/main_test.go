@@ -243,10 +243,17 @@ func TestConfigWatcherDebouncedReloadSignal(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	watchDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-watchDone
+	}()
 
 	reloadChan := make(chan struct{}, 1)
-	go startConfigWatcher(ctx, cfgPath, reloadChan)
+	go func() {
+		defer close(watchDone)
+		startConfigWatcher(ctx, cfgPath, reloadChan)
+	}()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -482,10 +489,17 @@ func TestConfigWatcherKubernetesConfigMapSymlink(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	watchDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-watchDone
+	}()
 
 	reloadChan := make(chan struct{}, 1)
-	go startConfigWatcher(ctx, cfgLink, reloadChan)
+	go func() {
+		defer close(watchDone)
+		startConfigWatcher(ctx, cfgLink, reloadChan)
+	}()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1662,14 +1676,18 @@ proxy:
 	if err := os.Truncate(cfgPath, 0); err != nil {
 		t.Fatalf("failed truncating config file: %v", err)
 	}
+	writer1Done := make(chan struct{})
 	go func() {
+		defer close(writer1Done)
 		time.Sleep(35 * time.Millisecond)
 		_ = os.WriteFile(cfgPath, []byte(makeConfigYAML("tskey-alpha-2", "tskey-beta-1")), 0o600)
 	}()
 
 	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		<-writer1Done
 		t.Fatalf("reloadConfig during truncate-then-write failed: %v", err)
 	}
+	<-writer1Done
 
 	mu.Lock()
 	if cleanupCount["beta"] != 0 || initCount["beta"] != 1 {
@@ -1718,14 +1736,18 @@ tailnets:
 	if err := os.WriteFile(cfgPath, []byte(partialFirstChunk), 0o600); err != nil {
 		t.Fatalf("failed writing first chunk: %v", err)
 	}
+	writer3Done := make(chan struct{})
 	go func() {
+		defer close(writer3Done)
 		time.Sleep(15 * time.Millisecond)
 		_ = os.WriteFile(cfgPath, []byte(makeConfigYAML("tskey-alpha-2", "tskey-beta-2")), 0o600)
 	}()
 
 	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		<-writer3Done
 		t.Fatalf("reloadConfig during multi-chunk write failed: %v", err)
 	}
+	<-writer3Done
 	mu.Lock()
 	if cleanupCount["alpha"] != 1 || initCount["alpha"] != 2 {
 		mu.Unlock()
@@ -1739,9 +1761,16 @@ tailnets:
 
 	// Step 4: Live startConfigWatcher with unlink+create save (vim/sed style) rotating 'alpha' auth_key.
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
-	defer cancelWatch()
+	watchDone := make(chan struct{})
+	defer func() {
+		cancelWatch()
+		<-watchDone
+	}()
 	reloadChan := make(chan struct{}, 1)
-	go startConfigWatcher(watchCtx, cfgPath, reloadChan)
+	go func() {
+		defer close(watchDone)
+		startConfigWatcher(watchCtx, cfgPath, reloadChan)
+	}()
 	time.Sleep(40 * time.Millisecond)
 
 	if err := os.Remove(cfgPath); err != nil {
@@ -1760,6 +1789,9 @@ tailnets:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for startConfigWatcher reload signal")
 	}
+
+	cancelWatch()
+	<-watchDone
 
 	mu.Lock()
 	if cleanupCount["beta"] != 1 || initCount["beta"] != 2 {
