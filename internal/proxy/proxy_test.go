@@ -2888,3 +2888,120 @@ func TestUDPProbeModeNetmapSkipsZeroBytePayload(t *testing.T) {
 		t.Fatalf("expected 0 zero-byte UDP packets in netmap probe mode, got %d", got)
 	}
 }
+
+func TestProxySetTailnetErrorsIsolatesFailedTailnetPorts(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+
+	tcpPortHealthy := getFreeTCPPort(t)
+	tcpPortBroken := getFreeTCPPort(t)
+	udpPortBroken := getFreeUDPPort(t)
+
+	ports := []PortMapping{
+		{
+			Source:        tcpPortHealthy,
+			ListenAddress: "127.0.0.1",
+			Destination:   backendLn.Addr().String(),
+			Protocol:      "tcp",
+			Tailnet:       "tailnet-healthy",
+		},
+		{
+			Source:        tcpPortBroken,
+			ListenAddress: "127.0.0.1",
+			Destination:   backendLn.Addr().String(),
+			Protocol:      "tcp",
+			Tailnet:       "tailnet-broken",
+		},
+		{
+			Source:        udpPortBroken,
+			ListenAddress: "127.0.0.1",
+			Destination:   "127.0.0.1:5353",
+			Protocol:      "udp",
+			Tailnet:       "tailnet-broken",
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"tailnet-healthy": &localDialer{}}, 32*1024, 50)
+	p.SetTailnetErrors(map[string]string{
+		"tailnet-broken": "invalid auth_key: environment variable tskye-auth-123 not set",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+
+	select {
+	case <-p.Started():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxy to start with partial tailnet failure")
+	}
+
+	if !p.IsReady() {
+		t.Fatal("expected IsReady() to be true when failed tailnet ports are registered suspended")
+	}
+	if got := p.ActiveListenerCount(); got != 1 {
+		t.Fatalf("expected 1 active listener (tailnet-healthy), got %d", got)
+	}
+
+	statuses := p.GetPortStatuses()
+	if len(statuses) != 3 {
+		t.Fatalf("expected 3 port statuses, got %d", len(statuses))
+	}
+	if !statuses[0].Up || statuses[0].LastError != "" {
+		t.Fatalf("expected tailnet-healthy TCP port to be UP with no error, got %+v", statuses[0])
+	}
+	if statuses[1].Up || !strings.Contains(statuses[1].LastError, "tailnet 'tailnet-broken' unavailable") {
+		t.Fatalf("expected tailnet-broken TCP port to be DOWN with unavailable error, got %+v", statuses[1])
+	}
+	if statuses[2].Up || !strings.Contains(statuses[2].LastError, "tailnet 'tailnet-broken' unavailable") {
+		t.Fatalf("expected tailnet-broken UDP port to be DOWN with unavailable error, got %+v", statuses[2])
+	}
+
+	// Simulate recovery of tailnet-broken on hot-reload
+	p.SetTailnetErrors(nil)
+	p.UpdateTailnetDialers(map[string]Dialer{
+		"tailnet-healthy": &localDialer{},
+		"tailnet-broken":  &localDialer{},
+	})
+	if err := p.ReloadConfig(ports); err != nil {
+		t.Fatalf("expected ReloadConfig on tailnet recovery to succeed, got: %v", err)
+	}
+	if got := p.ActiveListenerCount(); got != 3 {
+		t.Fatalf("expected all 3 listeners active after recovery, got %d", got)
+	}
+	statusesAfterRecovery := p.GetPortStatuses()
+	for i, st := range statusesAfterRecovery {
+		if !st.Up || st.LastError != "" {
+			t.Fatalf("expected port[%d] to be UP with empty LastError after recovery, got %+v", i, st)
+		}
+	}
+
+	// Simulate subsequent failure of tailnet-broken on hot-reload (e.g. mistyped key rotation)
+	p.SetTailnetErrors(map[string]string{
+		"tailnet-broken": "failed to start tsnet server: 401 Unauthorized",
+	})
+	p.UpdateTailnetDialers(map[string]Dialer{
+		"tailnet-healthy": &localDialer{},
+	})
+	if err := p.ReloadConfig(ports); err != nil {
+		t.Fatalf("expected ReloadConfig on tailnet failure to isolate error and succeed, got: %v", err)
+	}
+	if got := p.ActiveListenerCount(); got != 1 {
+		t.Fatalf("expected 1 active listener after tailnet-broken fails again, got %d", got)
+	}
+	// Verify tailnet-broken's TCP socket was actually unbound
+	if c, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", tcpPortBroken), 100*time.Millisecond); dialErr == nil {
+		_ = c.Close()
+		t.Fatalf("expected TCP listener on %d to be unbound when tailnet-broken fails", tcpPortBroken)
+	}
+	// Verify tailnet-healthy's TCP socket is still bound and accepting connections
+	cHealthy, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", tcpPortHealthy), 500*time.Millisecond)
+	if dialErr != nil {
+		t.Fatalf("expected TCP listener on %d (tailnet-healthy) to remain reachable, got: %v", tcpPortHealthy, dialErr)
+	}
+	_ = cHealthy.Close()
+}

@@ -397,6 +397,7 @@ type Proxy struct {
 	bufPool        *sync.Pool
 	udpBufPool     *sync.Pool
 	tailnetDialers map[string]Dialer
+	tailnetErrors  map[string]string
 
 	// Performance optimization fields
 	workerPool chan struct{}
@@ -482,6 +483,7 @@ func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, 
 		bufPool:        bufPool,
 		udpBufPool:     udpBufPool,
 		tailnetDialers: tailnetDialers,
+		tailnetErrors:  make(map[string]string),
 		workerPool:     make(chan struct{}, workerPoolSize),
 		tcpListeners:   make(map[string]*listenerInfo),
 		udpConns:       make(map[string]*listenerInfo),
@@ -574,6 +576,22 @@ func (p *Proxy) UpdateTailnetDialers(dialers map[string]Dialer) {
 	p.peerCacheMu.Lock()
 	clear(p.peerCache)
 	p.peerCacheMu.Unlock()
+}
+
+// SetTailnetErrors updates the per-tailnet initialization error map for configured tailnets
+// whose tsnet.Server failed to initialize or reinitialize. Ports mapped to a tailnet in this map
+// are registered in a suspended state (up=false, last_error populated) instead of failing startup or reload.
+func (p *Proxy) SetTailnetErrors(errs map[string]string) {
+	cp := make(map[string]string, len(errs))
+	for name, msg := range errs {
+		if trimmed := strings.TrimSpace(msg); trimmed != "" {
+			cp[name] = trimmed
+		}
+	}
+
+	p.mu.Lock()
+	p.tailnetErrors = cp
+	p.mu.Unlock()
 }
 
 // optimizeTCPConn applies TCP socket optimizations (TCP_NODELAY and 30s keepalive).
@@ -1367,7 +1385,7 @@ func (p *Proxy) ReloadConfig(newPorts []PortMapping) error {
 
 	for key, newPort := range newPortsMap {
 		if oldPort, exists := oldPortsMap[key]; exists && p.isListenerActiveLocked(oldPort) {
-			if !portsEqual(oldPort, newPort) || p.portProbingChangedLocked(key, newPort) {
+			if !portsEqual(oldPort, newPort) || p.portProbingChangedLocked(key, newPort) || p.portTailnetAvailabilityChangedLocked(key, newPort) {
 				portsToModify = append(portsToModify, newPort)
 			}
 		} else {
@@ -1509,6 +1527,43 @@ func (p *Proxy) portProbingChangedLocked(key string, newPort PortMapping) bool {
 	return false
 }
 
+func (p *Proxy) portTailnetAvailabilityChangedLocked(key string, newPort PortMapping) bool {
+	_, hasDialer := p.tailnetDialers[newPort.Tailnet]
+	initErr, hasInitErr := p.tailnetErrors[newPort.Tailnet]
+	wantErr := ""
+	if !hasDialer && hasInitErr {
+		wantErr = fmt.Sprintf("tailnet '%s' unavailable: %s", newPort.Tailnet, initErr)
+	}
+
+	if info, ok := p.tcpListeners[key]; ok {
+		info.mu.Lock()
+		bound := info.listener != nil
+		lastErr := info.lastError
+		probing := info.probing
+		info.mu.Unlock()
+		if !hasDialer && hasInitErr {
+			return bound || probing || lastErr != wantErr
+		}
+		if hasDialer && !bound && !probing {
+			return true
+		}
+	}
+	if info, ok := p.udpConns[key]; ok {
+		info.mu.Lock()
+		bound := info.conn != nil
+		lastErr := info.lastError
+		probing := info.probing
+		info.mu.Unlock()
+		if !hasDialer && hasInitErr {
+			return bound || probing || lastErr != wantErr
+		}
+		if hasDialer && !bound && !probing {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Proxy) detachListenerLocked(port PortMapping) []*listenerInfo {
 	key := port.Key()
 	var detached []*listenerInfo
@@ -1564,6 +1619,19 @@ func (p *Proxy) startListener(port PortMapping) error {
 func (p *Proxy) startTCPListener(port PortMapping, key string) error {
 	dialer, exists := p.tailnetDialers[port.Tailnet]
 	if !exists {
+		if initErr, hasInitErr := p.tailnetErrors[port.Tailnet]; hasInitErr {
+			ctx, cancel := context.WithCancel(p.ctx)
+			p.tcpListeners[key] = &listenerInfo{
+				port:      port,
+				up:        false,
+				lastError: fmt.Sprintf("tailnet '%s' unavailable: %s", port.Tailnet, initErr),
+				ctx:       ctx,
+				cancel:    cancel,
+			}
+			log.Printf("TCP listener on %s suspended because tailnet '%s' is unavailable: %s",
+				port.ListenAddr(), port.Tailnet, initErr)
+			return nil
+		}
 		return fmt.Errorf("tailnet server '%s' not found for port %d", port.Tailnet, port.Source)
 	}
 
@@ -1760,6 +1828,19 @@ func (p *Proxy) suspendTCPListener(info *listenerInfo, reason string) {
 func (p *Proxy) startUDPListener(port PortMapping, key string) error {
 	dialer, exists := p.tailnetDialers[port.Tailnet]
 	if !exists {
+		if initErr, hasInitErr := p.tailnetErrors[port.Tailnet]; hasInitErr {
+			ctx, cancel := context.WithCancel(p.ctx)
+			p.udpConns[key] = &listenerInfo{
+				port:      port,
+				up:        false,
+				lastError: fmt.Sprintf("tailnet '%s' unavailable: %s", port.Tailnet, initErr),
+				ctx:       ctx,
+				cancel:    cancel,
+			}
+			log.Printf("UDP listener on %s suspended because tailnet '%s' is unavailable: %s",
+				port.ListenAddr(), port.Tailnet, initErr)
+			return nil
+		}
 		return fmt.Errorf("tailnet server '%s' not found for port %d", port.Tailnet, port.Source)
 	}
 
@@ -1844,10 +1925,10 @@ func (p *Proxy) probeUDPUpstream(ctx context.Context, dialer Dialer, destination
 	if err == nil {
 		return nil
 	}
-	if ctx.Err() != nil {
+	if errors.Is(ctx.Err(), context.Canceled) {
 		return ctx.Err()
 	}
-	if isTimeoutError(err) {
+	if isTimeoutError(err) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return nil
 	}
 	return err

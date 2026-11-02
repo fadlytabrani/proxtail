@@ -1284,3 +1284,260 @@ proxy:
 	})
 }
 
+func TestMultiTailnetFaultIsolationOnKeyRotationAndStartup(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+	go func() {
+		for {
+			c, acceptErr := backendLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	portAlpha := getFreePort(t)
+	portBeta := getFreePort(t)
+	portBetaExtra := getFreePort(t)
+
+	// Step 1: 2 tailnets configured with valid auth keys
+	validYAML := fmt.Sprintf(`
+tailnets:
+  - profile: 'alpha'
+    hostname: 'alpha-node'
+    auth_key: 'tskey-auth-valid-alpha'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+  - profile: 'beta'
+    hostname: 'beta-node'
+    auth_key: 'tskey-auth-valid-beta'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+proxy:
+  probe:
+    enabled: false
+`, portAlpha, backendLn.Addr().String(), portBeta, backendLn.Addr().String())
+
+	if err := os.WriteFile(cfgPath, []byte(validYAML), 0o600); err != nil {
+		t.Fatalf("failed writing initial valid config: %v", err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load failed: %v", err)
+	}
+
+	tm := newTailnetManager()
+	tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+		if _, _, credErr := c.ResolveCredentials(c.Profile == "default"); credErr != nil {
+			return nil, credErr
+		}
+		if strings.Contains(c.AuthKey, "invalid") {
+			return nil, fmt.Errorf("failed to start tsnet server: 401 invalid auth key")
+		}
+		return &tsnet.Server{Hostname: c.Hostname}, nil
+	}
+	tm.cleanupFunc = func(*tsnet.Server, string) {}
+	tm.dialerForServer = func(_ string, _ *tsnet.Server) proxy.Dialer {
+		return &mockPeerDialer{}
+	}
+	defer tm.closeAll()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers, _, _, err := tm.syncTailnets(cfg.Tailnets)
+	if err != nil {
+		t.Fatalf("initial syncTailnets failed: %v", err)
+	}
+	initialPorts, err := tm.prepareInitialPorts(ctx, cfg, servers)
+	if err != nil {
+		t.Fatalf("prepareInitialPorts failed: %v", err)
+	}
+
+	proxyServer := proxy.NewProxyWithMultiTailnet(initialPorts, nil, 32*1024, 20)
+	applyTailnetServersToProxy(proxyServer, tm, servers)
+	proxyServer.SetProbeConfig(cfg.ToProxyProbeConfig())
+
+	go func() { _ = proxyServer.Start(ctx) }()
+	defer proxyServer.Stop()
+	<-proxyServer.Started()
+
+	handler := newHealthHandler(proxyServer, tm)
+
+	// Verify both tailnets and listeners are initially healthy ("ok")
+	if got := proxyServer.ActiveListenerCount(); got != 2 {
+		t.Fatalf("expected 2 active listeners initially, got %d", got)
+	}
+
+	// Step 2: Key rotation on 'alpha' with a mistyped auth_key ("tskye-auth-mistyped"),
+	// while 'beta' keeps its valid auth_key and adds an extra port.
+	mistypedRotationYAML := fmt.Sprintf(`
+tailnets:
+  - profile: 'alpha'
+    hostname: 'alpha-node'
+    auth_key: 'tskye-auth-mistyped'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+  - profile: 'beta'
+    hostname: 'beta-node'
+    auth_key: 'tskey-auth-valid-beta'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+proxy:
+  probe:
+    enabled: false
+`, portAlpha, backendLn.Addr().String(), portBeta, backendLn.Addr().String(), portBetaExtra, backendLn.Addr().String())
+
+	if err := os.WriteFile(cfgPath, []byte(mistypedRotationYAML), 0o600); err != nil {
+		t.Fatalf("failed writing mistyped rotation config: %v", err)
+	}
+
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("expected reloadConfig to isolate failed tailnet 'alpha' and succeed for healthy tailnet 'beta', got error: %v", err)
+	}
+
+	// Verify 'beta' has both of its listeners active (2 listeners) while 'alpha' is unbound
+	if got := proxyServer.ActiveListenerCount(); got != 2 {
+		t.Fatalf("expected 2 active listeners on healthy tailnet 'beta', got %d", got)
+	}
+	if c, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", portAlpha), 100*time.Millisecond); dialErr == nil {
+		_ = c.Close()
+		t.Fatalf("expected failed tailnet 'alpha' port %d to be unbound", portAlpha)
+	}
+	for _, pBeta := range []int{portBeta, portBetaExtra} {
+		c, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pBeta), 500*time.Millisecond)
+		if dialErr != nil {
+			t.Fatalf("expected healthy tailnet 'beta' port %d to accept connections, got: %v", pBeta, dialErr)
+		}
+		_ = c.Close()
+	}
+
+	// Verify /healthz reports 200 OK ("degraded") with 'alpha' in BackendState "Error" and 'beta' healthy
+	recDegraded := httptest.NewRecorder()
+	handler.ServeHTTP(recDegraded, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recDegraded.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK when healthy tailnet 'beta' is active, got %d", recDegraded.Code)
+	}
+	var hrDegraded healthResponse
+	if err := json.Unmarshal(recDegraded.Body.Bytes(), &hrDegraded); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
+	}
+	if hrDegraded.Status != "degraded" || hrDegraded.ActiveListeners != 2 || len(hrDegraded.Tailnets) != 2 {
+		t.Fatalf("expected degraded status with 2 tailnets and 2 active listeners, got %+v", hrDegraded)
+	}
+	if hrDegraded.Tailnets[0].Profile != "alpha" || hrDegraded.Tailnets[0].Self.BackendState != "Error" || len(hrDegraded.Tailnets[0].Self.HealthWarnings) == 0 {
+		t.Fatalf("expected tailnet 'alpha' to report BackendState 'Error' with health_warnings, got %+v", hrDegraded.Tailnets[0])
+	}
+
+	// Step 3: Fix 'alpha' auth_key and reload -> 'alpha' recovers and re-binds its listener; /healthz returns "ok"
+	recoveredYAML := fmt.Sprintf(`
+tailnets:
+  - profile: 'alpha'
+    hostname: 'alpha-node'
+    auth_key: 'tskey-auth-rotated-alpha'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+  - profile: 'beta'
+    hostname: 'beta-node'
+    auth_key: 'tskey-auth-valid-beta'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+proxy:
+  probe:
+    enabled: false
+`, portAlpha, backendLn.Addr().String(), portBeta, backendLn.Addr().String(), portBetaExtra, backendLn.Addr().String())
+
+	if err := os.WriteFile(cfgPath, []byte(recoveredYAML), 0o600); err != nil {
+		t.Fatalf("failed writing recovered config: %v", err)
+	}
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("expected reloadConfig after fixing 'alpha' auth_key to succeed, got: %v", err)
+	}
+	if got := proxyServer.ActiveListenerCount(); got != 3 {
+		t.Fatalf("expected all 3 listeners active after 'alpha' recovery, got %d", got)
+	}
+	recRecovered := httptest.NewRecorder()
+	handler.ServeHTTP(recRecovered, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recRecovered.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 OK after recovery, got %d", recRecovered.Code)
+	}
+	var hrRecovered healthResponse
+	if err := json.Unmarshal(recRecovered.Body.Bytes(), &hrRecovered); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
+	}
+	if hrRecovered.Status != "ok" || hrRecovered.ActiveListeners != 3 {
+		t.Fatalf("expected status 'ok' and 3 active listeners after recovery, got %+v", hrRecovered)
+	}
+
+	// Step 4: Verify that if ALL configured tailnets fail initialization, /healthz returns 503 Service Unavailable ("down")
+	allBrokenYAML := `
+tailnets:
+  - profile: 'alpha'
+    hostname: 'alpha-node'
+    auth_key: 'tskey-auth-invalid-1'
+    auto_proxy_vips: false
+  - profile: 'beta'
+    hostname: 'beta-node'
+    auth_key: 'tskey-auth-invalid-2'
+    auto_proxy_vips: false
+proxy:
+  probe:
+    enabled: false
+`
+	if err := os.WriteFile(cfgPath, []byte(allBrokenYAML), 0o600); err != nil {
+		t.Fatalf("failed writing all-broken config: %v", err)
+	}
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("expected reloadConfig when all tailnets fail init not to crash reload, got: %v", err)
+	}
+	recAllBroken := httptest.NewRecorder()
+	handler.ServeHTTP(recAllBroken, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recAllBroken.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected /healthz 503 Service Unavailable when all configured tailnets fail initialization, got %d", recAllBroken.Code)
+	}
+	var hrAllBroken healthResponse
+	if err := json.Unmarshal(recAllBroken.Body.Bytes(), &hrAllBroken); err != nil {
+		t.Fatalf("failed decoding /healthz: %v", err)
+	}
+	if hrAllBroken.Status != "down" || len(hrAllBroken.Tailnets) != 2 {
+		t.Fatalf("expected status 'down' with 2 error tailnets, got %+v", hrAllBroken)
+	}
+}
+

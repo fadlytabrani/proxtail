@@ -49,6 +49,7 @@ type tailnetManager struct {
 	reloadMu        sync.Mutex
 	servers         map[string]*tsnet.Server
 	configs         map[string]config.TailnetConfig
+	initErrors      map[string]string
 	initFunc        func(config.TailnetConfig) (*tsnet.Server, error)
 	cleanupFunc     func(*tsnet.Server, string)
 	dialerForServer func(string, *tsnet.Server) proxy.Dialer
@@ -78,6 +79,7 @@ func newTailnetManager() *tailnetManager {
 	return &tailnetManager{
 		servers:         make(map[string]*tsnet.Server),
 		configs:         make(map[string]config.TailnetConfig),
+		initErrors:      make(map[string]string),
 		initFunc:        initializeServer,
 		cleanupFunc:     cleanupTailnetServer,
 		vipDiscoverFunc: defaultDiscoverVIPServices,
@@ -268,6 +270,13 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
+	if tm.initErrors == nil {
+		tm.initErrors = make(map[string]string)
+	}
+
+	prevConfigs := maps.Clone(tm.configs)
+	prevInitErrors := maps.Clone(tm.initErrors)
+
 	newConfigs := make(map[string]config.TailnetConfig, len(tailnets))
 	for _, t := range tailnets {
 		newConfigs[t.Profile] = t
@@ -275,6 +284,7 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 
 	addedServers := make(map[string]*tsnet.Server)
 	restartedTailnets := make(map[string]bool)
+	reinitializingTailnets := make(map[string]bool)
 	removedServers := make(map[string]*tsnet.Server)
 	removedConfigs := make(map[string]config.TailnetConfig)
 
@@ -298,7 +308,12 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 			tm.cleanupFunc(existingSrv, t.Profile)
 			delete(tm.servers, t.Profile)
 			delete(tm.configs, t.Profile)
+			delete(tm.initErrors, t.Profile)
+			reinitializingTailnets[t.Profile] = true
 			tasks = append(tasks, initTask{cfg: t, restart: true})
+		} else {
+			tm.configs[t.Profile] = t
+			delete(tm.initErrors, t.Profile)
 		}
 	}
 
@@ -325,29 +340,23 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 		}
 		wg.Wait()
 
-		var firstErr error
 		for _, res := range results {
 			if res.err != nil {
-				if firstErr == nil {
-					if res.restart {
-						firstErr = fmt.Errorf("failed to reinitialize tailnet '%s': %w", res.name, res.err)
-					} else {
-						firstErr = fmt.Errorf("failed to initialize tailnet '%s': %w", res.name, res.err)
-					}
+				if res.restart {
+					log.Printf("ERROR: failed to reinitialize tailnet '%s': %v (isolating failure; healthy tailnets unaffected)", res.name, res.err)
+				} else {
+					log.Printf("ERROR: failed to initialize tailnet '%s': %v (isolating failure; healthy tailnets unaffected)", res.name, res.err)
 				}
+				tm.initErrors[res.name] = res.err.Error()
+				tm.configs[res.name] = newConfigs[res.name]
+				delete(tm.servers, res.name)
 				continue
 			}
+			delete(tm.initErrors, res.name)
 			addedServers[res.name] = res.srv
 			if res.restart {
 				restartedTailnets[res.name] = true
 			}
-		}
-
-		if firstErr != nil {
-			for name, started := range addedServers {
-				tm.cleanupFunc(started, name)
-			}
-			return nil, nil, nil, nil, firstErr
 		}
 	}
 
@@ -364,6 +373,18 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 			removedConfigs[name] = tm.configs[name]
 			delete(tm.servers, name)
 			delete(tm.configs, name)
+			delete(tm.initErrors, name)
+		}
+	}
+	for name := range tm.configs {
+		if _, exists := newConfigs[name]; !exists {
+			delete(tm.configs, name)
+			delete(tm.initErrors, name)
+		}
+	}
+	for name := range tm.initErrors {
+		if _, exists := newConfigs[name]; !exists {
+			delete(tm.initErrors, name)
 		}
 	}
 
@@ -392,6 +413,30 @@ func (tm *tailnetManager) syncTailnetsWithRollback(tailnets []config.TailnetConf
 				tm.servers[name] = srv
 				tm.configs[name] = removedConfigs[name]
 			}
+			for name := range newConfigs {
+				if reinitializingTailnets[name] {
+					continue
+				}
+				if oldCfg, existed := prevConfigs[name]; existed {
+					tm.configs[name] = oldCfg
+					if oldErr, hadErr := prevInitErrors[name]; hadErr {
+						tm.initErrors[name] = oldErr
+					} else {
+						delete(tm.initErrors, name)
+					}
+				} else {
+					delete(tm.configs, name)
+					delete(tm.initErrors, name)
+				}
+			}
+			for name, oldCfg := range prevConfigs {
+				if _, exists := newConfigs[name]; !exists {
+					tm.configs[name] = oldCfg
+					if oldErr, hadErr := prevInitErrors[name]; hadErr {
+						tm.initErrors[name] = oldErr
+					}
+				}
+			}
 			tm.mu.Unlock()
 		})
 	}
@@ -404,6 +449,37 @@ func (tm *tailnetManager) snapshotServers() map[string]*tsnet.Server {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	return maps.Clone(tm.servers)
+}
+
+// snapshotConfigs returns a thread-safe copy of the configured tailnet configs.
+func (tm *tailnetManager) snapshotConfigs() map[string]config.TailnetConfig {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return maps.Clone(tm.configs)
+}
+
+// snapshotInitErrors returns a thread-safe copy of the per-tailnet initialization errors.
+func (tm *tailnetManager) snapshotInitErrors() map[string]string {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return maps.Clone(tm.initErrors)
+}
+
+// isConfiguredTailnet reports whether the given tailnet profile is currently configured
+// (either running in tm.servers or tracked in tm.configs / tm.initErrors).
+func (tm *tailnetManager) isConfiguredTailnet(name string) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if _, ok := tm.servers[name]; ok {
+		return true
+	}
+	if _, ok := tm.configs[name]; ok {
+		return true
+	}
+	if _, ok := tm.initErrors[name]; ok {
+		return true
+	}
+	return false
 }
 
 // closeAll shuts down all managed tsnet.Server instances.
@@ -419,10 +495,13 @@ func (tm *tailnetManager) closeAll() {
 		delete(tm.servers, name)
 		delete(tm.configs, name)
 	}
+	clear(tm.configs)
+	clear(tm.initErrors)
 	log.Println("All tailnet servers cleaned up")
 }
 
 func applyTailnetServersToProxy(proxyServer *proxy.Proxy, tm *tailnetManager, servers map[string]*tsnet.Server) {
+	proxyServer.SetTailnetErrors(tm.snapshotInitErrors())
 	if tm.dialerForServer != nil {
 		dialers := make(map[string]proxy.Dialer, len(servers))
 		for name, srv := range servers {
@@ -452,7 +531,7 @@ func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManage
 	}
 
 	for _, mapping := range manualMappings {
-		if _, exists := servers[mapping.Tailnet]; !exists {
+		if !tm.isConfiguredTailnet(mapping.Tailnet) {
 			rollbackTailnets()
 			return fmt.Errorf("port mapping for port %d references unknown tailnet '%s'", mapping.Source, mapping.Tailnet)
 		}
@@ -633,6 +712,17 @@ func computeHealthStatus(isReady bool, configuredPorts int, activeListeners int,
 	if configuredPorts > 0 && (len(tailnets) == 0 || activeListeners == 0) {
 		return "down", http.StatusServiceUnavailable
 	}
+	if len(tailnets) > 0 {
+		errorTailnets := 0
+		for _, tn := range tailnets {
+			if tn.Self.BackendState == "Error" {
+				errorTailnets++
+			}
+		}
+		if errorTailnets == len(tailnets) {
+			return "down", http.StatusServiceUnavailable
+		}
+	}
 
 	for _, ps := range ports {
 		if !ps.Up {
@@ -659,9 +749,22 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		activeListeners := proxyServer.ActiveListenerCount()
 		isReady := proxyServer.IsReady()
 		servers := tm.snapshotServers()
+		configs := tm.snapshotConfigs()
+		initErrors := tm.snapshotInitErrors()
 
-		names := make([]string, 0, len(servers))
+		nameSet := make(map[string]struct{}, len(servers)+len(configs)+len(initErrors))
 		for name := range servers {
+			nameSet[name] = struct{}{}
+		}
+		for name := range configs {
+			nameSet[name] = struct{}{}
+		}
+		for name := range initErrors {
+			nameSet[name] = struct{}{}
+		}
+
+		names := make([]string, 0, len(nameSet))
+		for name := range nameSet {
 			names = append(names, name)
 		}
 		sort.Strings(names)
@@ -672,26 +775,35 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 			i, name := i, name
 			srv := servers[name]
 			st := healthTailnetStatus{Profile: name}
-			if srv != nil {
-				st.Self.HostName = srv.Hostname
-				if srv.Sys() != nil || tm.healthDiscoverFunc != nil {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						details := tm.getCachedTailnetDetails(r.Context(), name, srv)
-						if details.Self.HostName == "" {
-							details.Self.HostName = srv.Hostname
-						}
-						st.TailnetName = details.TailnetName
-						st.MagicDNSSuffix = details.MagicDNSSuffix
-						st.MagicDNSEnabled = details.MagicDNSEnabled
-						st.Self = details.Self
-						st.VIPServices = details.VIPServices
-						st.Peers = details.Peers
-						tailnets[i] = st
-					}()
-					continue
+			if srv == nil {
+				if cfg, ok := configs[name]; ok {
+					st.Self.HostName = cfg.Hostname
 				}
+				if initErr := initErrors[name]; initErr != "" {
+					st.Self.BackendState = "Error"
+					st.Self.HealthWarnings = []string{initErr}
+				}
+				tailnets[i] = st
+				continue
+			}
+			st.Self.HostName = srv.Hostname
+			if srv.Sys() != nil || tm.healthDiscoverFunc != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					details := tm.getCachedTailnetDetails(r.Context(), name, srv)
+					if details.Self.HostName == "" {
+						details.Self.HostName = srv.Hostname
+					}
+					st.TailnetName = details.TailnetName
+					st.MagicDNSSuffix = details.MagicDNSSuffix
+					st.MagicDNSEnabled = details.MagicDNSEnabled
+					st.Self = details.Self
+					st.VIPServices = details.VIPServices
+					st.Peers = details.Peers
+					tailnets[i] = st
+				}()
+				continue
 			}
 			tailnets[i] = st
 		}
@@ -964,7 +1076,7 @@ func main() {
 	}
 
 	for _, mapping := range portMappings {
-		if _, exists := tailnetServers[mapping.Tailnet]; !exists {
+		if !tm.isConfiguredTailnet(mapping.Tailnet) {
 			tm.closeAll()
 			log.Fatalf("Port mapping for port %d references unknown tailnet '%s'", mapping.Source, mapping.Tailnet)
 		}
@@ -982,6 +1094,7 @@ func main() {
 		cfg.Proxy.BufferSize*1024,
 		cfg.Proxy.WorkerPoolSize,
 	)
+	proxyServer.SetTailnetErrors(tm.snapshotInitErrors())
 	proxyServer.SetProbeConfig(cfg.ToProxyProbeConfig())
 
 	if cfg.Proxy.APIPort > 0 {
@@ -993,12 +1106,14 @@ func main() {
 
 	fmt.Printf("Starting proxtail with %d tailnets, %d workers, %dKB buffers...\n",
 		len(tailnetServers), cfg.Proxy.WorkerPoolSize, cfg.Proxy.BufferSize)
-	if len(tailnetServers) == 0 {
+	if len(cfg.Tailnets) == 0 {
 		if cfg.Proxy.APIPort > 0 {
 			log.Printf("Running in standby mode (0 tailnets configured; health server active on :%d)", cfg.Proxy.APIPort)
 		} else {
 			log.Printf("Running in standby mode (0 tailnets configured)")
 		}
+	} else if len(tailnetServers) == 0 {
+		log.Printf("WARNING: 0 of %d configured tailnets initialized successfully; waiting for configuration reload", len(cfg.Tailnets))
 	} else if len(initialPorts) == 0 {
 		if cfg.Proxy.APIPort > 0 {
 			log.Printf("Running in tailnet discovery mode (0 port mappings configured; health & discovery active on :%d)", cfg.Proxy.APIPort)

@@ -401,6 +401,7 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 		svcs map[tailcfg.ServiceName]tailcfg.ServiceDetails
 		err  error
 	}
+	initErrors := tm.snapshotInitErrors()
 	results := make([]discoverResult, len(cfg.Tailnets))
 	var wg sync.WaitGroup
 	for i, tailnetCfg := range cfg.Tailnets {
@@ -410,6 +411,9 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 		idx := i
 		tName := tailnetCfg.Profile
 		srv := servers[tName]
+		if srv == nil && initErrors[tName] != "" {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -436,7 +440,12 @@ func (tm *tailnetManager) computeVIPMappingsLocked(
 					svcs = prev
 				}
 			} else {
-				return nil, nil, nil, nil, fmt.Errorf("discovering VIP services for tailnet '%s': %w", tailnetCfg.Profile, dErr)
+				log.Printf("Warning: discovering VIP services for tailnet '%s' failed: %v (isolating failure; other tailnets unaffected)", tailnetCfg.Profile, dErr)
+				if !isInitial && servers[tailnetCfg.Profile] != nil {
+					if prev, ok := tm.lastTailnetVIPs[tailnetCfg.Profile]; ok {
+						svcs = prev
+					}
+				}
 			}
 		}
 		if len(svcs) > 0 {

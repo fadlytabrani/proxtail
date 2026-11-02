@@ -8,6 +8,17 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-02
+
+### Fixed
+- **Multi-Tailnet Fault Isolation on Startup & Key Rotation** ([#22](https://github.com/fadlytabrani/proxtail/issues/22)):
+  - Isolated per-tailnet initialization and re-initialization failures in `tailnetManager.syncTailnetsWithRollback` (`initErrors`) so an invalid or mistyped `auth_key` on one tailnet during startup or hot-reload key rotation no longer tears down healthy tailnets or aborts configuration reloads.
+  - Added per-tailnet listener availability tracking (`Proxy.SetTailnetErrors` and `portTailnetAvailabilityChangedLocked`) so TCP and UDP listeners belonging to an unavailable tailnet are cleanly suspended (`up: false`, `last_error: "tailnet '<profile>' unavailable: ..."`) while healthy tailnets continue forwarding traffic and accepting configuration changes, automatically re-binding when the tailnet's `auth_key` is corrected on a subsequent reload.
+  - Isolated per-tailnet VIP auto-discovery failures in `computeVIPMappingsLocked` so an unavailable tailnet does not abort VIP service reconciliation for healthy tailnets.
+  - Surfaced failed configured tailnets in `GET /healthz` under `tailnets[]` with `self.backend_state: "Error"` and the initialization error in `self.health_warnings`, reporting overall status `"degraded"` (`200 OK`) when at least one healthy tailnet/listener is up or `"down"` (`503 Service Unavailable`) when all configured tailnets fail.
+- **UDP Active Probing Deadline Race**:
+  - Fixed a race condition in `probeUDPUpstream` when `probe.timeout <= 500ms` where `context.DeadlineExceeded` firing at the end of the post-write ICMP `ECONNREFUSED` wait window was treated as an upstream failure instead of a healthy UDP probe timeout.
+
 ## [0.5.0] - 2026-10-31
 
 ### Changed
