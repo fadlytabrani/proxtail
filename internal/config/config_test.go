@@ -1356,3 +1356,48 @@ tailnets:
 		})
 	}
 }
+
+func TestParseIsEmptyDocument(t *testing.T) {
+	emptyCases := []struct {
+		name string
+		yaml string
+	}{
+		{name: "zero bytes", yaml: ""},
+		{name: "whitespace only", yaml: "   \n\t  \n"},
+		{name: "comments only", yaml: "# standby config\n# no YAML document\n"},
+	}
+	for _, tc := range emptyCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !cfg.IsEmptyDocument {
+				t.Fatalf("expected IsEmptyDocument=true for %q, got false", tc.name)
+			}
+			if len(cfg.Tailnets) != 0 {
+				t.Fatalf("expected 0 tailnets, got %d", len(cfg.Tailnets))
+			}
+		})
+	}
+
+	nonEmptyCases := []struct {
+		name string
+		yaml string
+	}{
+		{name: "explicit empty tailnets slice", yaml: "tailnets: []\n"},
+		{name: "proxy settings only", yaml: "proxy:\n  api_port: 8080\n"},
+		{name: "configured tailnet", yaml: "tailnets:\n  - profile: 'prod'\n"},
+	}
+	for _, tc := range nonEmptyCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.IsEmptyDocument {
+				t.Fatalf("expected IsEmptyDocument=false for %q, got true", tc.name)
+			}
+		})
+	}
+}

@@ -3005,3 +3005,43 @@ func TestProxySetTailnetErrorsIsolatesFailedTailnetPorts(t *testing.T) {
 	}
 	_ = cHealthy.Close()
 }
+
+func TestUpdateTailnetDialersPreservesUnchangedPeerCache(t *testing.T) {
+	dialerAlpha1 := &tsnet.Server{Hostname: "alpha-1"}
+	dialerAlpha2 := &tsnet.Server{Hostname: "alpha-2"}
+	dialerBeta := &tsnet.Server{Hostname: "beta"}
+
+	p := NewProxyWithDialers(nil, map[string]Dialer{
+		"alpha": dialerAlpha1,
+		"beta":  dialerBeta,
+	}, 1024, 1)
+
+	now := time.Now()
+	p.peerCacheMu.Lock()
+	p.peerCache[dialerAlpha1] = peerStatusSnapshot{
+		peers:     map[string]bool{"100.64.0.1": true},
+		expiresAt: now.Add(time.Minute),
+	}
+	p.peerCache[dialerBeta] = peerStatusSnapshot{
+		peers:     map[string]bool{"100.64.0.2": true},
+		expiresAt: now.Add(time.Minute),
+	}
+	p.peerCacheMu.Unlock()
+
+	p.UpdateTailnetDialers(map[string]Dialer{
+		"alpha": dialerAlpha2,
+		"beta":  dialerBeta,
+	})
+
+	p.peerCacheMu.Lock()
+	_, alpha1Cached := p.peerCache[dialerAlpha1]
+	_, betaCached := p.peerCache[dialerBeta]
+	p.peerCacheMu.Unlock()
+
+	if alpha1Cached {
+		t.Fatal("expected replaced dialerAlpha1 to be evicted from peerCache")
+	}
+	if !betaCached {
+		t.Fatal("expected unchanged dialerBeta to remain in peerCache")
+	}
+}

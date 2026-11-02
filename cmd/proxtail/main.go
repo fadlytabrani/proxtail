@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -513,14 +514,95 @@ func applyTailnetServersToProxy(proxyServer *proxy.Proxy, tm *tailnetManager, se
 	}
 }
 
+var (
+	configWatchDebounce       = 200 * time.Millisecond
+	configReloadRetryAttempts = 6
+	configReloadRetryInterval = 50 * time.Millisecond
+	configReloadSettleDelay   = 50 * time.Millisecond
+)
+
+func configRemovesExistingTailnet(existing map[string]config.TailnetConfig, next []config.TailnetConfig) bool {
+	if len(existing) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(next))
+	for _, t := range next {
+		seen[t.Profile] = struct{}{}
+	}
+	for name := range existing {
+		if _, ok := seen[name]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// loadConfigForReload reads and parses configFile during a live hot-reload, retrying through
+// transient save states (such as O_TRUNC 0-byte truncation, atomic unlink-then-create, or
+// multi-chunk writes) so active tailnets are never torn down by an intermediate file state.
+func loadConfigForReload(configFile string, tm *tailnetManager) (*config.Config, error) {
+	existingConfigs := tm.snapshotConfigs()
+	hasActiveTailnets := len(existingConfigs) > 0
+	attempts := max(1, configReloadRetryAttempts)
+
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 && configReloadRetryInterval > 0 {
+			time.Sleep(configReloadRetryInterval)
+		}
+
+		rawBytes, err := os.ReadFile(configFile)
+		if err != nil {
+			lastErr = fmt.Errorf("reading config file %s: %w", configFile, err)
+			continue
+		}
+
+		cfg, err := config.Parse(rawBytes)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if cfg.IsEmptyDocument && hasActiveTailnets {
+			lastErr = fmt.Errorf("refusing to reload empty/truncated config file %s while %d tailnet(s) are configured (use 'tailnets: []' to explicitly remove all tailnets)", configFile, len(existingConfigs))
+			continue
+		}
+
+		if hasActiveTailnets && configReloadSettleDelay > 0 && configRemovesExistingTailnet(existingConfigs, cfg.Tailnets) {
+			time.Sleep(configReloadSettleDelay)
+			settledBytes, readErr := os.ReadFile(configFile)
+			if readErr != nil {
+				lastErr = fmt.Errorf("reading config file %s: %w", configFile, readErr)
+				continue
+			}
+			if !bytes.Equal(rawBytes, settledBytes) {
+				settledCfg, parseErr := config.Parse(settledBytes)
+				if parseErr != nil {
+					lastErr = parseErr
+					continue
+				}
+				if settledCfg.IsEmptyDocument {
+					lastErr = fmt.Errorf("refusing to reload empty/truncated config file %s while %d tailnet(s) are configured (use 'tailnets: []' to explicitly remove all tailnets)", configFile, len(existingConfigs))
+					continue
+				}
+				return settledCfg, nil
+			}
+		}
+
+		return cfg, nil
+	}
+
+	return nil, fmt.Errorf("failed to load new config: %w", lastErr)
+}
+
 // reloadConfig loads and validates the updated configuration and applies it to the running proxy.
 func reloadConfig(configFile string, proxyServer *proxy.Proxy, tm *tailnetManager) error {
 	tm.reloadMu.Lock()
 	defer tm.reloadMu.Unlock()
 
-	newCfg, err := config.Load(configFile)
+	newCfg, err := loadConfigForReload(configFile, tm)
 	if err != nil {
-		return fmt.Errorf("failed to load new config: %w", err)
+		return err
 	}
 
 	manualMappings := newCfg.ToProxyPortMappings()
@@ -647,13 +729,15 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 			if !ok {
 				return
 			}
-			// Trigger reload on direct config file modifications or Kubernetes ConfigMap symlink swaps ("..data")
+			// Trigger reload on direct config file modifications or Kubernetes ConfigMap symlink swaps ("..data").
+			// Ignore bare Remove events because editors that save via unlink+create emit Remove before Create;
+			// triggering on Create/Write/Rename avoids starting the debounce timer while the file is unlinked.
 			base := filepath.Base(event.Name)
 			if (base == configBase || base == "..data") &&
-				event.Has(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) {
+				event.Has(fsnotify.Write|fsnotify.Create|fsnotify.Rename) {
 				log.Printf("Config file change detected (%s on %s), scheduling reload...", event.Op, base)
 				if debounceTimer == nil {
-					debounceTimer = time.NewTimer(100 * time.Millisecond)
+					debounceTimer = time.NewTimer(configWatchDebounce)
 					debounceC = debounceTimer.C
 				} else {
 					if !debounceTimer.Stop() {
@@ -662,7 +746,7 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 						default:
 						}
 					}
-					debounceTimer.Reset(100 * time.Millisecond)
+					debounceTimer.Reset(configWatchDebounce)
 				}
 			}
 		case <-debounceC:

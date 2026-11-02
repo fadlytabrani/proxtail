@@ -271,8 +271,9 @@ func (p ProxySettings) EffectiveAPIListenAddress() string {
 
 // Config defines the structure for the YAML configuration file.
 type Config struct {
-	Tailnets []TailnetConfig `yaml:"tailnets"`
-	Proxy    ProxySettings   `yaml:"proxy"`
+	Tailnets        []TailnetConfig `yaml:"tailnets"`
+	Proxy           ProxySettings   `yaml:"proxy"`
+	IsEmptyDocument bool            `yaml:"-"`
 }
 
 func sanitizeEnvSuffix(tailnetName string) string {
@@ -312,10 +313,17 @@ func Load(file string) (*Config, error) {
 func Parse(data []byte) (*Config, error) {
 	expanded := os.ExpandEnv(string(data))
 	var cfg Config
-	dec := yaml.NewDecoder(strings.NewReader(expanded))
-	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("parsing config YAML: %w", err)
+	if strings.TrimSpace(expanded) == "" {
+		cfg.IsEmptyDocument = true
+	} else {
+		dec := yaml.NewDecoder(strings.NewReader(expanded))
+		dec.KnownFields(true)
+		if err := dec.Decode(&cfg); err != nil {
+			if !errors.Is(err, io.EOF) {
+				return nil, fmt.Errorf("parsing config YAML: %w", err)
+			}
+			cfg.IsEmptyDocument = true
+		}
 	}
 
 	ApplyDefaults(&cfg)

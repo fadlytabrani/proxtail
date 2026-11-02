@@ -8,6 +8,20 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-02
+
+### Fixed
+- **Resilient Live `config.yaml` Hot-Reload & Non-Disruptive Single-Tailnet Key Rotation** ([#23](https://github.com/fadlytabrani/proxtail/issues/23)):
+  - Added `Config.IsEmptyDocument` (`yaml:"-"`) in `internal/config/config.go` so `LoadConfig` distinguishes a `0`-byte / whitespace-only file caught mid-truncation (`O_TRUNC`) from an explicit Standby Mode configuration (`tailnets: []`).
+  - Added `loadConfigForReload` and `configRemovesExistingTailnet` in `cmd/proxtail/main.go` with bounded retry/backoff (`6 x 50ms`) across transient `O_TRUNC` empty files, `ENOENT` atomic rename gaps, and partial chunked YAML writes, plus a `50ms` settle verification when an existing tailnet profile disappears from the reloaded configuration.
+  - Updated `startConfigWatcher` in `cmd/proxtail/main.go` to ignore bare `fsnotify.Remove` events and coalesce `Write | Create | Rename` bursts over a `200ms` debounce window (`configWatchDebounce`).
+  - Updated `Proxy.UpdateTailnetDialers` in `internal/proxy/proxy.go` to selectively evict `peerCache` entries only for removed or replaced `Dialer` instances, keeping peer status caches warm for unchanged tailnets during single-tailnet reloads.
+
+### Changed
+- **Dependencies & CI/CD**:
+  - Upgraded `tailscale.com` from `v1.104.2` to `v1.104.4` ([#21](https://github.com/fadlytabrani/proxtail/pull/21)).
+  - Upgraded `docker/login-action` from `v4.6.0` to `v4.7.0` ([#20](https://github.com/fadlytabrani/proxtail/pull/20)).
+
 ## [0.5.1] - 2026-11-02
 
 ### Fixed

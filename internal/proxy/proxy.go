@@ -561,11 +561,15 @@ func (p *Proxy) UpdateTailnetServers(tailnetServers map[string]*tsnet.Server) {
 }
 
 // UpdateTailnetDialers updates the active tailnet dialers map during a configuration reload.
+// Cached peer online snapshots for unchanged Dialer instances are preserved so unaffected
+// tailnets do not experience a cache flush when another tailnet is updated.
 func (p *Proxy) UpdateTailnetDialers(dialers map[string]Dialer) {
 	cp := make(map[string]Dialer, len(dialers))
+	activeDialers := make(map[Dialer]struct{}, len(dialers))
 	for name, d := range dialers {
 		if d != nil {
 			cp[name] = d
+			activeDialers[d] = struct{}{}
 		}
 	}
 
@@ -574,7 +578,11 @@ func (p *Proxy) UpdateTailnetDialers(dialers map[string]Dialer) {
 	p.mu.Unlock()
 
 	p.peerCacheMu.Lock()
-	clear(p.peerCache)
+	for d := range p.peerCache {
+		if _, ok := activeDialers[d]; !ok {
+			delete(p.peerCache, d)
+		}
+	}
 	p.peerCacheMu.Unlock()
 }
 

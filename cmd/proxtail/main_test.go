@@ -1541,3 +1541,249 @@ proxy:
 	}
 }
 
+func TestHotReloadSingleTailnetKeyChangeDoesNotResetOtherTailnets(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+	go func() {
+		for {
+			conn, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Write([]byte("ok"))
+			_ = conn.Close()
+		}
+	}()
+
+	portAlpha := getFreePort(t)
+	portBeta := getFreePort(t)
+
+	var (
+		mu           sync.Mutex
+		initCount    = make(map[string]int)
+		cleanupCount = make(map[string]int)
+	)
+
+	tm := newTailnetManager()
+	tm.initFunc = func(tc config.TailnetConfig) (*tsnet.Server, error) {
+		mu.Lock()
+		initCount[tc.Profile]++
+		mu.Unlock()
+		return &tsnet.Server{Hostname: tc.Hostname}, nil
+	}
+	tm.cleanupFunc = func(_ *tsnet.Server, name string) {
+		mu.Lock()
+		cleanupCount[name]++
+		mu.Unlock()
+	}
+	tm.dialerForServer = func(_ string, _ *tsnet.Server) proxy.Dialer {
+		return &mockPeerDialer{}
+	}
+	defer tm.closeAll()
+
+	origDebounce := configWatchDebounce
+	origAttempts := configReloadRetryAttempts
+	origInterval := configReloadRetryInterval
+	origSettle := configReloadSettleDelay
+	configWatchDebounce = 30 * time.Millisecond
+	configReloadRetryAttempts = 8
+	configReloadRetryInterval = 20 * time.Millisecond
+	configReloadSettleDelay = 40 * time.Millisecond
+	defer func() {
+		configWatchDebounce = origDebounce
+		configReloadRetryAttempts = origAttempts
+		configReloadRetryInterval = origInterval
+		configReloadSettleDelay = origSettle
+	}()
+
+	cfgDir := t.TempDir()
+	cfgPath := filepath.Join(cfgDir, "config.yaml")
+
+	makeConfigYAML := func(alphaKey, betaKey string) string {
+		return fmt.Sprintf(`
+tailnets:
+  - profile: 'alpha'
+    hostname: 'alpha-node'
+    auth_key: '%s'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+  - profile: 'beta'
+    hostname: 'beta-node'
+    auth_key: '%s'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+proxy:
+  probe:
+    enabled: false
+`, alphaKey, portAlpha, backendLn.Addr().String(), betaKey, portBeta, backendLn.Addr().String())
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(makeConfigYAML("tskey-alpha-1", "tskey-beta-1")), 0o600); err != nil {
+		t.Fatalf("failed writing initial config: %v", err)
+	}
+	initialCfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("failed loading initial config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	servers, _, _, err := tm.syncTailnets(initialCfg.Tailnets)
+	if err != nil {
+		t.Fatalf("initial syncTailnets failed: %v", err)
+	}
+	initialPorts, err := tm.prepareInitialPorts(ctx, initialCfg, servers)
+	if err != nil {
+		t.Fatalf("prepareInitialPorts failed: %v", err)
+	}
+
+	proxyServer := proxy.NewProxyWithMultiTailnet(initialPorts, nil, 32*1024, 20)
+	applyTailnetServersToProxy(proxyServer, tm, servers)
+	proxyServer.SetProbeConfig(initialCfg.ToProxyProbeConfig())
+
+	go func() { _ = proxyServer.Start(ctx) }()
+	defer proxyServer.Stop()
+	<-proxyServer.Started()
+
+	// Step 1: Simulate an editor saving config.yaml via O_TRUNC (0 bytes initially) followed by writing
+	// the updated YAML with a rotated auth_key for 'alpha' 35ms later while reloadConfig is running.
+	if err := os.Truncate(cfgPath, 0); err != nil {
+		t.Fatalf("failed truncating config file: %v", err)
+	}
+	go func() {
+		time.Sleep(35 * time.Millisecond)
+		_ = os.WriteFile(cfgPath, []byte(makeConfigYAML("tskey-alpha-2", "tskey-beta-1")), 0o600)
+	}()
+
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("reloadConfig during truncate-then-write failed: %v", err)
+	}
+
+	mu.Lock()
+	if cleanupCount["beta"] != 0 || initCount["beta"] != 1 {
+		mu.Unlock()
+		t.Fatalf("expected 'beta' tailnet to be untouched (cleanup=0, init=1), got cleanup=%d init=%d", cleanupCount["beta"], initCount["beta"])
+	}
+	if cleanupCount["alpha"] != 1 || initCount["alpha"] != 2 {
+		mu.Unlock()
+		t.Fatalf("expected 'alpha' tailnet to be rotated once (cleanup=1, init=2), got cleanup=%d init=%d", cleanupCount["alpha"], initCount["alpha"])
+	}
+	mu.Unlock()
+
+	// Step 2: Verify a persistently truncated (0-byte) config.yaml is rejected and does NOT tear down active tailnets.
+	if err := os.Truncate(cfgPath, 0); err != nil {
+		t.Fatalf("failed truncating config file: %v", err)
+	}
+	if err := reloadConfig(cfgPath, proxyServer, tm); err == nil || !strings.Contains(err.Error(), "refusing to reload empty/truncated config file") {
+		t.Fatalf("expected reloadConfig on persistently empty file to fail with empty/truncated error, got: %v", err)
+	}
+	mu.Lock()
+	if cleanupCount["alpha"] != 1 || cleanupCount["beta"] != 0 {
+		mu.Unlock()
+		t.Fatalf("expected persistently empty config.yaml not to tear down any tailnet, got cleanup alpha=%d beta=%d", cleanupCount["alpha"], cleanupCount["beta"])
+	}
+	mu.Unlock()
+
+	// Restore valid file before Step 3.
+	if err := os.WriteFile(cfgPath, []byte(makeConfigYAML("tskey-alpha-2", "tskey-beta-1")), 0o600); err != nil {
+		t.Fatalf("failed restoring config file: %v", err)
+	}
+
+	// Step 3: Simulate a multi-chunk write where the first chunk only contains 'alpha' and the second chunk
+	// (flushed 15ms later during the settle window) appends 'beta' with a rotated auth_key.
+	partialFirstChunk := fmt.Sprintf(`
+tailnets:
+  - profile: 'alpha'
+    hostname: 'alpha-node'
+    auth_key: 'tskey-alpha-2'
+    listen_address: '127.0.0.1'
+    auto_proxy_vips: false
+    ports:
+      - protocol: 'tcp'
+        port: %d
+        destination: '%s'
+`, portAlpha, backendLn.Addr().String())
+	if err := os.WriteFile(cfgPath, []byte(partialFirstChunk), 0o600); err != nil {
+		t.Fatalf("failed writing first chunk: %v", err)
+	}
+	go func() {
+		time.Sleep(15 * time.Millisecond)
+		_ = os.WriteFile(cfgPath, []byte(makeConfigYAML("tskey-alpha-2", "tskey-beta-2")), 0o600)
+	}()
+
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("reloadConfig during multi-chunk write failed: %v", err)
+	}
+	mu.Lock()
+	if cleanupCount["alpha"] != 1 || initCount["alpha"] != 2 {
+		mu.Unlock()
+		t.Fatalf("expected 'alpha' to remain untouched during 'beta' rotation, got cleanup=%d init=%d", cleanupCount["alpha"], initCount["alpha"])
+	}
+	if cleanupCount["beta"] != 1 || initCount["beta"] != 2 {
+		mu.Unlock()
+		t.Fatalf("expected 'beta' to be rotated once (cleanup=1, init=2), got cleanup=%d init=%d", cleanupCount["beta"], initCount["beta"])
+	}
+	mu.Unlock()
+
+	// Step 4: Live startConfigWatcher with unlink+create save (vim/sed style) rotating 'alpha' auth_key.
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
+	defer cancelWatch()
+	reloadChan := make(chan struct{}, 1)
+	go startConfigWatcher(watchCtx, cfgPath, reloadChan)
+	time.Sleep(40 * time.Millisecond)
+
+	if err := os.Remove(cfgPath); err != nil {
+		t.Fatalf("failed removing config file: %v", err)
+	}
+	time.Sleep(15 * time.Millisecond)
+	if err := os.WriteFile(cfgPath, []byte(makeConfigYAML("tskey-alpha-3", "tskey-beta-2")), 0o600); err != nil {
+		t.Fatalf("failed recreating config file: %v", err)
+	}
+
+	select {
+	case <-reloadChan:
+		if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+			t.Fatalf("reloadConfig after watcher notification failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for startConfigWatcher reload signal")
+	}
+
+	mu.Lock()
+	if cleanupCount["beta"] != 1 || initCount["beta"] != 2 {
+		mu.Unlock()
+		t.Fatalf("expected 'beta' to remain untouched after 'alpha' unlink+create rotation, got cleanup=%d init=%d", cleanupCount["beta"], initCount["beta"])
+	}
+	if cleanupCount["alpha"] != 2 || initCount["alpha"] != 3 {
+		mu.Unlock()
+		t.Fatalf("expected 'alpha' to be rotated a second time (cleanup=2, init=3), got cleanup=%d init=%d", cleanupCount["alpha"], initCount["alpha"])
+	}
+	mu.Unlock()
+
+	// Step 5: Verify explicit 'tailnets: []' YAML transition to Standby Mode still tears down all tailnets cleanly.
+	if err := os.WriteFile(cfgPath, []byte("tailnets: []\n"), 0o600); err != nil {
+		t.Fatalf("failed writing standby config: %v", err)
+	}
+	if err := reloadConfig(cfgPath, proxyServer, tm); err != nil {
+		t.Fatalf("expected explicit 'tailnets: []' reload to succeed, got: %v", err)
+	}
+	mu.Lock()
+	if cleanupCount["alpha"] != 3 || cleanupCount["beta"] != 2 {
+		mu.Unlock()
+		t.Fatalf("expected explicit 'tailnets: []' to clean up both tailnets, got cleanup alpha=%d beta=%d", cleanupCount["alpha"], cleanupCount["beta"])
+	}
+	mu.Unlock()
+}
+
