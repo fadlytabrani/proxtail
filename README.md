@@ -43,9 +43,12 @@ proxtail
 ```
 
 ```text
-2026/10/22 03:20:00 [default] tsnet node started (Tailscale IP: 100.64.1.42, hostname: proxtail-default)
-2026/10/22 03:20:00 [default] TCP listening on :8080 and forwarding to web-server:8080
-2026/10/22 03:20:01 Proxtail is ready to accept traffic (/healthz OK)
+2026/11/04 12:00:00 Tailnet 'default' server started successfully (hostname: proxtail-default, ephemeral: true)
+Starting proxtail with 1 tailnets, 200 workers, 512KB buffers...
+Hot reload enabled - watching for config changes in: config.yaml
+Manual reload available - send SIGHUP signal to trigger config reload
+2026/11/04 12:00:00 TCP listener started on :8080 for tailnet default
+2026/11/04 12:00:00 TCP listening on :8080 and forwarding to web-server:8080 (tailnet: default) with connection timeout 30s
 ```
 
 ```bash
@@ -159,7 +162,7 @@ flowchart TD
 ## Key Features
 
 - **Zero Host Privileges**: Runs 100% in userspace with non-root user `10001:10001`. No `CAP_NET_ADMIN`, no `/dev/net/tun` device, and zero host network changes. Fully compliant with Kubernetes Pod Security Standards `restricted` profile.
-- **Multi-Tailnet Isolation**: Connect to multiple independent tailnets (`production`, `staging`, partner networks) simultaneously. Backends with overlapping `100.64.x.x` CGNAT IPs or identical MagicDNS names are completely isolated.
+- **Multi-Tailnet Isolation & Fault Containment**: Connect to multiple independent tailnets (`production`, `staging`, partner networks) simultaneously. Backends with overlapping `100.64.x.x` CGNAT IPs or identical MagicDNS names are completely isolated, and if one tailnet encounters an expired or invalid `auth_key` during startup or hot-reload key rotation, only that tailnet enters a suspended state (`Status: "degraded"` in `/healthz`) while all other healthy tailnets continue forwarding uninterrupted.
 - **WireGuard Line-Rate Performance**: Up to **1.0 Gbps** encrypted TCP throughput over userspace WireGuard (ChaCha20-Poly1305 + gVisor), with less than **0.01 ms** raw socket proxy overhead and **~1.1 ms** round-trip overhead through full encryption.
 - **Parallel Multi-Core UDP Engine**: Multi-worker reader pool and 16-shard cacheline-padded session table scale parallel UDP traffic by **3.24x** to **~61,000 pkts/s** with zero lock contention.
 - **Horizontal Kubernetes Scaling**: Scales linearly across pod replicas (tested **3.12x** TCP and **3.94x** UDP throughput scaling across 3 pods) using dynamic `${HOSTNAME}` node registration.
@@ -186,11 +189,27 @@ All benchmarks were evaluated using both synthetic local loopback tests and end-
 | **Kubernetes Scaling (1 $\rightarrow$ 3 Pods)** | 163 req/s (1 pod) | **509 req/s (3 pods)** | **3.12x linear TCP scaling** |
 | **Node Deregistration on Pod Exit** | 30–60 min (timeout) | **< 150 ms** | Instant clean teardown |
 
+### Go Benchmark Suite (`make bench` & `make bench-real` with PGO)
+
+Measured with **Profile-Guided Optimization (`cmd/proxtail/default.pgo`)** enabled on Go `1.27.3` (`linux/amd64` Intel Core i7-10710U and `darwin/arm64` Apple Silicon):
+
+| Benchmark | Payload | `linux/amd64` Throughput | `darwin/arm64` Throughput | Latency / Op (`linux` / `darwin`) | Heap Allocations |
+| :--- | :--- | ---: | ---: | ---: | :--- |
+| `BenchmarkTCPThroughput` | 64 KB | **1,911 MB/s** (~15.3 Gbps) | **5,244 MB/s** (~41.9 Gbps) | `34.3 µs` / `12.5 µs` | **0 allocs/op** (`15 B/op`) |
+| `BenchmarkMultiTailnetParallelTCPThroughput` | 64 KB (3 tailnets) | **5,663 MB/s** (~45.3 Gbps) | **8,187 MB/s** (~65.5 Gbps) | `11.6 µs` / `8.0 µs` | **0 allocs/op** (`45 B/op`) |
+| `BenchmarkUDPThroughput` | 1 KB | **59 MB/s** (~57,800 pps) | **57 MB/s** (~55,700 pps) | `17.3 µs` / `17.9 µs` | **0 allocs/op** (`0 B/op`) |
+| `BenchmarkMultiClientParallelUDPThroughput` | 1 KB (parallel) | **235 MB/s** (~229,300 pps) | **308 MB/s** (~300,800 pps) | `4.4 µs` / `3.3 µs` | **0 allocs/op** (`2 B/op`) |
+| `BenchmarkRealTSNetWireGuardTCPThroughput` | 512 KB (`tsnet` + WG) | **884 MB/s** (~7.08 Gbps) | **1,089 MB/s** (~8.71 Gbps) | `592.8 µs` / `481.6 µs` | `1,723 allocs/op` (`1.25 MB/op`) |
+| `BenchmarkRealTSNetWireGuardTCPParallelThroughput` | 256 KB (`tsnet` + WG) | **278 MB/s** (~2.22 Gbps) | **678 MB/s** (~5.42 Gbps) | `943.2 µs` / `386.6 µs` | `843 allocs/op` (`588 KB/op`) |
+| `BenchmarkRealTSNetWireGuardUDPThroughput` | 2 KB (`tsnet` + WG) | **33 MB/s** (~16,200 pps) | **31 MB/s** (~15,100 pps) | `61.8 µs` / `66.1 µs` | `44 allocs/op` (`7.2 KB/op`) |
+| `BenchmarkRealTSNetWireGuardUDPParallelThroughput` | 2 KB (`tsnet` + WG) | **126 MB/s** (~61,300 pps) | **171 MB/s** (~83,500 pps) | `16.3 µs` / `12.0 µs` | `43 allocs/op` (`6.7 KB/op`) |
+
 > [!TIP]
-> Run benchmarks locally:
+> Run benchmarks or regenerate the PGO profile locally:
 > ```bash
-> make bench       # Synthetic TCP/UDP loopback benchmarks
-> make bench-real  # End-to-end WireGuard ChaCha20-Poly1305 + gVisor benchmarks
+> make bench       # Synthetic TCP/UDP loopback benchmarks (with default.pgo)
+> make bench-real  # End-to-end WireGuard ChaCha20-Poly1305 + gVisor benchmarks (with default.pgo)
+> make pgo         # Regenerate cmd/proxtail/default.pgo from end-to-end WireGuard benchmarks
 > ```
 
 ---
@@ -294,6 +313,9 @@ tailnets:
         destination: '100.64.0.10:8080' # Complete isolation! Overlapping IPs never collide.
 ```
 
+> [!TIP]
+> **Per-Tailnet Local IP Isolation (`listen_address`)**: Multiple tailnets can also bind the **exact same local port numbers** (and allocate independent, overlapping `vip_port_range` blocks) by assigning each tailnet its own local loopback or interface IP via `tailnets[].listen_address` (e.g., `listen_address: '127.0.0.1'` for `production` and `listen_address: '127.0.0.2'` for `staging`).
+
 Run with environment variables:
 ```bash
 export TS_AUTHKEY_PRODUCTION="tskey-auth-prod-xxxx"
@@ -380,24 +402,24 @@ curl -s http://localhost:9090/healthz | jq '.Ports[] | select(.VIPService != nul
 
 *(You can also manually map a specific local port outside `vip_port_range`—such as `8443`—to a VIP service hostname or FQDN via `ports:`.)*
 
-### Recipe 8: Zero-Port Tailnet Discovery Mode
-Start `proxtail` with zero port mappings (`ports: []` or omitted) to discover active tailnet peers and Virtual IP (VIP) services via `/healthz` before defining routes:
+### Recipe 8: Zero-Port Discovery & Zero-Tailnet Standby Mode
+Start `proxtail` with zero port mappings (`ports: []` or omitted) to discover active tailnet peers and Virtual IP (VIP) services via `/healthz` and pre-flight test ports via `/probe` before defining routes—or start in **Zero-Tailnet Standby Mode** (`tailnets: []` or omitted) on a freshly deployed appliance and provision tailnets later via hot-reload:
 
 ```yaml
 tailnets:
   - profile: 'production'
-    # 'ports:' omitted or set to []
+    # 'ports:' omitted or set to [] (or omit 'tailnets:' entirely for Zero-Tailnet Standby Mode)
 
 proxy:
   api_port: 9090
 ```
 
-Once running, query `/healthz` to inspect discovered services:
+Once running, query `/healthz` to inspect discovered services or `/probe` to test candidate ports:
 ```bash
 curl http://localhost:9090/healthz | jq '.Tailnets[0].Services'
 ```
 
-You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automatic file watcher dynamically binds the newly added ports with zero downtime and without reconnecting to the tailnet.
+You can then add tailnets or port mappings to `config.yaml` on the fly—`proxtail`'s automatic file watcher dynamically starts new tailnets and binds newly added ports with zero downtime and without reconnecting existing tailnets.
 
 ---
 
@@ -512,10 +534,10 @@ proxtail -validate -c config.yaml
 ```
 
 ### Zero-Downtime Hot Reload
-Modify `config.yaml` to add, update, or remove ports on the fly:
+Modify `config.yaml` to add, update, or remove tailnets and ports—or rotate `auth_key` credentials—on the fly:
 - **Automatic**: File watcher detects atomic file replacements and Kubernetes `ConfigMap` symlink updates within **100 ms**.
 - **Signal**: Trigger manually via `kill -HUP $(pgrep proxtail)` or `docker kill --signal=HUP proxtail`.
-- **Safe Rollback**: If an invalid configuration is introduced, `proxtail` rejects it, logs the validation error, and continues serving active traffic without interruption.
+- **Safe Rollback & Per-Tailnet Fault Isolation**: If an invalid configuration is introduced, `proxtail` rejects it, logs the validation error, and continues serving active traffic without interruption. If a newly added or rotated tailnet fails authentication (e.g., an expired `auth_key`), only that tailnet enters a suspended state (`Status: "degraded"` in `/healthz` with `Tailnets[].Error`), while all other healthy tailnets continue forwarding traffic uninterrupted.
 
 ### Active Upstream Probing & ADC Listener Suspension
 
@@ -527,7 +549,7 @@ When placing `proxtail` behind an external L4 load balancer or Application Deliv
   1. **Opt-in Zero Overhead**: Disabled by default (`0` background goroutines or hot-path timers when disabled); overridable per port via `probe: true/false`.
   2. **Traffic-Aware Cooldown**: Coalesced upstream activity tracking (`cooldown`, default `10s`) skips background probes completely whenever live traffic recently received data or completed a TCP handshake from the upstream backend.
   3. **Asymmetric Failure Detection**: Live client dial failures trigger instant reactive listener suspension, while background idle probes require `consecutive_failures` (default `2`) to prevent flapping.
-  4. **Cached In-Memory Peer Check**: Inspects a 2-second per-tailnet cached Tailscale peer status map before dialing; offline peers fail immediately with zero WireGuard handshakes or network packets.
+  4. **Event-Driven Netmap & Coalesced Disco Path Probing**: Inspects a 2-second per-tailnet cached Tailscale peer status map (`Online && !Expired` and `PrimaryRoutes` for Tailscale Services VIPs and CIDR subnet routes) invalidated in real time by `WatchIPNBus(NotifyInitialState | NotifyPeerPatches)`, so offline or expired peers fail immediately with zero WireGuard handshakes. For online peers, `proxtail` performs singleflight-coalesced Tailscale Disco pings (`lc.Ping(ctx, ip, tailcfg.PingDisco)`) to record transport path telemetry (`Path`: `"direct"` / `"derp"` / `"local"`, `Endpoint`, `DERPRegionID`, `DERPRegionCode`, `LatencySeconds`) alongside L4 port reachability.
   5. **Staggered Jitter**: Randomized startup delay (`100–500ms`) and `±20%` interval jitter prevent synchronized probe bursts across large port tables.
 
 ### Unified Health, Readiness & Tailnet Discovery (`/healthz`)
@@ -752,17 +774,20 @@ Key exported metrics:
 ## Building from Source
 
 ```bash
-# Build binary with embedded version metadata
+# Build binary with embedded version metadata and Profile-Guided Optimization (default.pgo)
 make build
 
 # Run formatting, vet, and race-enabled test suite
 make check
 
-# Run synthetic TCP & UDP socket throughput benchmarks
+# Run synthetic TCP & UDP socket throughput benchmarks (with PGO)
 make bench
 
-# Run end-to-end WireGuard (ChaCha20-Poly1305 + gVisor) throughput benchmarks
+# Run end-to-end WireGuard (ChaCha20-Poly1305 + gVisor) throughput benchmarks (with PGO)
 make bench-real
+
+# Regenerate cmd/proxtail/default.pgo profile from end-to-end WireGuard benchmarks
+make pgo
 
 # Validate example configuration
 make validate

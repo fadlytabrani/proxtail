@@ -21,18 +21,19 @@ proxtail/
 ## Development Setup
 
 ### Prerequisites
-- **Go `1.27.2+`** *(Note: If you have Go `1.21+` installed locally, the `Makefile` automatically sets `GOTOOLCHAIN=auto` to download and run the exact Go toolchain specified in `go.mod`.)*
+- **Go `1.27.3+`** *(Note: If you have Go `1.21+` installed locally, the `Makefile` automatically sets `GOTOOLCHAIN=auto` to download and run the exact Go toolchain specified in `go.mod`.)*
 - **Docker** *(optional, for building and testing container images)*
 
 ### Common `make` Targets
 
 | Command | Description |
 | :--- | :--- |
-| `make build` | Compile the `./proxtail` binary with version metadata. |
+| `make build` | Compile the `./proxtail` binary with version metadata and Profile-Guided Optimization (`cmd/proxtail/default.pgo`). |
+| `make pgo` | Regenerate `cmd/proxtail/default.pgo` from end-to-end `tsnet` + WireGuard benchmarks. |
 | `make test` | Run all unit and integration tests. |
 | `make race` | Run the full test suite with the Go `-race` detector enabled. |
-| `make bench` | Run synthetic socket TCP and UDP throughput benchmarks (`internal/proxy`). |
-| `make bench-real` | Run real end-to-end `tsnet` + WireGuard (`gVisor` + `ChaCha20-Poly1305`) throughput benchmarks. |
+| `make bench` | Run synthetic socket TCP and UDP throughput benchmarks (`internal/proxy`, with PGO). |
+| `make bench-real` | Run real end-to-end `tsnet` + WireGuard (`gVisor` + `ChaCha20-Poly1305`) throughput benchmarks (with PGO). |
 | `make vet` | Run `go vet ./...` static analysis. |
 | `make check` | Run `fmt`, `vet`, and `race` tests (run before opening a PR). |
 | `make validate` | Build `proxtail` and validate `examples/config.yaml`. |
