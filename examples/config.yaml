@@ -43,7 +43,7 @@ tailnets:
 # Optional proxy tuning & monitoring (omit entirely to use defaults: 512KB buffer, 200 workers)
 proxy:
   # api_listen_address: '127.0.0.1' # Optional bind address for the HTTP API server (default: '0.0.0.0')
-  api_port: 9090                    # Exposes /healthz and /metrics
+  api_port: 9090                    # Exposes /healthz, /probe, and /metrics
   # state_dir: '/var/lib/tsnet'     # Optional base directory for Tailscale state (<state_dir>/<profile>)
   vip_port_range: '30000-30999' # Reserved local port range for auto-proxied VIP services (manual ports cannot overlap)
 

@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 
@@ -1038,3 +1040,275 @@ proxy:
 	})
 }
 
+type mockIPNBusWatcher struct {
+	ctx    context.Context
+	events chan ipn.Notify
+}
+
+func (w *mockIPNBusWatcher) Next() (ipn.Notify, error) {
+	select {
+	case <-w.ctx.Done():
+		return ipn.Notify{}, w.ctx.Err()
+	case n, ok := <-w.events:
+		if !ok {
+			return ipn.Notify{}, io.EOF
+		}
+		return n, nil
+	}
+}
+
+func (w *mockIPNBusWatcher) Close() error {
+	return nil
+}
+
+func TestClassifyIPNNotify(t *testing.T) {
+	onlineTrue := true
+	stateRunning := ipn.Running
+
+	tests := []struct {
+		name              string
+		notify            ipn.Notify
+		wantReconcileVIPs bool
+		wantInvalidate    bool
+	}{
+		{
+			name:              "empty keepalive notify",
+			notify:            ipn.Notify{},
+			wantReconcileVIPs: false,
+			wantInvalidate:    false,
+		},
+		{
+			name: "PeersChanged incremental node/VIP/route addition",
+			notify: ipn.Notify{
+				PeersChanged: []*tailcfg.Node{{ID: 101}},
+			},
+			wantReconcileVIPs: true,
+			wantInvalidate:    true,
+		},
+		{
+			name: "PeersRemoved incremental node/VIP removal",
+			notify: ipn.Notify{
+				PeersRemoved: []tailcfg.NodeID{101},
+			},
+			wantReconcileVIPs: true,
+			wantInvalidate:    true,
+		},
+		{
+			name: "SelfChange full netmap or local node update",
+			notify: ipn.Notify{
+				SelfChange: &tailcfg.Node{ID: 1},
+			},
+			wantReconcileVIPs: true,
+			wantInvalidate:    true,
+		},
+		{
+			name: "Prefs update (AdvertiseServices / AdvertiseRoutes)",
+			notify: ipn.Notify{
+				Prefs: new(ipn.NewPrefs().View()),
+			},
+			wantReconcileVIPs: true,
+			wantInvalidate:    true,
+		},
+		{
+			name: "State transition",
+			notify: ipn.Notify{
+				State: &stateRunning,
+			},
+			wantReconcileVIPs: true,
+			wantInvalidate:    true,
+		},
+		{
+			name: "PeerChangedPatch with Online transition invalidates state without full VIP reconcile",
+			notify: ipn.Notify{
+				PeerChangedPatch: []*tailcfg.PeerChange{
+					{NodeID: 42, Online: &onlineTrue},
+				},
+			},
+			wantReconcileVIPs: false,
+			wantInvalidate:    true,
+		},
+		{
+			name: "PeerChangedPatch with routine DERP/Endpoints only is ignored",
+			notify: ipn.Notify{
+				PeerChangedPatch: []*tailcfg.PeerChange{
+					{NodeID: 42, DERPRegion: 1},
+				},
+			},
+			wantReconcileVIPs: false,
+			wantInvalidate:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotReconcile, gotInvalidate := classifyIPNNotify(tc.notify)
+			if gotReconcile != tc.wantReconcileVIPs || gotInvalidate != tc.wantInvalidate {
+				t.Fatalf("classifyIPNNotify() = (reconcileVIPs=%v, invalidateState=%v), want (%v, %v)",
+					gotReconcile, gotInvalidate, tc.wantReconcileVIPs, tc.wantInvalidate)
+			}
+		})
+	}
+}
+
+func TestWatchIPNBusEventDrivenVIPAndRouteReconciliation(t *testing.T) {
+	paymentsBackend := startTCPEchoBackend(t, "payments-vip:")
+	dialer := newVIPRoutingDialer()
+	dialer.setRoute("tcp", "100.101.50.10:8443", paymentsBackend)
+
+	vipStart, vipEnd := getFreePortBlock(t, 3)
+	cfg, err := config.Parse([]byte(fmt.Sprintf(`
+tailnets:
+  - profile: 'prod'
+    listen_address: '127.0.0.1'
+proxy:
+  vip_port_range: '%d-%d'
+`, vipStart, vipEnd)))
+	if err != nil {
+		t.Fatalf("config.Parse failed: %v", err)
+	}
+
+	var vipMu sync.Mutex
+	currentVIPs := map[tailcfg.ServiceName]tailcfg.ServiceDetails{}
+
+	eventsCh := make(chan ipn.Notify, 8)
+	var observedMask atomic.Uint32
+
+	tm := newTailnetManager()
+	tm.initFunc = func(c config.TailnetConfig) (*tsnet.Server, error) {
+		return &tsnet.Server{Hostname: c.Hostname}, nil
+	}
+	tm.cleanupFunc = func(*tsnet.Server, string) {}
+	// Set fallback polling ticker to 10 minutes so ONLY WatchIPNBus events can trigger reconciliation!
+	tm.vipRefreshOverride = 10 * time.Minute
+	tm.vipDebounceDelay = 15 * time.Millisecond
+	tm.vipDiscoverFunc = func(_ context.Context, _ string, _ *tsnet.Server) (map[tailcfg.ServiceName]tailcfg.ServiceDetails, error) {
+		vipMu.Lock()
+		defer vipMu.Unlock()
+		return maps.Clone(currentVIPs), nil
+	}
+	tm.healthDiscoverFunc = func(_ context.Context, _ string, _ *tsnet.Server) tailnetHealthDetails {
+		vipMu.Lock()
+		svcs := maps.Clone(currentVIPs)
+		vipMu.Unlock()
+		return tailnetHealthDetails{
+			Status: &ipnstate.Status{
+				BackendState: "Running",
+				Self:         &ipnstate.PeerStatus{HostName: "proxtail-prod", Online: true},
+			},
+			Services: svcs,
+		}
+	}
+	tm.ipnBusWatchFunc = func(wCtx context.Context, _ string, _ *tsnet.Server, mask ipn.NotifyWatchOpt) (ipnBusWatcher, error) {
+		observedMask.Store(uint32(mask))
+		return &mockIPNBusWatcher{ctx: wCtx, events: eventsCh}, nil
+	}
+	defer tm.closeAll()
+
+	servers, _, _, err := tm.syncTailnets(cfg.Tailnets)
+	if err != nil {
+		t.Fatalf("syncTailnets failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	initialPorts, err := tm.prepareInitialPorts(ctx, cfg, servers)
+	if err != nil {
+		t.Fatalf("prepareInitialPorts failed: %v", err)
+	}
+	if len(initialPorts) != 0 {
+		t.Fatalf("expected 0 initial ports, got %d", len(initialPorts))
+	}
+
+	p := proxy.NewProxyWithDialers(initialPorts, map[string]proxy.Dialer{"prod": dialer}, 32*1024, 50)
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+	<-p.Started()
+
+	tm.startVIPReconciler(ctx, p)
+
+	// Wait for WatchIPNBus subscription to be established and verify watch mask includes NotifyPeerPatches
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if observedMask.Load() != 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if gotMask := ipn.NotifyWatchOpt(observedMask.Load()); gotMask != defaultIPNBusWatchMask {
+		t.Fatalf("WatchIPNBus mask = %v, want %v (NotifyInitialState | NotifyPeerPatches)", gotMask, defaultIPNBusWatchMask)
+	}
+
+	// Prime /healthz cache before any VIPs exist
+	handler := newHealthHandler(p, tm)
+	rec0 := httptest.NewRecorder()
+	handler.ServeHTTP(rec0, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	// 1. Simulate incremental PeersChanged delta advertising svc:payments (100.101.50.10:8443)
+	vipMu.Lock()
+	currentVIPs["svc:payments"] = tailcfg.ServiceDetails{
+		Name:  "svc:payments",
+		Addrs: []netip.Addr{netip.MustParseAddr("100.101.50.10")},
+		Ports: []tailcfg.ProtoPortRange{{Proto: 6, Ports: tailcfg.PortRange{First: 8443, Last: 8443}}},
+	}
+	vipMu.Unlock()
+
+	eventsCh <- ipn.Notify{
+		PeersChanged: []*tailcfg.Node{{ID: 501}},
+	}
+
+	// Verify event-driven VIP reconciliation binds vipStart immediately (without waiting for 10m ticker)
+	deadline = time.Now().Add(2 * time.Second)
+	bound := false
+	for time.Now().Before(deadline) {
+		for _, st := range p.GetPortStatuses() {
+			if st.Source == vipStart && st.VIPService == "payments" && st.Up {
+				bound = true
+				break
+			}
+		}
+		if bound {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !bound {
+		t.Fatalf("expected WatchIPNBus PeersChanged to immediately bind svc:payments on port %d, got %+v", vipStart, p.GetPortStatuses())
+	}
+
+	assertTCPRoundTrip(t, vipStart, "charge", "payments-vip:charge")
+
+	// Verify /healthz cache was invalidated and immediately reflects svc:payments
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var hr1 healthResponse
+	if err := json.Unmarshal(rec1.Body.Bytes(), &hr1); err != nil {
+		t.Fatalf("failed to unmarshal /healthz: %v", err)
+	}
+	if len(hr1.Tailnets) != 1 {
+		t.Fatalf("expected 1 tailnet in /healthz, got %d", len(hr1.Tailnets))
+	}
+	if _, ok := hr1.Tailnets[0].Services["svc:payments"]; !ok {
+		t.Fatalf("expected /healthz Tailnets[0].Services to immediately include svc:payments, got %+v", hr1.Tailnets[0].Services)
+	}
+
+	// 2. Simulate incremental PeersRemoved delta removing svc:payments
+	vipMu.Lock()
+	clear(currentVIPs)
+	vipMu.Unlock()
+
+	eventsCh <- ipn.Notify{
+		PeersRemoved: []tailcfg.NodeID{501},
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.ActiveListenerCount() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := p.ActiveListenerCount(); got != 0 {
+		t.Fatalf("expected WatchIPNBus PeersRemoved to immediately unbind removed VIP listener, got %d active listeners", got)
+	}
+}

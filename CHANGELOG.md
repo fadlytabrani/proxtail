@@ -8,6 +8,26 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-04
+
+### Added
+- **On-Demand Pre-Flight Port & Path Probing Endpoint (`GET /probe`)**:
+  - Added `GET /probe` (`?profile=<name>&protocol=tcp|udp&destination=<host:port>&timeout=2s`) on the HTTP API server (`proxy.api_port`), allowing external orchestrators and control planes to verify candidate peer port reachability, Tailscale ACL permissions, and transport path telemetry before adding port mappings to `config.yaml`.
+  - Added opt-in 3-stage progressive streaming (`?stream=true` / `Accept: application/x-ndjson` and `?stream=sse` / `Accept: text/event-stream`) via `Proxy.ProbeDestinationStream`, flushing real-time `ProbeResult` events as each stage completes (`Stage: "netmap"` → `"path"` → `"port"`, or short-circuiting after `"netmap"` when the peer is offline).
+  - Added `tailcfg.PingTSMP` diagnostic pings when Stage 1 (`PeerOnline: true`) succeeds but Stage 3 (`DialContext` / UDP probe) fails or times out, surfacing Tailscale packet-filter / ACL rejections (`ACLBlocked: true`) alongside the peer's Disco transport path.
+- **Tailscale Disco Path Telemetry (`internal/proxy/probe.go`)**:
+  - Augmented active TCP and UDP upstream probes with Tailscale-layer `lc.Ping(ctx, ip, tailcfg.PingDisco)` checks (`probeDiscoPath`), reporting `Path` (`"direct"`, `"derp"`, or `"local"`), `Endpoint` (`<ip>:<port>`), `DERPRegionID`, `DERPRegionCode`, and `LatencySeconds` on each healthy port entry (`Ports[]`) in `GET /healthz`.
+  - Implemented per-peer singleflight coalescing (`discoFlight`) and TTL caching (`discoCache`) so multiple ports targeting the same backend peer share a single Disco ping without redundant probe traffic, automatically clearing path fields when a port is suspended (`Up: false`).
+  - Added destination peer IP resolution (`resolvePeerIP` and `buildPeerAddrMap`) supporting Tailscale IPv4/IPv6 literals, MagicDNS short hostnames and FQDNs, `/32` & `/128` TailVIP `PrimaryRoutes`, and CIDR subnet routes advertised by subnet routers.
+- **Instant Event-Driven VIP & Route Reconciliation across All Tailnets**:
+  - Updated `watchTailnetIPNBus` in `cmd/proxtail/vip.go` to subscribe to `lc.WatchIPNBus(ctx, ipn.NotifyInitialState | ipn.NotifyPeerPatches)` on every configured tailnet (regardless of `auto_proxy_vips`), immediately invalidating `/healthz` and `peerCache` snapshots and waking upstream probe monitors (`Proxy.NotifyTailnetNetmapChanged`) whenever structural netmap updates or peer/route patches arrive.
+  - Enriched Stage 1 netmap peer reachability checks (`buildPeerOnlineMap`, `extractPeerRoutes`, `isPeerOffline`) to require `peer.Online && !peer.Expired` and index `peer.PrimaryRoutes` (`/32` & `/128` TailVIPs and CIDR subnet prefixes).
+
+### Changed
+- **Embedded Native Tailscale `/localapi/v0/status` & `PascalCase` JSON Schema in `GET /healthz`**:
+  - Embedded Tailscale's native `*ipnstate.Status` (from `lc.Status(ctx)`) and `Services` (`map[tailcfg.ServiceName]tailcfg.ServiceDetails` from `lc.GetServices(ctx)`) directly inside each `Tailnets[]` entry in `GET /healthz`, providing 100% fidelity with `tailscale status --json` alongside ProxTail's `Profile` and `Error` fields.
+  - Standardized all top-level `GET /healthz` (`Status`, `ActiveListeners`, `Tailnets`, `Ports`, `TCPConnections`, `UDPPackets`, `BytesTransferred`, `Errors`), `Ports[]` (`Port`, `ListenAddress`, `ListenAddr`, `Destination`, `Protocol`, `Profile`, `VIPService`, `Up`, `LastError`, `Path`, `Endpoint`, `DERPRegionID`, `DERPRegionCode`, `LatencySeconds`), and `GET /probe` JSON fields on `PascalCase`.
+
 ## [0.5.2] - 2026-11-02
 
 ### Fixed

@@ -25,6 +25,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	_ "tailscale.com/feature/oauthkey"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
@@ -64,12 +65,14 @@ type tailnetManager struct {
 	vipWatchMu         sync.Mutex
 	reconcilerCtx      context.Context
 	reconcilerCancel   context.CancelFunc
+	reconcilerProxy    *proxy.Proxy
 	vipTriggerCh       chan struct{}
 	vipTickerCh        chan time.Duration
 	vipWatchers        map[string]vipWatcherEntry
 	vipInterval        time.Duration
 	vipRefreshOverride time.Duration
 	vipDebounceDelay   time.Duration
+	ipnBusWatchFunc    ipnBusWatchFunc
 
 	healthCacheMu      sync.Mutex
 	healthCache        map[string]cachedTailnetHealth
@@ -764,27 +767,26 @@ func startConfigWatcher(ctx context.Context, configFile string, reloadChan chan<
 	}
 }
 
-// healthTailnetStatus describes the runtime status of a single tailnet for /healthz.
+// healthTailnetStatus describes the runtime status of a single tailnet for /healthz,
+// embedding Tailscale's native ipnstate.Status (/localapi/v0/status) alongside
+// VIP Services (/localapi/v0/services) and ProxTail profile metadata.
 type healthTailnetStatus struct {
-	Profile         string             `json:"profile"`
-	TailnetName     string             `json:"tailnet_name,omitempty"`
-	MagicDNSSuffix  string             `json:"magic_dns_suffix,omitempty"`
-	MagicDNSEnabled bool               `json:"magic_dns_enabled"`
-	Self            healthSelfStatus   `json:"self"`
-	VIPServices     []healthVIPService `json:"vip_services,omitempty"`
-	Peers           []healthPeerStatus `json:"peers,omitempty"`
+	Profile string `json:"Profile"`
+	Error   string `json:"Error,omitempty"`
+	*ipnstate.Status
+	Services map[tailcfg.ServiceName]tailcfg.ServiceDetails `json:"Services,omitempty"`
 }
 
 // healthResponse is the JSON payload returned by GET /healthz.
 type healthResponse struct {
-	Status           string                `json:"status"`
-	ActiveListeners  int                   `json:"active_listeners"`
-	Tailnets         []healthTailnetStatus `json:"tailnets"`
-	Ports            []proxy.PortStatus    `json:"ports,omitempty"`
-	TCPConnections   int64                 `json:"tcp_connections"`
-	UDPPackets       int64                 `json:"udp_packets"`
-	BytesTransferred int64                 `json:"bytes_transferred"`
-	Errors           int64                 `json:"errors"`
+	Status           string                `json:"Status"`
+	ActiveListeners  int                   `json:"ActiveListeners"`
+	Tailnets         []healthTailnetStatus `json:"Tailnets"`
+	Ports            []proxy.PortStatus    `json:"Ports,omitempty"`
+	TCPConnections   int64                 `json:"TCPConnections"`
+	UDPPackets       int64                 `json:"UDPPackets"`
+	BytesTransferred int64                 `json:"BytesTransferred"`
+	Errors           int64                 `json:"Errors"`
 }
 
 // computeHealthStatus determines the overall health status ("ok", "degraded", or "down")
@@ -799,7 +801,7 @@ func computeHealthStatus(isReady bool, configuredPorts int, activeListeners int,
 	if len(tailnets) > 0 {
 		errorTailnets := 0
 		for _, tn := range tailnets {
-			if tn.Self.BackendState == "Error" {
+			if tn.Error != "" || (tn.Status != nil && tn.BackendState == "Error") {
 				errorTailnets++
 			}
 		}
@@ -814,17 +816,215 @@ func computeHealthStatus(isReady bool, configuredPorts int, activeListeners int,
 		}
 	}
 	for _, tn := range tailnets {
-		if (tn.Self.BackendState != "" && tn.Self.BackendState != "Running") || len(tn.Self.HealthWarnings) > 0 {
+		if tn.Error != "" {
 			return "degraded", http.StatusOK
+		}
+		if tn.Status != nil {
+			if (tn.BackendState != "" && tn.BackendState != "Running") || len(tn.Health) > 0 {
+				return "degraded", http.StatusOK
+			}
 		}
 	}
 
 	return "ok", http.StatusOK
 }
 
-// newHealthHandler constructs an http.Handler serving /healthz (unified health & readiness) and /metrics (Prometheus).
+// newHealthHandler constructs an http.Handler serving /healthz (unified health & readiness), /probe (on-demand pre-flight reachability & path probing), and /metrics (Prometheus).
 func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler {
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+				Error: "method not allowed: use GET",
+			})
+			return
+		}
+
+		q := r.URL.Query()
+		profile := strings.TrimSpace(q.Get("profile"))
+		if profile == "" {
+			profile = strings.TrimSpace(q.Get("tailnet"))
+		}
+		protocol := strings.ToLower(strings.TrimSpace(q.Get("protocol")))
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		destination := strings.TrimSpace(q.Get("destination"))
+
+		if profile == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+				Protocol:    protocol,
+				Destination: destination,
+				Error:       "missing required query parameter 'profile'",
+			})
+			return
+		}
+		if protocol != "tcp" && protocol != "udp" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+				Profile:     profile,
+				Protocol:    protocol,
+				Destination: destination,
+				Error:       "invalid 'protocol': must be 'tcp' or 'udp'",
+			})
+			return
+		}
+		if destination == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+				Profile:  profile,
+				Protocol: protocol,
+				Error:    "missing required query parameter 'destination' (expected host:port)",
+			})
+			return
+		}
+		host, portStr, splitErr := net.SplitHostPort(destination)
+		portNum, portErr := strconv.Atoi(portStr)
+		if splitErr != nil || strings.TrimSpace(host) == "" || portErr != nil || portNum < 1 || portNum > 65535 {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+				Profile:     profile,
+				Protocol:    protocol,
+				Destination: destination,
+				Error:       "invalid 'destination': expected host:port with port 1-65535",
+			})
+			return
+		}
+
+		var timeout time.Duration
+		if rawTimeout := strings.TrimSpace(q.Get("timeout")); rawTimeout != "" {
+			if d, err := time.ParseDuration(rawTimeout); err == nil {
+				timeout = d
+			} else if secs, err := strconv.Atoi(rawTimeout); err == nil {
+				timeout = time.Duration(secs) * time.Second
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+					Profile:     profile,
+					Protocol:    protocol,
+					Destination: destination,
+					Error:       "invalid 'timeout': expected duration (e.g. 2s, 1500ms)",
+				})
+				return
+			}
+			if timeout <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+					Profile:     profile,
+					Protocol:    protocol,
+					Destination: destination,
+					Error:       "invalid 'timeout': must be greater than 0",
+				})
+				return
+			}
+		}
+
+		rawStream := strings.ToLower(strings.TrimSpace(q.Get("stream")))
+		accept := strings.ToLower(r.Header.Get("Accept"))
+		streamMode := ""
+		switch rawStream {
+		case "", "false", "0":
+			if strings.Contains(accept, "text/event-stream") {
+				streamMode = "sse"
+			} else if strings.Contains(accept, "application/x-ndjson") {
+				streamMode = "ndjson"
+			}
+		case "true", "1", "ndjson":
+			streamMode = "ndjson"
+		case "sse":
+			streamMode = "sse"
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+				Profile:     profile,
+				Protocol:    protocol,
+				Destination: destination,
+				Error:       "invalid 'stream': expected 'true', 'ndjson', 'sse', or 'false'",
+			})
+			return
+		}
+
+		hasProfile := proxyServer.HasTailnet(profile)
+		var fallbackErr string
+		if !hasProfile && tm != nil {
+			initErrors := tm.snapshotInitErrors()
+			configs := tm.snapshotConfigs()
+			if initErr := initErrors[profile]; initErr != "" {
+				fallbackErr = fmt.Sprintf("tailnet '%s' unavailable: %s", profile, initErr)
+				hasProfile = true
+			} else if _, ok := configs[profile]; ok {
+				fallbackErr = fmt.Sprintf("tailnet '%s' is not ready", profile)
+				hasProfile = true
+			}
+		}
+		if !hasProfile {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+				Profile:     profile,
+				Protocol:    protocol,
+				Destination: destination,
+				Error:       fmt.Sprintf("tailnet profile '%s' not found", profile),
+			})
+			return
+		}
+
+		if streamMode == "" {
+			if fallbackErr != "" {
+				_ = json.NewEncoder(w).Encode(proxy.ProbeResult{
+					Profile:     profile,
+					Protocol:    protocol,
+					Destination: destination,
+					Error:       fallbackErr,
+				})
+				return
+			}
+			res, _ := proxyServer.ProbeDestination(r.Context(), profile, protocol, destination, timeout)
+			_ = json.NewEncoder(w).Encode(res)
+			return
+		}
+
+		flusher, _ := w.(http.Flusher)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if streamMode == "sse" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Connection", "keep-alive")
+		} else {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+		}
+
+		writeStage := func(ev proxy.ProbeResult) {
+			data, err := json.Marshal(ev)
+			if err != nil {
+				return
+			}
+			if streamMode == "sse" {
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Stage, data)
+			} else {
+				_, _ = w.Write(append(data, '\n'))
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		if fallbackErr != "" {
+			writeStage(proxy.ProbeResult{
+				Stage:       "netmap",
+				Profile:     profile,
+				Protocol:    protocol,
+				Destination: destination,
+				Error:       fallbackErr,
+			})
+			return
+		}
+
+		_, _ = proxyServer.ProbeDestinationStream(r.Context(), profile, protocol, destination, timeout, writeStage)
+	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		stats := proxyServer.GetStats()
@@ -858,14 +1058,20 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 		for i, name := range names {
 			i, name := i, name
 			srv := servers[name]
-			st := healthTailnetStatus{Profile: name}
+			st := healthTailnetStatus{
+				Profile: name,
+				Status: &ipnstate.Status{
+					Self: &ipnstate.PeerStatus{},
+				},
+			}
 			if srv == nil {
 				if cfg, ok := configs[name]; ok {
 					st.Self.HostName = cfg.Hostname
 				}
 				if initErr := initErrors[name]; initErr != "" {
-					st.Self.BackendState = "Error"
-					st.Self.HealthWarnings = []string{initErr}
+					st.Error = initErr
+					st.BackendState = "Error"
+					st.Health = []string{initErr}
 				}
 				tailnets[i] = st
 				continue
@@ -876,15 +1082,16 @@ func newHealthHandler(proxyServer *proxy.Proxy, tm *tailnetManager) http.Handler
 				go func() {
 					defer wg.Done()
 					details := tm.getCachedTailnetDetails(r.Context(), name, srv)
-					if details.Self.HostName == "" {
-						details.Self.HostName = srv.Hostname
+					if details.Status != nil {
+						st.Status = details.Status
 					}
-					st.TailnetName = details.TailnetName
-					st.MagicDNSSuffix = details.MagicDNSSuffix
-					st.MagicDNSEnabled = details.MagicDNSEnabled
-					st.Self = details.Self
-					st.VIPServices = details.VIPServices
-					st.Peers = details.Peers
+					if st.Self == nil {
+						st.Self = &ipnstate.PeerStatus{}
+					}
+					if st.Self.HostName == "" {
+						st.Self.HostName = srv.Hostname
+					}
+					st.Services = details.Services
 					tailnets[i] = st
 				}()
 				continue

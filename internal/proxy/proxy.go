@@ -37,9 +37,17 @@ type peerStatusProvider interface {
 	PeerOnlineMap(ctx context.Context) (map[string]bool, error)
 }
 
+type peerRouteStatus struct {
+	prefix   netip.Prefix
+	online   bool
+	peerAddr netip.Addr
+}
+
 type peerStatusSnapshot struct {
 	expiresAt time.Time
 	peers     map[string]bool
+	peerAddrs map[string]netip.Addr
+	routes    []peerRouteStatus
 }
 
 // listenerInfo holds listener details with proper lifecycle management.
@@ -51,6 +59,7 @@ type listenerInfo struct {
 	conn           net.PacketConn
 	up             bool
 	lastError      string
+	pathInfo       peerPathInfo
 	failedProbes   int
 	lastActiveNano atomic.Int64
 	suspendCh      chan struct{}
@@ -83,15 +92,20 @@ func (info *listenerInfo) isTrafficActive(cooldown time.Duration) bool {
 
 // PortStatus describes the runtime status of a single configured port mapping.
 type PortStatus struct {
-	Source        int    `json:"port"`
-	ListenAddress string `json:"listen_address,omitempty"`
-	ListenAddr    string `json:"listen_addr"`
-	Destination   string `json:"destination"`
-	Protocol      string `json:"protocol"`
-	Tailnet       string `json:"profile"`
-	VIPService    string `json:"vip_service,omitempty"`
-	Up            bool   `json:"up"`
-	LastError     string `json:"last_error,omitempty"`
+	Source         int     `json:"Port"`
+	ListenAddress  string  `json:"ListenAddress,omitempty"`
+	ListenAddr     string  `json:"ListenAddr"`
+	Destination    string  `json:"Destination"`
+	Protocol       string  `json:"Protocol"`
+	Tailnet        string  `json:"Profile"`
+	VIPService     string  `json:"VIPService,omitempty"`
+	Up             bool    `json:"Up"`
+	LastError      string  `json:"LastError,omitempty"`
+	Path           string  `json:"Path,omitempty"`
+	Endpoint       string  `json:"Endpoint,omitempty"`
+	DERPRegionID   int     `json:"DERPRegionID,omitempty"`
+	DERPRegionCode string  `json:"DERPRegionCode,omitempty"`
+	LatencySeconds float64 `json:"LatencySeconds,omitempty"`
 }
 
 // ProbeConfig defines upstream reachability probe settings and thresholds.
@@ -421,6 +435,8 @@ type Proxy struct {
 	probeInitialDelay  time.Duration
 	peerCacheMu        sync.Mutex
 	peerCache          map[Dialer]peerStatusSnapshot
+	discoCache         map[discoCacheKey]discoCacheEntry
+	discoInFlight      map[discoCacheKey]*discoInFlightCall
 }
 
 // NewProxy creates a new Proxy instance with default worker pool sizing.
@@ -496,8 +512,10 @@ func NewProxyWithDialers(ports []PortMapping, tailnetDialers map[string]Dialer, 
 			ConsecutiveFailures: 2,
 			Cooldown:            10 * time.Second,
 		},
-		probeWakeCh: make(chan struct{}),
-		peerCache:   make(map[Dialer]peerStatusSnapshot),
+		probeWakeCh:   make(chan struct{}),
+		peerCache:     make(map[Dialer]peerStatusSnapshot),
+		discoCache:    make(map[discoCacheKey]discoCacheEntry),
+		discoInFlight: make(map[discoCacheKey]*discoInFlightCall),
 	}
 }
 
@@ -583,6 +601,11 @@ func (p *Proxy) UpdateTailnetDialers(dialers map[string]Dialer) {
 			delete(p.peerCache, d)
 		}
 	}
+	for k := range p.discoCache {
+		if _, ok := activeDialers[k.dialer]; !ok {
+			delete(p.discoCache, k)
+		}
+	}
 	p.peerCacheMu.Unlock()
 }
 
@@ -599,6 +622,44 @@ func (p *Proxy) SetTailnetErrors(errs map[string]string) {
 
 	p.mu.Lock()
 	p.tailnetErrors = cp
+	p.mu.Unlock()
+}
+
+// InvalidatePeerCache evicts the cached peer online snapshot for the given dialer,
+// or flushes all cached snapshots when dialer is nil.
+func (p *Proxy) InvalidatePeerCache(dialer Dialer) {
+	p.peerCacheMu.Lock()
+	if dialer == nil {
+		clear(p.peerCache)
+		clear(p.discoCache)
+	} else {
+		delete(p.peerCache, dialer)
+		for k := range p.discoCache {
+			if k.dialer == dialer {
+				delete(p.discoCache, k)
+			}
+		}
+	}
+	p.peerCacheMu.Unlock()
+}
+
+// NotifyTailnetNetmapChanged flushes the cached peer/route status for tailnetName
+// and wakes background upstream monitors so suspended or active ports immediately
+// reconcile their reachability state when a WatchIPNBus netmap event arrives.
+func (p *Proxy) NotifyTailnetNetmapChanged(tailnetName string) {
+	p.mu.RLock()
+	dialer := p.tailnetDialers[tailnetName]
+	p.mu.RUnlock()
+
+	if dialer != nil {
+		p.InvalidatePeerCache(dialer)
+	}
+
+	p.mu.Lock()
+	if p.probeWakeCh != nil {
+		close(p.probeWakeCh)
+		p.probeWakeCh = make(chan struct{})
+	}
 	p.mu.Unlock()
 }
 
@@ -700,79 +761,151 @@ func buildPeerOnlineMap(st *ipnstate.Status) map[string]bool {
 		if peer == nil {
 			continue
 		}
+		peerOnline := peer.Online && !peer.Expired
 		dnsClean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(peer.DNSName), "."))
 		if dnsClean != "" {
-			record(dnsClean, peer.Online)
+			record(dnsClean, peerOnline)
 			if shortLabel, _, ok := strings.Cut(dnsClean, "."); ok && shortLabel != "" {
-				record(shortLabel, peer.Online)
+				record(shortLabel, peerOnline)
 			}
 		}
 		hostClean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(peer.HostName), "."))
 		if hostClean != "" {
-			record(hostClean, peer.Online)
+			record(hostClean, peerOnline)
 		}
 		for _, ip := range peer.TailscaleIPs {
 			if ip.IsValid() {
-				record(strings.ToLower(ip.String()), peer.Online)
+				record(strings.ToLower(ip.String()), peerOnline)
+			}
+		}
+		if peer.PrimaryRoutes != nil {
+			for i := 0; i < peer.PrimaryRoutes.Len(); i++ {
+				pfx := peer.PrimaryRoutes.At(i)
+				if !pfx.IsValid() {
+					continue
+				}
+				if pfx.IsSingleIP() {
+					record(strings.ToLower(pfx.Addr().String()), peerOnline)
+				} else {
+					record(strings.ToLower(pfx.Masked().String()), peerOnline)
+				}
 			}
 		}
 	}
 	return peers
 }
 
-func (p *Proxy) getPeerOnlineMap(ctx context.Context, dialer Dialer) (map[string]bool, bool) {
+func extractPeerRoutes(peers map[string]bool, peerAddrs ...map[string]netip.Addr) []peerRouteStatus {
+	var addrMap map[string]netip.Addr
+	if len(peerAddrs) > 0 {
+		addrMap = peerAddrs[0]
+	}
+	var routes []peerRouteStatus
+	for k, online := range peers {
+		if !strings.ContainsRune(k, '/') {
+			continue
+		}
+		pfx, err := netip.ParsePrefix(k)
+		if err != nil || !pfx.IsValid() {
+			continue
+		}
+		var peerAddr netip.Addr
+		if addrMap != nil {
+			peerAddr = addrMap[k]
+			if !peerAddr.IsValid() {
+				peerAddr = addrMap[strings.ToLower(pfx.Masked().String())]
+			}
+		}
+		routes = append(routes, peerRouteStatus{
+			prefix:   pfx.Masked(),
+			online:   online,
+			peerAddr: peerAddr,
+		})
+	}
+	return routes
+}
+
+func (p *Proxy) getPeerSnapshot(ctx context.Context, dialer Dialer) (peerStatusSnapshot, bool) {
 	if dialer == nil {
-		return nil, false
+		return peerStatusSnapshot{}, false
 	}
 
 	p.peerCacheMu.Lock()
 	defer p.peerCacheMu.Unlock()
 
 	if snap, ok := p.peerCache[dialer]; ok && time.Now().Before(snap.expiresAt) {
-		return snap.peers, true
+		return snap, true
 	}
 
 	var peers map[string]bool
-	if provider, ok := dialer.(peerStatusProvider); ok {
-		stCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		m, err := provider.PeerOnlineMap(stCtx)
-		cancel()
-		if err != nil {
-			return nil, false
+	var peerAddrs map[string]netip.Addr
+	_, hasStatusProvider := dialer.(peerStatusProvider)
+	_, hasAddrProvider := dialer.(peerAddrProvider)
+	if hasStatusProvider || hasAddrProvider {
+		if provider, ok := dialer.(peerStatusProvider); ok {
+			stCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			m, err := provider.PeerOnlineMap(stCtx)
+			cancel()
+			if err != nil {
+				return peerStatusSnapshot{}, false
+			}
+			peers = m
 		}
-		peers = m
+		if addrProvider, ok := dialer.(peerAddrProvider); ok {
+			stCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			am, err := addrProvider.PeerAddrMap(stCtx)
+			cancel()
+			if err == nil && len(am) > 0 {
+				peerAddrs = make(map[string]netip.Addr, len(am))
+				for k, v := range am {
+					peerAddrs[strings.ToLower(strings.TrimSuffix(strings.TrimSpace(k), "."))] = v
+				}
+			}
+		}
 	} else {
 		tsSrv, isTS := dialer.(*tsnet.Server)
 		if !isTS || tsSrv == nil || tsSrv.Sys() == nil {
-			return nil, false
+			return peerStatusSnapshot{}, false
 		}
 		lc, err := tsSrv.LocalClient()
 		if err != nil || lc == nil {
-			return nil, false
+			return peerStatusSnapshot{}, false
 		}
 		stCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		st, err := lc.Status(stCtx)
 		cancel()
 		if err != nil || st == nil {
-			return nil, false
+			return peerStatusSnapshot{}, false
 		}
 		peers = buildPeerOnlineMap(st)
+		peerAddrs = buildPeerAddrMap(st)
 	}
 
+	snap := peerStatusSnapshot{
+		expiresAt: time.Now().Add(peerStatusCacheTTL),
+		peers:     peers,
+		peerAddrs: peerAddrs,
+		routes:    extractPeerRoutes(peers, peerAddrs),
+	}
 	if p.peerCache == nil {
 		p.peerCache = make(map[Dialer]peerStatusSnapshot)
 	}
-	p.peerCache[dialer] = peerStatusSnapshot{
-		expiresAt: time.Now().Add(peerStatusCacheTTL),
-		peers:     peers,
-	}
+	p.peerCache[dialer] = snap
 
-	return peers, true
+	return snap, true
+}
+
+func (p *Proxy) getPeerOnlineMap(ctx context.Context, dialer Dialer) (map[string]bool, bool) {
+	snap, ok := p.getPeerSnapshot(ctx, dialer)
+	if !ok {
+		return nil, false
+	}
+	return snap.peers, true
 }
 
 func (p *Proxy) isPeerOffline(ctx context.Context, dialer Dialer, destination string) (offline bool, reason string) {
-	peers, ok := p.getPeerOnlineMap(ctx, dialer)
-	if !ok || len(peers) == 0 {
+	snap, ok := p.getPeerSnapshot(ctx, dialer)
+	if !ok || len(snap.peers) == 0 {
 		return false, ""
 	}
 
@@ -781,9 +914,35 @@ func (p *Proxy) isPeerOffline(ctx context.Context, dialer Dialer, destination st
 		destHost = destination
 	}
 	destHostClean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(destHost), "."))
-	if online, found := peers[destHostClean]; found && !online {
-		return true, fmt.Sprintf("tailnet peer %s is offline", destHost)
+	if online, found := snap.peers[destHostClean]; found {
+		if !online {
+			return true, fmt.Sprintf("tailnet peer %s is offline", destHost)
+		}
+		return false, ""
 	}
+
+	if len(snap.routes) > 0 {
+		if addr, err := netip.ParseAddr(destHostClean); err == nil && addr.IsValid() {
+			bestBits := -1
+			bestOnline := true
+			var bestPrefix netip.Prefix
+			for _, r := range snap.routes {
+				if !r.prefix.Contains(addr) {
+					continue
+				}
+				bits := r.prefix.Bits()
+				if bits > bestBits || (bits == bestBits && r.online) {
+					bestBits = bits
+					bestOnline = r.online
+					bestPrefix = r.prefix
+				}
+			}
+			if bestBits >= 0 && !bestOnline {
+				return true, fmt.Sprintf("tailnet route %s for %s is offline", bestPrefix, destHost)
+			}
+		}
+	}
+
 	return false, ""
 }
 
@@ -800,6 +959,9 @@ func (p *Proxy) isPortProbingEnabledLocked(port PortMapping, dialer Dialer) bool
 		return dialer != nil
 	}
 	if _, ok := dialer.(peerStatusProvider); ok {
+		return true
+	}
+	if _, ok := dialer.(discoPingProvider); ok {
 		return true
 	}
 	tsSrv, isTS := dialer.(*tsnet.Server)
@@ -1736,15 +1898,33 @@ func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port Port
 			info.mu.Unlock()
 
 			if !isSuspended && info.isTrafficActive(cooldown) {
+				var pathInfo peerPathInfo
+				var hasPath bool
+				if canProbeDisco(dialer) {
+					discoCtx, discoCancel := context.WithTimeout(ctx, timeout)
+					pathInfo, hasPath = p.probeDiscoPath(discoCtx, dialer, port.Destination)
+					discoCancel()
+				}
 				info.mu.Lock()
 				info.failedProbes = 0
 				info.up = true
 				info.lastError = ""
+				if hasPath {
+					info.pathInfo = pathInfo
+				}
 				info.mu.Unlock()
 			} else {
 				probeCtx, probeCancel := context.WithTimeout(ctx, timeout)
 				err := p.probeTCPUpstream(probeCtx, dialer, port.Destination)
 				probeCancel()
+
+				var pathInfo peerPathInfo
+				var hasPath bool
+				if err == nil && ctx.Err() == nil && canProbeDisco(dialer) {
+					discoCtx, discoCancel := context.WithTimeout(ctx, timeout)
+					pathInfo, hasPath = p.probeDiscoPath(discoCtx, dialer, port.Destination)
+					discoCancel()
+				}
 
 				info.mu.Lock()
 				if ctx.Err() != nil {
@@ -1757,6 +1937,7 @@ func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port Port
 					if isSuspended || info.failedProbes >= maxFailures {
 						info.up = false
 						info.lastError = err.Error()
+						info.pathInfo = peerPathInfo{}
 						if info.listener != nil {
 							_ = info.listener.Close()
 							info.listener = nil
@@ -1768,12 +1949,16 @@ func (p *Proxy) monitorTCPUpstream(ctx context.Context, dialer Dialer, port Port
 					info.failedProbes = 0
 					info.up = true
 					info.lastError = ""
+					if hasPath {
+						info.pathInfo = pathInfo
+					}
 					if info.listener == nil {
 						lc := net.ListenConfig{KeepAlive: 30 * time.Second}
 						ln, bindErr := lc.Listen(ctx, "tcp", port.ListenAddr())
 						if bindErr != nil {
 							info.up = false
 							info.lastError = bindErr.Error()
+							info.pathInfo = peerPathInfo{}
 							log.Printf("Failed to re-bind TCP listener on %s after upstream recovery: %v",
 								port.ListenAddr(), bindErr)
 						} else {
@@ -1825,6 +2010,7 @@ func (p *Proxy) suspendTCPListener(info *listenerInfo, reason string) {
 	defer info.mu.Unlock()
 	info.up = false
 	info.lastError = reason
+	info.pathInfo = peerPathInfo{}
 	if info.listener != nil {
 		_ = info.listener.Close()
 		info.listener = nil
@@ -1978,15 +2164,33 @@ func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port Port
 			info.mu.Unlock()
 
 			if !isSuspended && info.isTrafficActive(cooldown) {
+				var pathInfo peerPathInfo
+				var hasPath bool
+				if canProbeDisco(dialer) {
+					discoCtx, discoCancel := context.WithTimeout(ctx, timeout)
+					pathInfo, hasPath = p.probeDiscoPath(discoCtx, dialer, port.Destination)
+					discoCancel()
+				}
 				info.mu.Lock()
 				info.failedProbes = 0
 				info.up = true
 				info.lastError = ""
+				if hasPath {
+					info.pathInfo = pathInfo
+				}
 				info.mu.Unlock()
 			} else {
 				probeCtx, probeCancel := context.WithTimeout(ctx, timeout)
 				err := p.probeUDPUpstream(probeCtx, dialer, port.Destination)
 				probeCancel()
+
+				var pathInfo peerPathInfo
+				var hasPath bool
+				if err == nil && ctx.Err() == nil && canProbeDisco(dialer) {
+					discoCtx, discoCancel := context.WithTimeout(ctx, timeout)
+					pathInfo, hasPath = p.probeDiscoPath(discoCtx, dialer, port.Destination)
+					discoCancel()
+				}
 
 				info.mu.Lock()
 				if ctx.Err() != nil {
@@ -1999,6 +2203,7 @@ func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port Port
 					if isSuspended || info.failedProbes >= maxFailures {
 						info.up = false
 						info.lastError = err.Error()
+						info.pathInfo = peerPathInfo{}
 						if info.conn != nil {
 							_ = info.conn.Close()
 							info.conn = nil
@@ -2010,11 +2215,15 @@ func (p *Proxy) monitorUDPUpstream(ctx context.Context, dialer Dialer, port Port
 					info.failedProbes = 0
 					info.up = true
 					info.lastError = ""
+					if hasPath {
+						info.pathInfo = pathInfo
+					}
 					if info.conn == nil {
 						conn, bindErr := net.ListenPacket("udp", port.ListenAddr())
 						if bindErr != nil {
 							info.up = false
 							info.lastError = bindErr.Error()
+							info.pathInfo = peerPathInfo{}
 							log.Printf("Failed to re-bind UDP listener on %s after upstream recovery: %v",
 								port.ListenAddr(), bindErr)
 						} else {
@@ -2066,6 +2275,7 @@ func (p *Proxy) suspendUDPListener(info *listenerInfo, reason string) {
 	defer info.mu.Unlock()
 	info.up = false
 	info.lastError = reason
+	info.pathInfo = peerPathInfo{}
 	if info.conn != nil {
 		_ = info.conn.Close()
 		info.conn = nil
@@ -2127,11 +2337,17 @@ func (p *Proxy) GetPortStatuses() []PortStatus {
 			info.mu.Lock()
 			st.Up = info.up && info.listener != nil
 			st.LastError = info.lastError
+			if st.Up {
+				applyPathInfo(&st, info.pathInfo)
+			}
 			info.mu.Unlock()
 		} else if info, ok := p.udpConns[key]; ok {
 			info.mu.Lock()
 			st.Up = info.up && info.conn != nil
 			st.LastError = info.lastError
+			if st.Up {
+				applyPathInfo(&st, info.pathInfo)
+			}
 			info.mu.Unlock()
 		}
 		statuses = append(statuses, st)

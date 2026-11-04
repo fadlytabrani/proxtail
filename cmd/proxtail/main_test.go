@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,9 +18,12 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/eventbus"
 
@@ -379,6 +383,15 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 	}
 	if hrPorts.Status != "ok" || hrPorts.ActiveListeners != 1 || len(hrPorts.Ports) != 1 || hrPorts.Ports[0].Source != freePort || !hrPorts.Ports[0].Up {
 		t.Errorf("expected /healthz to expose 1 active port mapping on %d with status 'ok', got %+v", freePort, hrPorts)
+	}
+	var rawHealthMap map[string]any
+	if err := json.Unmarshal(recHealthWithPorts.Body.Bytes(), &rawHealthMap); err != nil {
+		t.Fatalf("failed to decode /healthz raw map: %v", err)
+	}
+	for _, wantKey := range []string{"Status", "ActiveListeners", "Tailnets", "Ports", "TCPConnections", "UDPPackets", "BytesTransferred", "Errors"} {
+		if _, ok := rawHealthMap[wantKey]; !ok {
+			t.Errorf("expected top-level PascalCase key %q in /healthz response, got keys: %v", wantKey, rawHealthMap)
+		}
 	}
 
 	// Verify runHealthCheck against running HTTP health server and TCP listener
@@ -1096,16 +1109,26 @@ func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
 			}
 		}
 		inFlight.Add(-1)
+		peerKey := key.NewNode().Public()
 		return tailnetHealthDetails{
-			TailnetName:     "example.com",
-			MagicDNSSuffix:  "tail88356.ts.net",
-			MagicDNSEnabled: true,
-			Self: healthSelfStatus{
-				BackendState: "Running",
-				Online:       true,
+			Status: &ipnstate.Status{
+				BackendState:   "Running",
+				MagicDNSSuffix: "tail88356.ts.net",
+				CurrentTailnet: &ipnstate.TailnetStatus{
+					Name:            "example.com",
+					MagicDNSSuffix:  "tail88356.ts.net",
+					MagicDNSEnabled: true,
+				},
+				Self: &ipnstate.PeerStatus{
+					Online: true,
+				},
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					peerKey: {HostName: "peer-1", Online: true},
+				},
 			},
-			Peers:       []healthPeerStatus{{HostName: "peer-1", Online: true}},
-			VIPServices: []healthVIPService{{Name: "svc-a"}},
+			Services: map[tailcfg.ServiceName]tailcfg.ServiceDetails{
+				tailcfg.ServiceName("svc:svc-a"): {Name: tailcfg.ServiceName("svc:svc-a")},
+			},
 		}
 	}
 	defer tm.closeAll()
@@ -1156,14 +1179,18 @@ func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
 	tm.healthDiscoverFunc = func(_ context.Context, name string, _ *tsnet.Server) tailnetHealthDetails {
 		if name == "alpha" {
 			return tailnetHealthDetails{
-				Self: healthSelfStatus{
-					BackendState:   "Running",
-					HealthWarnings: []string{"control plane unreachable"},
+				Status: &ipnstate.Status{
+					BackendState: "Running",
+					Health:       []string{"control plane unreachable"},
+					Self:         &ipnstate.PeerStatus{Online: true},
 				},
 			}
 		}
 		return tailnetHealthDetails{
-			Self: healthSelfStatus{BackendState: "Running"},
+			Status: &ipnstate.Status{
+				BackendState: "Running",
+				Self:         &ipnstate.PeerStatus{Online: true},
+			},
 		}
 	}
 	tm.invalidateHealthCache()
@@ -1176,7 +1203,7 @@ func TestHealthzConcurrentDiscoveryAndTTLCache(t *testing.T) {
 	if err := json.Unmarshal(rec4.Body.Bytes(), &hrDegraded); err != nil {
 		t.Fatalf("failed decoding /healthz: %v", err)
 	}
-	if hrDegraded.Status != "degraded" || len(hrDegraded.Tailnets[0].Self.HealthWarnings) != 1 {
+	if hrDegraded.Status != "degraded" || len(hrDegraded.Tailnets[0].Health) != 1 {
 		t.Errorf("expected status 'degraded' with health warning on alpha, got %+v", hrDegraded)
 	}
 }
@@ -1465,8 +1492,8 @@ proxy:
 	if hrDegraded.Status != "degraded" || hrDegraded.ActiveListeners != 2 || len(hrDegraded.Tailnets) != 2 {
 		t.Fatalf("expected degraded status with 2 tailnets and 2 active listeners, got %+v", hrDegraded)
 	}
-	if hrDegraded.Tailnets[0].Profile != "alpha" || hrDegraded.Tailnets[0].Self.BackendState != "Error" || len(hrDegraded.Tailnets[0].Self.HealthWarnings) == 0 {
-		t.Fatalf("expected tailnet 'alpha' to report BackendState 'Error' with health_warnings, got %+v", hrDegraded.Tailnets[0])
+	if hrDegraded.Tailnets[0].Profile != "alpha" || hrDegraded.Tailnets[0].BackendState != "Error" || hrDegraded.Tailnets[0].Error == "" || len(hrDegraded.Tailnets[0].Health) == 0 {
+		t.Fatalf("expected tailnet 'alpha' to report BackendState 'Error' with Error and Health warnings, got %+v", hrDegraded.Tailnets[0])
 	}
 
 	// Step 3: Fix 'alpha' auth_key and reload -> 'alpha' recovers and re-binds its listener; /healthz returns "ok"
@@ -1819,3 +1846,254 @@ tailnets:
 	mu.Unlock()
 }
 
+type healthDiscoMockDialer struct {
+	dialTarget  string
+	pingResults map[netip.Addr]*ipnstate.PingResult
+}
+
+func (d *healthDiscoMockDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, d.dialTarget)
+}
+
+func (d *healthDiscoMockDialer) PingDisco(_ context.Context, ip netip.Addr) (*ipnstate.PingResult, error) {
+	if pr, ok := d.pingResults[ip]; ok {
+		cp := *pr
+		return &cp, nil
+	}
+	return &ipnstate.PingResult{Err: "peer not found"}, nil
+}
+
+func TestHealthzEndpointIncludesDiscoPathTelemetry(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+	go func() {
+		for {
+			c, acceptErr := backendLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	directIP := netip.MustParseAddr("100.64.0.10")
+	derpIP := netip.MustParseAddr("100.64.0.11")
+	dialer := &healthDiscoMockDialer{
+		dialTarget: backendLn.Addr().String(),
+		pingResults: map[netip.Addr]*ipnstate.PingResult{
+			directIP: {
+				Endpoint:       "203.0.113.45:41641",
+				LatencySeconds: 0.0042,
+			},
+			derpIP: {
+				DERPRegionID:   17,
+				DERPRegionCode: "syd",
+				LatencySeconds: 0.039,
+			},
+		},
+	}
+
+	portDirect := getFreePort(t)
+	portDERP := getFreePort(t)
+	ports := []proxy.PortMapping{
+		{
+			Source:            portDirect,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "100.64.0.10:8080",
+			Protocol:          "tcp",
+			Tailnet:           "work",
+			ConnectionTimeout: 2,
+		},
+		{
+			Source:            portDERP,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "100.64.0.11:8081",
+			Protocol:          "tcp",
+			Tailnet:           "work",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	proxyServer := proxy.NewProxyWithDialers(ports, map[string]proxy.Dialer{"work": dialer}, 32*1024, 20)
+	proxyServer.SetProbeConfig(proxy.ProbeConfig{
+		Enabled:             true,
+		Interval:            50 * time.Millisecond,
+		Timeout:             200 * time.Millisecond,
+		ConsecutiveFailures: 2,
+		Cooldown:            time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = proxyServer.Start(ctx) }()
+	defer proxyServer.Stop()
+	<-proxyServer.Started()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := proxyServer.GetPortStatuses()
+		if len(st) == 2 && st[0].Path == "direct" && st[1].Path == "derp" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	tm := newTailnetManager()
+	tm.servers["work"] = &tsnet.Server{Hostname: "proxtail-work"}
+	handler := newHealthHandler(proxyServer, tm)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var hr healthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &hr); err != nil {
+		t.Fatalf("failed to decode /healthz JSON: %v", err)
+	}
+	if len(hr.Ports) != 2 {
+		t.Fatalf("expected 2 ports in /healthz response, got %d", len(hr.Ports))
+	}
+	if hr.Ports[0].Path != "direct" || hr.Ports[0].Endpoint != "203.0.113.45:41641" || hr.Ports[0].LatencySeconds != 0.0042 {
+		t.Fatalf("expected Ports[0] to serialize direct UDP path telemetry, got %+v", hr.Ports[0])
+	}
+	if hr.Ports[1].Path != "derp" || hr.Ports[1].DERPRegionID != 17 || hr.Ports[1].DERPRegionCode != "syd" || hr.Ports[1].LatencySeconds != 0.039 {
+		t.Fatalf("expected Ports[1] to serialize DERP relay path telemetry, got %+v", hr.Ports[1])
+	}
+}
+
+func TestProbeHTTPHandler(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendLn.Close()
+	go func() {
+		for {
+			c, acceptErr := backendLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	peerIP := netip.MustParseAddr("100.64.0.10")
+	dialer := &healthDiscoMockDialer{
+		dialTarget: backendLn.Addr().String(),
+		pingResults: map[netip.Addr]*ipnstate.PingResult{
+			peerIP: {
+				Endpoint:       "203.0.113.45:41641",
+				LatencySeconds: 0.0042,
+			},
+		},
+	}
+
+	proxyServer := proxy.NewProxyWithDialers(nil, map[string]proxy.Dialer{"work": dialer}, 32*1024, 20)
+	tm := newTailnetManager()
+	tm.servers["work"] = &tsnet.Server{Hostname: "proxtail-work"}
+	handler := newHealthHandler(proxyServer, tm)
+
+	// 1. Valid GET /probe for open TCP port returns 200 OK with Reachable=true and Path="direct"
+	req := httptest.NewRequest(http.MethodGet, "/probe?profile=work&protocol=tcp&destination=100.64.0.10:5432&timeout=500ms", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var res proxy.ProbeResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode /probe JSON: %v", err)
+	}
+	if !res.Reachable || !res.PeerOnline || res.Profile != "work" || res.Protocol != "tcp" || res.PeerIP != "100.64.0.10" || res.Path != "direct" || res.Endpoint != "203.0.113.45:41641" {
+		t.Fatalf("unexpected /probe response: %+v", res)
+	}
+
+	// 2. Unknown profile returns 404 Not Found
+	reqNotFound := httptest.NewRequest(http.MethodGet, "/probe?profile=nonexistent&destination=100.64.0.10:5432", nil)
+	recNotFound := httptest.NewRecorder()
+	handler.ServeHTTP(recNotFound, reqNotFound)
+	if recNotFound.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for unknown profile, got %d: %s", recNotFound.Code, recNotFound.Body.String())
+	}
+
+	// 3. Invalid parameters return 400 Bad Request
+	for _, urlPath := range []string{
+		"/probe?destination=100.64.0.10:5432",
+		"/probe?profile=work",
+		"/probe?profile=work&destination=invalid-no-port",
+		"/probe?profile=work&destination=100.64.0.10:70000",
+		"/probe?profile=work&protocol=icmp&destination=100.64.0.10:5432",
+		"/probe?profile=work&destination=100.64.0.10:5432&timeout=-1s",
+		"/probe?profile=work&destination=100.64.0.10:5432&timeout=invalid",
+		"/probe?profile=work&destination=100.64.0.10:5432&stream=invalid",
+	} {
+		r := httptest.NewRequest(http.MethodGet, urlPath, nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for %q, got %d: %s", urlPath, w.Code, w.Body.String())
+		}
+	}
+
+	// 4. Streaming NDJSON (?stream=true) returns 3 newline-delimited JSON objects ("netmap", "path", "port")
+	reqNDJSON := httptest.NewRequest(http.MethodGet, "/probe?profile=work&protocol=tcp&destination=100.64.0.10:5432&stream=true", nil)
+	recNDJSON := httptest.NewRecorder()
+	handler.ServeHTTP(recNDJSON, reqNDJSON)
+	if recNDJSON.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for NDJSON stream, got %d: %s", recNDJSON.Code, recNDJSON.Body.String())
+	}
+	if ct := recNDJSON.Header().Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Fatalf("expected Content-Type application/x-ndjson, got %q", ct)
+	}
+	lines := strings.Split(strings.TrimSpace(recNDJSON.Body.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 NDJSON lines, got %d: %s", len(lines), recNDJSON.Body.String())
+	}
+	var firstEv, finalEv proxy.ProbeResult
+	if err := json.Unmarshal([]byte(lines[0]), &firstEv); err != nil {
+		t.Fatalf("failed to unmarshal first NDJSON line: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &finalEv); err != nil {
+		t.Fatalf("failed to unmarshal final NDJSON line: %v", err)
+	}
+	if firstEv.Stage != "netmap" || !firstEv.PeerOnline {
+		t.Fatalf("expected first NDJSON event to be stage='netmap', got %+v", firstEv)
+	}
+	if !finalEv.Reachable || finalEv.Path != "direct" || finalEv.Endpoint != "203.0.113.45:41641" {
+		t.Fatalf("expected final NDJSON event to contain cumulative Reachable=true and Path='direct', got %+v", finalEv)
+	}
+
+	// 5. Streaming SSE (Accept: text/event-stream) returns Server-Sent Events
+	reqSSE := httptest.NewRequest(http.MethodGet, "/probe?profile=work&protocol=tcp&destination=100.64.0.10:5432", nil)
+	reqSSE.Header.Set("Accept", "text/event-stream")
+	recSSE := httptest.NewRecorder()
+	handler.ServeHTTP(recSSE, reqSSE)
+	if recSSE.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for SSE stream, got %d: %s", recSSE.Code, recSSE.Body.String())
+	}
+	if ct := recSSE.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("expected Content-Type text/event-stream, got %q", ct)
+	}
+	sseBody := recSSE.Body.String()
+	if !strings.Contains(sseBody, "event: netmap\n") || !strings.Contains(sseBody, "event: path\n") || !strings.Contains(sseBody, "event: port\n") {
+		t.Fatalf("expected SSE body to contain netmap, path, and port events, got:\n%s", sseBody)
+	}
+
+	// 6. Non-GET HTTP methods (including POST and DELETE) return 405 Method Not Allowed
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		reqMethod := httptest.NewRequest(method, "/probe?profile=work&destination=100.64.0.10:5432", nil)
+		recMethod := httptest.NewRecorder()
+		handler.ServeHTTP(recMethod, reqMethod)
+		if recMethod.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405 Method Not Allowed for %s /probe, got %d", method, recMethod.Code)
+		}
+	}
+}

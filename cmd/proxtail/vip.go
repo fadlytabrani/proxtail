@@ -46,8 +46,69 @@ type vipTargetSpec struct {
 }
 
 type vipWatcherEntry struct {
-	srv    *tsnet.Server
-	cancel context.CancelFunc
+	srv           *tsnet.Server
+	autoProxyVIPs bool
+	cancel        context.CancelFunc
+}
+
+// defaultIPNBusWatchMask subscribes to initial daemon state plus incremental peer/netmap
+// patches so WatchIPNBus delivers real-time notifications for:
+//   - full netmap updates and local node/service changes (SelfChange, Prefs)
+//   - incremental peer additions, removals, and route/service advertisement changes (PeersChanged, PeersRemoved)
+//   - peer online/offline transitions (PeerChangedPatch.Online)
+//   - backend state and health changes (State, LoginFinished, Health)
+const defaultIPNBusWatchMask = ipn.NotifyInitialState | ipn.NotifyPeerPatches
+
+// ipnBusWatcher abstracts tailscale.com/client/local.IPNBusWatcher so WatchIPNBus
+// event-driven reconciliation can be deterministically unit-tested.
+type ipnBusWatcher interface {
+	Next() (ipn.Notify, error)
+	Close() error
+}
+
+type ipnBusWatchFunc func(ctx context.Context, tailnetName string, srv *tsnet.Server, mask ipn.NotifyWatchOpt) (ipnBusWatcher, error)
+
+func defaultWatchIPNBus(ctx context.Context, _ string, srv *tsnet.Server, mask ipn.NotifyWatchOpt) (ipnBusWatcher, error) {
+	if srv == nil || srv.Sys() == nil {
+		return nil, errors.New("tsnet server not initialized")
+	}
+	lc, err := srv.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	if lc == nil {
+		return nil, errors.New("tsnet local client unavailable")
+	}
+	return lc.WatchIPNBus(ctx, mask)
+}
+
+// hasPeerOnlinePatch reports whether any incremental PeerChange patch carries
+// an Online state transition (ignoring routine endpoint or LastSeen updates).
+func hasPeerOnlinePatch(patches []*tailcfg.PeerChange) bool {
+	for _, p := range patches {
+		if p != nil && p.Online != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyIPNNotify determines whether an IPN bus notification should trigger
+// VIP service port reconciliation (reconcileVIPs) and/or tailnet health & peer
+// reachability cache invalidation (invalidateState).
+func classifyIPNNotify(n ipn.Notify) (reconcileVIPs bool, invalidateState bool) {
+	reconcileVIPs = n.SelfChange != nil ||
+		n.State != nil ||
+		n.LoginFinished != nil ||
+		n.Prefs != nil ||
+		len(n.PeersChanged) > 0 ||
+		len(n.PeersRemoved) > 0
+
+	invalidateState = reconcileVIPs ||
+		n.Health != nil ||
+		hasPeerOnlinePatch(n.PeerChangedPatch)
+
+	return reconcileVIPs, invalidateState
 }
 
 // defaultDiscoverVIPServices queries the live tsnet LocalClient for Tailscale VIP services.
@@ -612,6 +673,7 @@ func (tm *tailnetManager) startVIPReconciler(ctx context.Context, proxyServer *p
 	rCtx, rCancel := context.WithCancel(ctx)
 	tm.reconcilerCtx = rCtx
 	tm.reconcilerCancel = rCancel
+	tm.reconcilerProxy = proxyServer
 	if tm.vipTriggerCh == nil {
 		tm.vipTriggerCh = make(chan struct{}, 1)
 	}
@@ -706,34 +768,44 @@ func (tm *tailnetManager) syncVIPWatchers(cfg *config.Config, servers map[string
 		return
 	}
 
-	desired := make(map[string]*tsnet.Server)
+	type desiredWatchSpec struct {
+		srv           *tsnet.Server
+		autoProxyVIPs bool
+	}
+
+	hasCustomWatch := tm.ipnBusWatchFunc != nil
+	desired := make(map[string]desiredWatchSpec, len(cfg.Tailnets))
 	for _, tailnetCfg := range cfg.Tailnets {
-		if !tailnetCfg.IsAutoProxyVIPs() {
+		srv := servers[tailnetCfg.Profile]
+		if srv == nil || (srv.Sys() == nil && !hasCustomWatch) {
 			continue
 		}
-		if srv := servers[tailnetCfg.Profile]; srv != nil && srv.Sys() != nil {
-			desired[tailnetCfg.Profile] = srv
+		desired[tailnetCfg.Profile] = desiredWatchSpec{
+			srv:           srv,
+			autoProxyVIPs: tailnetCfg.IsAutoProxyVIPs(),
 		}
 	}
 
 	for name, existing := range tm.vipWatchers {
-		wantSrv, ok := desired[name]
-		if !ok || existing.srv != wantSrv {
+		want, ok := desired[name]
+		if !ok || existing.srv != want.srv || existing.autoProxyVIPs != want.autoProxyVIPs {
 			existing.cancel()
 			delete(tm.vipWatchers, name)
 		}
 	}
 
-	for name, srv := range desired {
+	proxyServer := tm.reconcilerProxy
+	for name, spec := range desired {
 		if _, exists := tm.vipWatchers[name]; exists {
 			continue
 		}
 		wCtx, wCancel := context.WithCancel(tm.reconcilerCtx)
 		tm.vipWatchers[name] = vipWatcherEntry{
-			srv:    srv,
-			cancel: wCancel,
+			srv:           spec.srv,
+			autoProxyVIPs: spec.autoProxyVIPs,
+			cancel:        wCancel,
 		}
-		go tm.watchTailnetIPNBus(wCtx, name, srv)
+		go tm.watchTailnetIPNBus(wCtx, name, spec.srv, spec.autoProxyVIPs, proxyServer)
 	}
 
 	newInterval := resolveVIPRefreshInterval(tm)
@@ -759,14 +831,30 @@ func (tm *tailnetManager) stopVIPWatchers() {
 		tm.reconcilerCancel()
 		tm.reconcilerCancel = nil
 		tm.reconcilerCtx = nil
+		tm.reconcilerProxy = nil
 	}
 }
 
-// watchTailnetIPNBus subscribes to Tailscale's local IPN notification bus for SelfChange / State events
-// (which fire whenever the node comes online or its visible VIP services change) with zero peer-churn overhead.
-func (tm *tailnetManager) watchTailnetIPNBus(ctx context.Context, _ string, srv *tsnet.Server) {
-	if srv == nil || srv.Sys() == nil {
-		return
+// watchTailnetIPNBus subscribes to Tailscale's local IPN notification bus with
+// defaultIPNBusWatchMask (NotifyInitialState | NotifyPeerPatches) to react in real time
+// to full and incremental netmap updates, VIP service/route advertisement changes,
+// and peer online/offline transitions.
+func (tm *tailnetManager) watchTailnetIPNBus(
+	ctx context.Context,
+	tailnetName string,
+	srv *tsnet.Server,
+	autoProxyVIPs bool,
+	proxyServer *proxy.Proxy,
+) {
+	tm.vipWatchMu.Lock()
+	watchFn := tm.ipnBusWatchFunc
+	tm.vipWatchMu.Unlock()
+
+	if watchFn == nil {
+		if srv == nil || srv.Sys() == nil {
+			return
+		}
+		watchFn = defaultWatchIPNBus
 	}
 
 	backoff := 500 * time.Millisecond
@@ -776,20 +864,24 @@ func (tm *tailnetManager) watchTailnetIPNBus(ctx context.Context, _ string, srv 
 		if ctx.Err() != nil {
 			return
 		}
-		lc, err := srv.LocalClient()
-		if err == nil && lc != nil {
-			watcher, wErr := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
-			if wErr == nil {
-				backoff = 500 * time.Millisecond
-				for {
-					n, nextErr := watcher.Next()
-					if nextErr != nil {
-						_ = watcher.Close()
-						break
+		watcher, wErr := watchFn(ctx, tailnetName, srv, defaultIPNBusWatchMask)
+		if wErr == nil && watcher != nil {
+			backoff = 500 * time.Millisecond
+			for {
+				n, nextErr := watcher.Next()
+				if nextErr != nil {
+					_ = watcher.Close()
+					break
+				}
+				reconcileVIPs, invalidateState := classifyIPNNotify(n)
+				if invalidateState {
+					tm.invalidateTailnetHealthCache(tailnetName)
+					if proxyServer != nil {
+						proxyServer.NotifyTailnetNetmapChanged(tailnetName)
 					}
-					if n.SelfChange != nil || n.State != nil || n.LoginFinished != nil {
-						tm.triggerVIPReconcile()
-					}
+				}
+				if reconcileVIPs && autoProxyVIPs {
+					tm.triggerVIPReconcile()
 				}
 			}
 		}

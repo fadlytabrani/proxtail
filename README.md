@@ -168,7 +168,7 @@ flowchart TD
 - **Cross-Platform Standalone Binaries**: Precompiled standalone binaries for Linux, macOS, Windows, and FreeBSD with zero external dependencies.
 - **Tailscale OAuth & Auto ACL Tag Discovery**: Authenticate with non-expiring OAuth client secrets (`tskey-client-...`). When `tags:` are omitted in YAML, `proxtail` automatically queries the Tailscale API to discover and advertise authorized tags.
 - **Zero-Downtime Hot Reload**: Dynamic file watching and Kubernetes atomic symlink detection (`..data`) reload routes in **< 100 ms** without dropping active connections.
-- **Native Observability**: Prometheus metrics (`/metrics`) and unified Kubernetes health and readiness endpoint (`/healthz`).
+- **Native Observability & Pre-Flight Probing**: Prometheus metrics (`/metrics`), unified Kubernetes health/readiness and raw Tailscale status endpoint (`/healthz`), and on-demand pre-flight port & Disco path probing (`/probe` with 3-stage NDJSON/SSE progressive streaming).
 
 ---
 
@@ -373,9 +373,9 @@ proxy:
   vip_port_range: '30000-30999' # Reserved exclusively for auto-proxied VIP services
 ```
 
-Inspect active VIP local port allocations at any time via `/healthz` (`ports[].vip_service`):
+Inspect active VIP local port allocations at any time via `/healthz` (`Ports[].VIPService`):
 ```bash
-curl -s http://localhost:9090/healthz | jq '.ports[] | select(.vip_service != null)'
+curl -s http://localhost:9090/healthz | jq '.Ports[] | select(.VIPService != null)'
 ```
 
 *(You can also manually map a specific local port outside `vip_port_range`—such as `8443`—to a VIP service hostname or FQDN via `ports:`.)*
@@ -394,7 +394,7 @@ proxy:
 
 Once running, query `/healthz` to inspect discovered services:
 ```bash
-curl http://localhost:9090/healthz | jq .tailnets[0].vip_services
+curl http://localhost:9090/healthz | jq '.Tailnets[0].Services'
 ```
 
 You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automatic file watcher dynamically binds the newly added ports with zero downtime and without reconnecting to the tailnet.
@@ -440,8 +440,8 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `api_listen_address` | `string` | `"0.0.0.0"` | Local bind IP for the HTTP API server (`/healthz`, `/metrics`). Does not inherit from `tailnets[].listen_address`. |
-| `api_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz` and `/metrics` (must be outside `vip_port_range`). |
+| `api_listen_address` | `string` | `"0.0.0.0"` | Local bind IP for the HTTP API server (`/healthz`, `/probe`, `/metrics`). Does not inherit from `tailnets[].listen_address`. |
+| `api_port` | `int` | Disabled (`0`) | HTTP port serving `/healthz`, `/probe`, and `/metrics` (must be outside `vip_port_range`). |
 | `state_dir` | `string` | `PROXTAIL_STATE_DIR` / `TS_STATE_DIR` | Base directory for Tailscale node state storage; each tailnet uses `<state_dir>/<profile>`. |
 | `vip_port_range` | `string` | `"30000-30999"` | Reserved local `"start-end"` port range allocated exclusively to auto-proxied VIP services. |
 | `buffer_size` | `int` | `512` | Per-connection I/O copy buffer size in KB (`1`–`8192`). |
@@ -483,7 +483,8 @@ You can then add port mappings to `config.yaml` on the fly—`proxtail`'s automa
 - **Read-Only Root Filesystem**: Operates cleanly with `readOnlyRootFilesystem: true` using an `emptyDir` at `/var/lib/tsnet` and `/tmp`.
 - **ConfigMap Hot Reload**: Watches the `/etc/proxtail` directory; swapping the `..data` symlink on `kubectl apply` reloads routes with zero downtime.
 - **Health, Readiness & Metrics Endpoints**:
-  - `GET /healthz`: Unified health and readiness probe (`200 OK` when `"ok"` or `"degraded"`, `503 Service Unavailable` when `"down"` during startup, `SIGTERM` draining, or when all configured listeners are suspended), returning self-node metadata (`tailnets[].self`), active tailnet peers, discovered Virtual IP (VIP) services with MagicDNS FQDNs, and per-port listener state.
+  - `GET /healthz`: Unified health and readiness probe (`200 OK` when `"ok"` or `"degraded"`, `503 Service Unavailable` when `"down"` during startup, `SIGTERM` draining, or when all configured listeners are suspended), returning self-node metadata (`tailnets[].Self`), active tailnet peers, discovered Virtual IP (VIP) services with MagicDNS FQDNs, and per-port listener state + Disco path telemetry (`Path`, `Endpoint`, `DERPRegionID`, `DERPRegionCode`, `LatencySeconds`).
+  - `GET /probe`: On-demand pre-flight reachability & path probing endpoint (`?profile=<name>&protocol=tcp|udp&destination=<host:port>&timeout=2s`) for external orchestrators to verify whether a candidate port on a peer is open, permitted by Tailscale ACLs (`ACLBlocked`), and using direct P2P UDP or DERP before adding it to `config.yaml`.
   - `GET /metrics`: Prometheus metrics scraper endpoint.
 - **Graceful Shutdown**: On pod scale-down or node draining, Kubernetes sends `SIGTERM`. `proxtail` immediately deregisters its ephemeral nodes via `b.Logout()`, eliminating stale or offline nodes in Tailscale Admin.
 
@@ -531,15 +532,13 @@ When placing `proxtail` behind an external L4 load balancer or Application Deliv
 
 ### Unified Health, Readiness & Tailnet Discovery (`/healthz`)
 
-When `api_port` is configured (or via `PROXTAIL_API_PORT=9090`), the `GET /healthz` HTTP endpoint acts as both the readiness probe and a zero-extra-RPC-cost ("Tier 0") operational status snapshot (cached for 2 seconds per tailnet):
+When `api_port` is configured (or via `PROXTAIL_API_PORT=9090`), the `GET /healthz` HTTP endpoint acts as both the readiness probe and a zero-extra-RPC-cost ("Tier 0") operational status snapshot (cached for 2 seconds per tailnet) using unified `PascalCase` JSON and embedding Tailscale's native `/localapi/v0/status` (`ipnstate.Status`) and `/localapi/v0/services` (`Services`) per tailnet:
 - **Dynamic Status & HTTP Codes**:
-  - `"ok"` (`200 OK`): All configured port listeners are bound (`up: true`) and all connected tailnet nodes are `Running` with no health warnings (also `"ok"` in zero-port discovery or zero-tailnet standby mode).
-  - `"degraded"` (`200 OK`): At least one port listener remains active (`active_listeners > 0`), **but** one or more ports are suspended (`up: false`), **or** a tailnet node has `self.backend_state != "Running"` or `self.health_warnings`.
-  - `"down"` (`503 Service Unavailable`): Proxy is starting up or shutting down, **or** ports are configured (`len(ports) > 0`) and all local listeners are down (`active_listeners == 0`).
-- **Tailnet & Self-Node Details (`tailnets[]` & `tailnets[].self`)**: Local profile key (`profile`), Tailscale organization name (`tailnet_name`), MagicDNS suffix/status, and ProxTail's own node details (`id`, `hostname`, `dns_name`, `ipv4`, `ipv6`, `backend_state`, `online`, `relay`, `tags`, `key_expiry`, `cert_domains`, `health_warnings`).
-- **Per-Port Reachability (`ports[]`)**: Live local bind state (`up: true/false`), `listen_address`, `listen_addr`, `destination`, `protocol`, `profile`, `vip_service`, and `last_error` when suspended by upstream probing.
-- **Active Peers (`tailnets[].peers[]`)**: Discovered tailnet peer nodes with stable node ID, hostname, MagicDNS FQDN, IPv4/IPv6 addresses, online/active status, direct P2P `cur_addr` vs. DERP `relay`, `rx_bytes`/`tx_bytes` counters, `last_handshake`, `last_seen`, ACL `tags`, advertised `primary_routes`, and `expired` flag.
-- **VIP Services (`tailnets[].vip_services[]`)**: Discovered Tailscale Virtual IP (VIP) services with service names, display names, resolved MagicDNS FQDNs (`<service-name>.<magic-dns-suffix>`), IPv4/IPv6 VIPs, and exposed proto-ports.
+  - `"ok"` (`200 OK`): All configured port listeners are bound (`Up: true`) and all connected tailnet nodes are `Running` with no health warnings (also `"ok"` in zero-port discovery or zero-tailnet standby mode).
+  - `"degraded"` (`200 OK`): At least one port listener remains active (`ActiveListeners > 0`), **but** one or more ports are suspended (`Up: false`), **or** a tailnet node has `BackendState != "Running"`, `Error != ""`, or `Health` warnings.
+  - `"down"` (`503 Service Unavailable`): Proxy is starting up or shutting down, **or** ports are configured (`len(Ports) > 0`) and all local listeners are down (`ActiveListeners == 0`), **or** all configured tailnets are in `"Error"` state.
+- **Native Tailscale Status (`Tailnets[]`)**: Each entry includes ProxTail's `Profile` (and optional `Error`), embeds the full Tailscale `ipnstate.Status` (`Version`, `TUN`, `BackendState`, `HaveNodeKey`, `TailscaleIPs`, `Self`, `Health`, `MagicDNSSuffix`, `CurrentTailnet`, `CertDomains`, `Peer`, `User`), and attaches `Services` (`map[tailcfg.ServiceName]tailcfg.ServiceDetails`).
+- **Per-Port Reachability & Disco Path Telemetry (`Ports[]`)**: Live local bind state (`Up: true/false`), `Port`, `ListenAddress`, `ListenAddr`, `Destination`, `Protocol`, `Profile`, `VIPService`, `LastError` when suspended by upstream probing, plus Tailscale Disco path telemetry (`Path` = `"direct"` | `"derp"` | `"local"`, `Endpoint`, `DERPRegionID`, `DERPRegionCode`, `LatencySeconds`) when probing is active.
 
 ```bash
 curl http://localhost:9090/healthz | jq
@@ -548,93 +547,175 @@ curl http://localhost:9090/healthz | jq
 Example JSON response:
 ```json
 {
-  "status": "ok",
-  "active_listeners": 2,
-  "tailnets": [
+  "Status": "ok",
+  "ActiveListeners": 2,
+  "Tailnets": [
     {
-      "profile": "production",
-      "tailnet_name": "example.com",
-      "magic_dns_suffix": "tail88356.ts.net",
-      "magic_dns_enabled": true,
-      "self": {
-        "id": "n293847239CNTRL",
-        "hostname": "proxtail-production",
-        "dns_name": "proxtail-production.tail88356.ts.net",
-        "ipv4": "100.64.0.42",
-        "ipv6": "fd7a:115c:a1e0::2a",
-        "backend_state": "Running",
-        "online": true,
-        "relay": "syd",
-        "tags": [
+      "Profile": "production",
+      "Version": "1.96.4",
+      "TUN": false,
+      "BackendState": "Running",
+      "HaveNodeKey": true,
+      "AuthURL": "",
+      "TailscaleIPs": [
+        "100.64.0.42",
+        "fd7a:115c:a1e0::2a"
+      ],
+      "Self": {
+        "ID": "n293847239CNTRL",
+        "PublicKey": "nodekey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "HostName": "proxtail-production",
+        "DNSName": "proxtail-production.tail88356.ts.net.",
+        "OS": "linux",
+        "UserID": 1001,
+        "TailscaleIPs": [
+          "100.64.0.42",
+          "fd7a:115c:a1e0::2a"
+        ],
+        "Tags": [
           "tag:proxy"
         ],
-        "key_expiry": "2027-04-29T10:00:00Z"
+        "Relay": "syd",
+        "Online": true,
+        "KeyExpiry": "2027-04-29T10:00:00Z"
       },
-      "vip_services": [
-        {
-          "name": "api-backend",
-          "dns_name": "api-backend.tail88356.ts.net",
-          "display_name": "API Backend",
-          "ipv4": "100.64.0.100",
-          "ipv6": "fd7a:115c:a1e0::64",
-          "ports": [
+      "ExitNodeStatus": null,
+      "Health": [],
+      "MagicDNSSuffix": "tail88356.ts.net",
+      "CurrentTailnet": {
+        "Name": "example.com",
+        "MagicDNSSuffix": "tail88356.ts.net",
+        "MagicDNSEnabled": true
+      },
+      "CertDomains": [
+        "proxtail-production.tail88356.ts.net"
+      ],
+      "Peer": {
+        "nodekey:aaaa111122223333444455556666777788889999aaaabbbbccccddddeeeeffff": {
+          "ID": "n1048576CNTRL",
+          "PublicKey": "nodekey:aaaa111122223333444455556666777788889999aaaabbbbccccddddeeeeffff",
+          "HostName": "postgres-prod-01",
+          "DNSName": "postgres-prod-01.tail88356.ts.net.",
+          "OS": "linux",
+          "UserID": 1001,
+          "TailscaleIPs": [
+            "100.64.0.15",
+            "fd7a:115c:a1e0::f"
+          ],
+          "Tags": [
+            "tag:prod-db"
+          ],
+          "PrimaryRoutes": [
+            "10.20.0.0/16"
+          ],
+          "CurAddr": "203.0.113.45:41641",
+          "Relay": "syd",
+          "RxBytes": 104857600,
+          "TxBytes": 52428800,
+          "LastSeen": "2026-10-31T10:24:00Z",
+          "LastHandshake": "2026-10-31T10:22:15Z",
+          "Online": true,
+          "Active": true
+        }
+      },
+      "Services": {
+        "svc:api-backend": {
+          "Name": "svc:api-backend",
+          "Addrs": [
+            "100.64.0.100",
+            "fd7a:115c:a1e0::64"
+          ],
+          "DisplayName": "API Backend",
+          "Ports": [
             "tcp:443",
             "tcp:8443"
           ]
         }
-      ],
-      "peers": [
-        {
-          "id": "n1048576CNTRL",
-          "hostname": "postgres-prod-01",
-          "dns_name": "postgres-prod-01.tail88356.ts.net",
-          "ipv4": "100.64.0.15",
-          "ipv6": "fd7a:115c:a1e0::f",
-          "online": true,
-          "active": true,
-          "cur_addr": "203.0.113.45:41641",
-          "relay": "syd",
-          "rx_bytes": 104857600,
-          "tx_bytes": 52428800,
-          "last_handshake": "2026-10-31T10:22:15Z",
-          "last_seen": "2026-10-31T10:24:00Z",
-          "tags": [
-            "tag:prod-db"
-          ],
-          "primary_routes": [
-            "10.20.0.0/16"
-          ]
-        }
-      ]
+      }
     }
   ],
-  "ports": [
+  "Ports": [
     {
-      "port": 5432,
-      "listen_address": "127.0.0.1",
-      "listen_addr": "127.0.0.1:5432",
-      "destination": "postgres-prod-01:5432",
-      "protocol": "tcp",
-      "profile": "production",
-      "up": true
+      "Port": 5432,
+      "ListenAddress": "127.0.0.1",
+      "ListenAddr": "127.0.0.1:5432",
+      "Destination": "postgres-prod-01:5432",
+      "Protocol": "tcp",
+      "Profile": "production",
+      "Up": true,
+      "Path": "direct",
+      "Endpoint": "203.0.113.45:41641",
+      "LatencySeconds": 0.0042
     },
     {
-      "port": 30000,
-      "listen_address": "127.0.0.1",
-      "listen_addr": "127.0.0.1:30000",
-      "destination": "100.64.0.100:443",
-      "protocol": "tcp",
-      "profile": "production",
-      "vip_service": "api-backend",
-      "up": true
+      "Port": 30000,
+      "ListenAddress": "127.0.0.1",
+      "ListenAddr": "127.0.0.1:30000",
+      "Destination": "100.64.0.100:443",
+      "Protocol": "tcp",
+      "Profile": "production",
+      "VIPService": "api-backend",
+      "Up": true,
+      "Path": "derp",
+      "DERPRegionID": 17,
+      "DERPRegionCode": "syd",
+      "LatencySeconds": 0.0385
     }
   ],
-  "tcp_connections": 4,
-  "udp_packets": 1280,
-  "bytes_transferred": 157286400,
-  "errors": 0
+  "TCPConnections": 4,
+  "UDPPackets": 1280,
+  "BytesTransferred": 157286400,
+  "Errors": 0
 }
 ```
+
+### On-Demand Pre-Flight Port & Path Probing (`/probe`)
+
+External orchestrators and control planes can verify whether a candidate port on a peer is open, reachable over the target tailnet's isolated `tsnet.Server` netstack, permitted by Tailscale ACLs, and using a direct P2P UDP path or DERP relay **before** adding the port mapping to `config.yaml`:
+
+```bash
+# Standard single-JSON response
+curl "http://localhost:9090/probe?profile=production&protocol=tcp&destination=postgres-prod-01:5432&timeout=2s" | jq
+
+# Progressive 3-stage NDJSON stream ("netmap" -> "path" -> "port")
+curl -N "http://localhost:9090/probe?profile=production&protocol=tcp&destination=postgres-prod-01:5432&stream=true"
+
+# Progressive 3-stage Server-Sent Events (SSE) stream for browser EventSource
+curl -N "http://localhost:9090/probe?profile=production&protocol=tcp&destination=postgres-prod-01:5432&stream=sse"
+```
+
+| Query Parameter / Header | Default | Description |
+| :--- | :--- | :--- |
+| `profile` | `"default"` *(if 1 tailnet)* | Target tailnet profile name in `proxtail`. Required when multiple tailnets are configured. |
+| `protocol` | `"tcp"` | Layer 4 protocol to probe: `"tcp"` or `"udp"`. |
+| `destination` | *(required)* | Target `<host>:<port>` inside the tailnet (MagicDNS hostname, FQDN, Tailscale IP, VIP, or advertised subnet IP). |
+| `timeout` | `probe.timeout` (`2s`) | Per-request probe deadline (`100ms`–`30s`, e.g., `2s` or `500ms`). |
+| `stream` / `Accept` | Disabled (single JSON) | Set `stream=true` (or `Accept: application/x-ndjson`) for 3-stage NDJSON streaming, or `stream=sse` (or `Accept: text/event-stream`) for Server-Sent Events (`event: netmap`, `event: path`, `event: port`). |
+
+Example standard JSON response:
+```json
+{
+  "Profile": "production",
+  "Protocol": "tcp",
+  "Destination": "postgres-prod-01:5432",
+  "PeerIP": "100.64.0.15",
+  "PeerOnline": true,
+  "Reachable": true,
+  "DialLatencySeconds": 0.0048,
+  "Path": "direct",
+  "Endpoint": "203.0.113.45:41641",
+  "LatencySeconds": 0.0042
+}
+```
+
+Example 3-stage NDJSON stream (`?stream=true`), where each line is flushed immediately as its stage completes:
+```json
+{"Stage":"netmap","Profile":"production","Protocol":"tcp","Destination":"postgres-prod-01:5432","PeerIP":"100.64.0.15","PeerOnline":true,"Reachable":false}
+{"Stage":"path","Profile":"production","Protocol":"tcp","Destination":"postgres-prod-01:5432","PeerIP":"100.64.0.15","PeerOnline":true,"Reachable":false,"Path":"direct","Endpoint":"203.0.113.45:41641","LatencySeconds":0.0042}
+{"Stage":"port","Profile":"production","Protocol":"tcp","Destination":"postgres-prod-01:5432","PeerIP":"100.64.0.15","PeerOnline":true,"Reachable":true,"DialLatencySeconds":0.0048,"Path":"direct","Endpoint":"203.0.113.45:41641","LatencySeconds":0.0042}
+```
+
+If the peer is online in the netmap (`PeerOnline: true`) but the port is closed (`connection refused`) or blocked by Tailscale ACLs (`ACLBlocked: true` via TSMP diagnostic ping), `/probe` returns `Reachable: false` along with the `Error` and the peer's transport `Path` (`"direct"` vs `"derp"`). In non-streaming mode, `/probe` returns `HTTP 200 OK` when `Reachable: true` and `HTTP 502 Bad Gateway` when `Reachable: false`; in streaming mode (`?stream=true` or `?stream=sse`), `HTTP 200 OK` headers are flushed upfront (`X-Content-Type-Options: nosniff`, `Cache-Control: no-cache`) and reachability is determined from the final emitted stage object (which short-circuits after `"netmap"` if `PeerOnline: false`).
 
 ### Prometheus Metrics
 When `api_port` is enabled (e.g. `PROXTAIL_API_PORT=9090`):

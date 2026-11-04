@@ -10,9 +10,9 @@ Thank you for your interest in contributing to `proxtail`! This guide covers our
 
 ```text
 proxtail/
-├── cmd/proxtail/          # CLI entrypoint, tsnet lifecycle manager, config watcher, and HTTP health/metrics server
+├── cmd/proxtail/          # CLI entrypoint, tsnet lifecycle, IPN bus watcher, and HTTP API server (/healthz, /probe, /metrics)
 ├── internal/config/       # YAML configuration parsing, convention-over-configuration defaults, and validation
-├── internal/proxy/        # High-throughput TCP/UDP forwarding engine, buffer pools, and hot-reload state machine
+├── internal/proxy/        # High-throughput TCP/UDP forwarding engine, Disco/L4 probing, buffer pools, and hot-reload state machine
 └── examples/              # Ready-to-run Docker Compose, Kubernetes, and multi-tailnet YAML examples
 ```
 

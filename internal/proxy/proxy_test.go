@@ -25,6 +25,7 @@ import (
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 )
 
 type localDialer struct{}
@@ -3043,5 +3044,638 @@ func TestUpdateTailnetDialersPreservesUnchangedPeerCache(t *testing.T) {
 	}
 	if !betaCached {
 		t.Fatal("expected unchanged dialerBeta to remain in peerCache")
+	}
+}
+
+func TestBuildPeerOnlineMapPrimaryRoutesAndExpired(t *testing.T) {
+	kOfflineVIP := key.NewNode().Public()
+	kOnlineVIP := key.NewNode().Public()
+	kExpiredPeer := key.NewNode().Public()
+	kOfflineRouter := key.NewNode().Public()
+	kOnlineSpecificRouter := key.NewNode().Public()
+
+	offlineVIPRoutes := views.SliceOf([]netip.Prefix{
+		netip.MustParsePrefix("100.101.102.10/32"),
+		netip.MustParsePrefix("100.101.102.99/32"),
+	})
+	onlineVIPRoutes := views.SliceOf([]netip.Prefix{
+		netip.MustParsePrefix("100.101.102.10/32"),
+	})
+	offlineSubnetRoutes := views.SliceOf([]netip.Prefix{
+		netip.MustParsePrefix("10.20.0.0/16"),
+	})
+	onlineSpecificSubnetRoutes := views.SliceOf([]netip.Prefix{
+		netip.MustParsePrefix("10.20.1.0/24"),
+	})
+
+	st := &ipnstate.Status{
+		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+			kOfflineVIP: {
+				HostName:      "vip-node-1",
+				TailscaleIPs:  []netip.Addr{netip.MustParseAddr("100.64.0.21")},
+				PrimaryRoutes: &offlineVIPRoutes,
+				Online:        false,
+			},
+			kOnlineVIP: {
+				HostName:      "vip-node-2",
+				TailscaleIPs:  []netip.Addr{netip.MustParseAddr("100.64.0.22")},
+				PrimaryRoutes: &onlineVIPRoutes,
+				Online:        true,
+			},
+			kExpiredPeer: {
+				HostName:     "expired-node",
+				DNSName:      "expired-node.example.ts.net.",
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.23")},
+				Online:       true,
+				Expired:      true,
+			},
+			kOfflineRouter: {
+				HostName:      "subnet-router-broad",
+				TailscaleIPs:  []netip.Addr{netip.MustParseAddr("100.64.0.24")},
+				PrimaryRoutes: &offlineSubnetRoutes,
+				Online:        false,
+			},
+			kOnlineSpecificRouter: {
+				HostName:      "subnet-router-specific",
+				TailscaleIPs:  []netip.Addr{netip.MustParseAddr("100.64.0.25")},
+				PrimaryRoutes: &onlineSpecificSubnetRoutes,
+				Online:        true,
+			},
+		},
+	}
+
+	peerMap := buildPeerOnlineMap(st)
+	// HA VIP 100.101.102.10 has one offline and one online backing node -> online
+	if !peerMap["100.101.102.10"] {
+		t.Fatalf("expected HA VIP 100.101.102.10 with online backing peer to resolve online, got %+v", peerMap)
+	}
+	// VIP 100.101.102.99 has only an offline backing node -> offline
+	if peerMap["100.101.102.99"] {
+		t.Fatalf("expected VIP 100.101.102.99 with only offline backing peer to resolve offline, got %+v", peerMap)
+	}
+	// Expired peer must resolve offline even if Online=true
+	if peerMap["expired-node"] || peerMap["100.64.0.23"] {
+		t.Fatalf("expected expired peer to resolve offline, got %+v", peerMap)
+	}
+
+	dialer := &countingMockPeerDialer{peers: peerMap}
+	p := NewProxyWithDialers(nil, map[string]Dialer{"prod": dialer}, 1024, 1)
+
+	if offline, reason := p.isPeerOffline(context.Background(), dialer, "100.101.102.99:443"); !offline || !strings.Contains(reason, "100.101.102.99") {
+		t.Fatalf("expected offline VIP 100.101.102.99:443 to be detected offline, got offline=%v reason=%q", offline, reason)
+	}
+	if offline, reason := p.isPeerOffline(context.Background(), dialer, "100.101.102.10:443"); offline {
+		t.Fatalf("expected online HA VIP 100.101.102.10:443 to be online, got reason=%q", reason)
+	}
+	// Longest-prefix match: 10.20.1.50 matches /24 (online) over /16 (offline)
+	if offline, reason := p.isPeerOffline(context.Background(), dialer, "10.20.1.50:8080"); offline {
+		t.Fatalf("expected 10.20.1.50:8080 matching online /24 route to be online, got reason=%q", reason)
+	}
+	// 10.20.99.50 falls into /16 (offline)
+	if offline, reason := p.isPeerOffline(context.Background(), dialer, "10.20.99.50:8080"); !offline || !strings.Contains(reason, "10.20.0.0/16") {
+		t.Fatalf("expected 10.20.99.50:8080 matching offline /16 subnet route to be offline, got offline=%v reason=%q", offline, reason)
+	}
+}
+
+func TestNotifyTailnetNetmapChangedImmediateWakeup(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start backend listener: %v", err)
+	}
+	defer backendListener.Close()
+	go func() {
+		for {
+			c, acceptErr := backendListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	backendHost, _, _ := net.SplitHostPort(backendListener.Addr().String())
+	dialer := &countingMockPeerDialer{
+		peers: map[string]bool{
+			backendHost: false, // Initially offline in netmap
+		},
+	}
+
+	proxyPort := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            proxyPort,
+			ListenAddress:     "127.0.0.1",
+			Destination:       backendListener.Addr().String(),
+			Protocol:          "tcp",
+			Tailnet:           "prod",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"prod": dialer}, 32*1024, 20)
+	p.probeInitialDelay = 10 * time.Millisecond
+	// Set a 10-minute probe interval so periodic timer never fires during the test
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            10 * time.Minute,
+		Timeout:             200 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+	<-p.Started()
+
+	// Wait for initial probe to suspend the listener because netmap says peer is offline
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && !st[0].Up && st[0].LastError != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := p.GetPortStatuses(); len(st) != 1 || st[0].Up {
+		t.Fatalf("expected listener to be initially suspended due to offline peer, got %+v", st)
+	}
+
+	// Transition peer to online in the netmap and fire NotifyTailnetNetmapChanged("prod")
+	dialer.mu.Lock()
+	dialer.peers[backendHost] = true
+	dialer.mu.Unlock()
+	p.NotifyTailnetNetmapChanged("prod")
+
+	// Listener must wake immediately (without waiting for the 10-minute probe interval) and resume
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 1 && st[0].Up {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := p.GetPortStatuses(); len(st) != 1 || !st[0].Up {
+		t.Fatalf("expected listener to immediately resume upon NotifyTailnetNetmapChanged, got %+v", st)
+	}
+}
+
+type discoMockDialer struct {
+	mu          sync.Mutex
+	dialTarget  string
+	peers       map[string]bool
+	peerAddrs   map[string]netip.Addr
+	pingResults map[netip.Addr]*ipnstate.PingResult
+	tsmpResults map[netip.Addr]*ipnstate.PingResult
+	pingErr     error
+	pingCalls   atomic.Int32
+}
+
+func (d *discoMockDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	d.mu.Lock()
+	target := d.dialTarget
+	d.mu.Unlock()
+	if target == "" {
+		target = address
+	}
+	var nd net.Dialer
+	return nd.DialContext(ctx, network, target)
+}
+
+func (d *discoMockDialer) PeerOnlineMap(_ context.Context) (map[string]bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cp := make(map[string]bool, len(d.peers))
+	for k, v := range d.peers {
+		cp[k] = v
+	}
+	return cp, nil
+}
+
+func (d *discoMockDialer) PeerAddrMap(_ context.Context) (map[string]netip.Addr, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cp := make(map[string]netip.Addr, len(d.peerAddrs))
+	for k, v := range d.peerAddrs {
+		cp[k] = v
+	}
+	return cp, nil
+}
+
+func (d *discoMockDialer) PingDisco(_ context.Context, ip netip.Addr) (*ipnstate.PingResult, error) {
+	d.pingCalls.Add(1)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.pingErr != nil {
+		return nil, d.pingErr
+	}
+	if pr, ok := d.pingResults[ip]; ok && pr != nil {
+		cp := *pr
+		return &cp, nil
+	}
+	return &ipnstate.PingResult{Err: "peer not found"}, nil
+}
+
+func (d *discoMockDialer) PingTSMP(_ context.Context, ip netip.Addr) (*ipnstate.PingResult, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if pr, ok := d.tsmpResults[ip]; ok && pr != nil {
+		cp := *pr
+		return &cp, nil
+	}
+	return &ipnstate.PingResult{}, nil
+}
+
+func TestClassifyDiscoPingResultAndPeerAddrResolution(t *testing.T) {
+	if _, ok := classifyDiscoPingResult(nil); ok {
+		t.Fatal("expected nil PingResult to return ok=false")
+	}
+	if _, ok := classifyDiscoPingResult(&ipnstate.PingResult{Err: "timed out"}); ok {
+		t.Fatal("expected error PingResult to return ok=false")
+	}
+
+	localInfo, ok := classifyDiscoPingResult(&ipnstate.PingResult{IsLocalIP: true})
+	if !ok || localInfo.path != "local" {
+		t.Fatalf("expected local path classification, got ok=%v info=%+v", ok, localInfo)
+	}
+
+	directInfo, ok := classifyDiscoPingResult(&ipnstate.PingResult{
+		Endpoint:       "203.0.113.45:41641",
+		LatencySeconds: 0.0041,
+	})
+	if !ok || directInfo.path != "direct" || directInfo.endpoint != "203.0.113.45:41641" || directInfo.latencySeconds != 0.0041 {
+		t.Fatalf("unexpected direct path classification: ok=%v info=%+v", ok, directInfo)
+	}
+
+	derpInfo, ok := classifyDiscoPingResult(&ipnstate.PingResult{
+		DERPRegionID:   17,
+		DERPRegionCode: "syd",
+		LatencySeconds: 0.038,
+	})
+	if !ok || derpInfo.path != "derp" || derpInfo.derpRegionID != 17 || derpInfo.derpRegionCode != "syd" || derpInfo.latencySeconds != 0.038 {
+		t.Fatalf("unexpected derp path classification: ok=%v info=%+v", ok, derpInfo)
+	}
+
+	kOfflineVIP := key.NewNode().Public()
+	kOnlineVIP := key.NewNode().Public()
+	kBroadRouter := key.NewNode().Public()
+	kSpecificRouter := key.NewNode().Public()
+
+	vipRoutes := views.SliceOf([]netip.Prefix{
+		netip.MustParsePrefix("100.101.102.10/32"),
+	})
+	broadSubnet := views.SliceOf([]netip.Prefix{
+		netip.MustParsePrefix("10.20.0.0/16"),
+	})
+	specificSubnet := views.SliceOf([]netip.Prefix{
+		netip.MustParsePrefix("10.20.1.0/24"),
+	})
+
+	st := &ipnstate.Status{
+		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+			kOfflineVIP: {
+				HostName:      "vip-node-offline",
+				DNSName:       "vip-offline.example.ts.net.",
+				TailscaleIPs:  []netip.Addr{netip.MustParseAddr("100.64.0.21")},
+				PrimaryRoutes: &vipRoutes,
+				Online:        false,
+			},
+			kOnlineVIP: {
+				HostName: "vip-node-online",
+				DNSName:  "db.example.ts.net.",
+				TailscaleIPs: []netip.Addr{
+					netip.MustParseAddr("fd7a:115c:a1e0::22"),
+					netip.MustParseAddr("100.64.0.22"),
+				},
+				PrimaryRoutes: &vipRoutes,
+				Online:        true,
+			},
+			kBroadRouter: {
+				HostName:      "router-broad",
+				TailscaleIPs:  []netip.Addr{netip.MustParseAddr("100.64.0.24")},
+				PrimaryRoutes: &broadSubnet,
+				Online:        true,
+			},
+			kSpecificRouter: {
+				HostName:      "router-specific",
+				TailscaleIPs:  []netip.Addr{netip.MustParseAddr("100.64.0.25")},
+				PrimaryRoutes: &specificSubnet,
+				Online:        true,
+			},
+		},
+	}
+
+	peerMap := buildPeerOnlineMap(st)
+	addrMap := buildPeerAddrMap(st)
+	dialer := &discoMockDialer{
+		peers:     peerMap,
+		peerAddrs: addrMap,
+	}
+	p := NewProxyWithDialers(nil, map[string]Dialer{"prod": dialer}, 1024, 1)
+
+	// 1. MagicDNS FQDN and short hostname resolve to the online peer's IPv4 Tailscale IP
+	if ip, ok := p.resolvePeerIP(context.Background(), dialer, "db.example.ts.net:5432"); !ok || ip != netip.MustParseAddr("100.64.0.22") {
+		t.Fatalf("expected db.example.ts.net:5432 to resolve to 100.64.0.22, got ok=%v ip=%v", ok, ip)
+	}
+	if ip, ok := p.resolvePeerIP(context.Background(), dialer, "db:5432"); !ok || ip != netip.MustParseAddr("100.64.0.22") {
+		t.Fatalf("expected short hostname db:5432 to resolve to 100.64.0.22, got ok=%v ip=%v", ok, ip)
+	}
+	// 2. Explicit IPv6 Tailscale address resolves to the peer's IPv6 Tailscale IP
+	if ip, ok := p.resolvePeerIP(context.Background(), dialer, "[fd7a:115c:a1e0::22]:5432"); !ok || ip != netip.MustParseAddr("fd7a:115c:a1e0::22") {
+		t.Fatalf("expected [fd7a:115c:a1e0::22]:5432 to resolve to fd7a:115c:a1e0::22, got ok=%v ip=%v", ok, ip)
+	}
+	// 3. HA TailVIP /32 PrimaryRoute resolves to the online backing peer (100.64.0.22) over the offline peer (100.64.0.21)
+	if ip, ok := p.resolvePeerIP(context.Background(), dialer, "100.101.102.10:443"); !ok || ip != netip.MustParseAddr("100.64.0.22") {
+		t.Fatalf("expected HA VIP 100.101.102.10:443 to resolve to online peer 100.64.0.22, got ok=%v ip=%v", ok, ip)
+	}
+	// 4. Subnet route longest-prefix match resolves 10.20.1.50 to specific router (100.64.0.25) and 10.20.99.50 to broad router (100.64.0.24)
+	if ip, ok := p.resolvePeerIP(context.Background(), dialer, "10.20.1.50:8080"); !ok || ip != netip.MustParseAddr("100.64.0.25") {
+		t.Fatalf("expected 10.20.1.50:8080 to resolve to specific subnet router 100.64.0.25, got ok=%v ip=%v", ok, ip)
+	}
+	if ip, ok := p.resolvePeerIP(context.Background(), dialer, "10.20.99.50:8080"); !ok || ip != netip.MustParseAddr("100.64.0.24") {
+		t.Fatalf("expected 10.20.99.50:8080 to resolve to broad subnet router 100.64.0.24, got ok=%v ip=%v", ok, ip)
+	}
+}
+
+func TestDiscoPathProbingDirectAndDERPTransition(t *testing.T) {
+	backendListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start TCP backend listener: %v", err)
+	}
+	defer backendListener.Close()
+	go func() {
+		for {
+			c, acceptErr := backendListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	peerIP := netip.MustParseAddr("100.64.0.55")
+	dialer := &discoMockDialer{
+		dialTarget: backendListener.Addr().String(),
+		peers: map[string]bool{
+			"app.example.ts.net": true,
+			"app":                true,
+			"100.64.0.55":        true,
+		},
+		peerAddrs: map[string]netip.Addr{
+			"app.example.ts.net": peerIP,
+			"app":                peerIP,
+			"100.64.0.55":        peerIP,
+		},
+		pingResults: map[netip.Addr]*ipnstate.PingResult{
+			peerIP: {
+				DERPRegionID:   17,
+				DERPRegionCode: "syd",
+				LatencySeconds: 0.042,
+			},
+		},
+	}
+
+	port1 := getFreeTCPPort(t)
+	port2 := getFreeTCPPort(t)
+	ports := []PortMapping{
+		{
+			Source:            port1,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "app.example.ts.net:8080",
+			Protocol:          "tcp",
+			Tailnet:           "prod",
+			ConnectionTimeout: 2,
+		},
+		{
+			Source:            port2,
+			ListenAddress:     "127.0.0.1",
+			Destination:       "100.64.0.55:8081",
+			Protocol:          "tcp",
+			Tailnet:           "prod",
+			ConnectionTimeout: 2,
+		},
+	}
+
+	p := NewProxyWithDialers(ports, map[string]Dialer{"prod": dialer}, 32*1024, 20)
+	p.probeInitialDelay = 10 * time.Millisecond
+	p.SetProbeConfig(ProbeConfig{
+		Enabled:             true,
+		Interval:            10 * time.Minute,
+		Timeout:             200 * time.Millisecond,
+		ConsecutiveFailures: 1,
+		Cooldown:            time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+	defer p.Stop()
+	<-p.Started()
+
+	// Step 1: Wait for initial probe to populate DERP relay path telemetry on both ports
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := p.GetPortStatuses()
+		if len(st) == 2 && st[0].Path == "derp" && st[1].Path == "derp" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st := p.GetPortStatuses()
+	for i, ps := range st {
+		if !ps.Up || ps.Path != "derp" || ps.DERPRegionID != 17 || ps.DERPRegionCode != "syd" || ps.Endpoint != "" || ps.LatencySeconds != 0.042 {
+			t.Fatalf("expected port[%d] to report DERP path telemetry, got %+v", i, ps)
+		}
+	}
+	// Verify per-peer disco cache deduplicated the two ports targeting the same peer into a single PingDisco call
+	if calls := dialer.pingCalls.Load(); calls != 1 {
+		t.Fatalf("expected disco cache to coalesce 2 ports for peer %s into 1 PingDisco call, got %d", peerIP, calls)
+	}
+
+	// Step 2: Upgrade peer path from DERP relay to Direct P2P UDP and notify netmap change
+	dialer.mu.Lock()
+	dialer.pingResults[peerIP] = &ipnstate.PingResult{
+		Endpoint:       "203.0.113.45:41641",
+		LatencySeconds: 0.0035,
+	}
+	dialer.mu.Unlock()
+	p.NotifyTailnetNetmapChanged("prod")
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st = p.GetPortStatuses()
+		if len(st) == 2 && st[0].Path == "direct" && st[1].Path == "direct" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st = p.GetPortStatuses()
+	for i, ps := range st {
+		if !ps.Up || ps.Path != "direct" || ps.Endpoint != "203.0.113.45:41641" || ps.DERPRegionID != 0 || ps.DERPRegionCode != "" || ps.LatencySeconds != 0.0035 {
+			t.Fatalf("expected port[%d] to transition to direct UDP path telemetry, got %+v", i, ps)
+		}
+	}
+
+	// Step 3: Transition peer to offline and verify path telemetry is cleared when suspended
+	dialer.mu.Lock()
+	dialer.peers["app.example.ts.net"] = false
+	dialer.peers["app"] = false
+	dialer.peers["100.64.0.55"] = false
+	dialer.mu.Unlock()
+	p.NotifyTailnetNetmapChanged("prod")
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st = p.GetPortStatuses()
+		if len(st) == 2 && !st[0].Up && !st[1].Up {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	st = p.GetPortStatuses()
+	for i, ps := range st {
+		if ps.Up || ps.Path != "" || ps.Endpoint != "" || ps.DERPRegionID != 0 || ps.DERPRegionCode != "" || ps.LatencySeconds != 0 {
+			t.Fatalf("expected suspended port[%d] to clear all path telemetry, got %+v", i, ps)
+		}
+	}
+}
+
+func TestProbeDestinationPreFlight(t *testing.T) {
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start TCP backend listener: %v", err)
+	}
+	defer tcpLn.Close()
+	go func() {
+		for {
+			c, acceptErr := tcpLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	udpPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start UDP backend listener: %v", err)
+	}
+	defer udpPC.Close()
+
+	closedPort := getFreeTCPPort(t)
+	closedAddr := fmt.Sprintf("127.0.0.1:%d", closedPort)
+
+	peerIP := netip.MustParseAddr("100.64.0.88")
+	offlineIP := netip.MustParseAddr("100.64.0.89")
+
+	dialer := &discoMockDialer{
+		dialTarget: tcpLn.Addr().String(),
+		peers: map[string]bool{
+			"db.example.ts.net":      true,
+			"100.64.0.88":            true,
+			"offline.example.ts.net": false,
+			"100.64.0.89":            false,
+		},
+		peerAddrs: map[string]netip.Addr{
+			"db.example.ts.net":      peerIP,
+			"100.64.0.88":            peerIP,
+			"offline.example.ts.net": offlineIP,
+			"100.64.0.89":            offlineIP,
+		},
+		pingResults: map[netip.Addr]*ipnstate.PingResult{
+			peerIP: {
+				Endpoint:       "203.0.113.88:41641",
+				LatencySeconds: 0.0029,
+			},
+		},
+		tsmpResults: map[netip.Addr]*ipnstate.PingResult{},
+	}
+
+	p := NewProxyWithDialers(nil, map[string]Dialer{"prod": dialer}, 32*1024, 20)
+
+	// 1. Open TCP port on online peer -> Reachable=true, PeerOnline=true, Path="direct"
+	res, found := p.ProbeDestination(context.Background(), "prod", "tcp", "db.example.ts.net:5432", 500*time.Millisecond)
+	if !found {
+		t.Fatal("expected known profile 'prod' to return found=true")
+	}
+	if !res.Reachable || !res.PeerOnline || res.PeerIP != "100.64.0.88" || res.Path != "direct" || res.Endpoint != "203.0.113.88:41641" || res.LatencySeconds != 0.0029 {
+		t.Fatalf("unexpected open TCP probe result: %+v", res)
+	}
+
+	// 2. Open UDP port on online peer -> Reachable=true, PeerOnline=true, Path="direct"
+	dialer.mu.Lock()
+	dialer.dialTarget = udpPC.LocalAddr().String()
+	dialer.mu.Unlock()
+	res, found = p.ProbeDestination(context.Background(), "prod", "udp", "db.example.ts.net:5353", 500*time.Millisecond)
+	if !found || !res.Reachable || !res.PeerOnline || res.Path != "direct" {
+		t.Fatalf("unexpected open UDP probe result: found=%v res=%+v", found, res)
+	}
+
+	// 3. Closed TCP port on online peer -> Reachable=false, PeerOnline=true, ACLBlocked=false, still reports Path="direct"
+	dialer.mu.Lock()
+	dialer.dialTarget = closedAddr
+	dialer.mu.Unlock()
+	res, found = p.ProbeDestination(context.Background(), "prod", "tcp", "db.example.ts.net:5432", 300*time.Millisecond)
+	if !found || res.Reachable || !res.PeerOnline || res.ACLBlocked || res.Path != "direct" || res.Error == "" {
+		t.Fatalf("expected closed TCP port to report Reachable=false, PeerOnline=true, Path=direct, got found=%v res=%+v", found, res)
+	}
+
+	// 4. Tailscale ACL / packet filter block diagnosed via PingTSMP -> ACLBlocked=true
+	dialer.mu.Lock()
+	dialer.tsmpResults[peerIP] = &ipnstate.PingResult{
+		Err: "peer's node filter blocked packet",
+	}
+	dialer.mu.Unlock()
+	res, found = p.ProbeDestination(context.Background(), "prod", "tcp", "db.example.ts.net:5432", 300*time.Millisecond)
+	if !found || res.Reachable || !res.PeerOnline || !res.ACLBlocked || !strings.Contains(res.Error, "filter blocked") {
+		t.Fatalf("expected ACL-blocked port to report ACLBlocked=true, got found=%v res=%+v", found, res)
+	}
+
+	// 5. Offline peer in netmap -> PeerOnline=false, Reachable=false
+	res, found = p.ProbeDestination(context.Background(), "prod", "tcp", "offline.example.ts.net:5432", 300*time.Millisecond)
+	if !found || res.PeerOnline || res.Reachable || !strings.Contains(res.Error, "is offline") {
+		t.Fatalf("expected offline peer to report PeerOnline=false, Reachable=false, got found=%v res=%+v", found, res)
+	}
+
+	// 6. Unknown profile -> found=false
+	res, found = p.ProbeDestination(context.Background(), "unknown-tailnet", "tcp", "db.example.ts.net:5432", 300*time.Millisecond)
+	if found || res.Reachable {
+		t.Fatalf("expected unknown profile to return found=false, got found=%v res=%+v", found, res)
+	}
+
+	// 7. Streaming 3-stage callbacks ("netmap", "path", "port")
+	dialer.mu.Lock()
+	dialer.dialTarget = tcpLn.Addr().String()
+	delete(dialer.tsmpResults, peerIP)
+	dialer.mu.Unlock()
+
+	var stages []ProbeResult
+	finalRes, found := p.ProbeDestinationStream(context.Background(), "prod", "tcp", "db.example.ts.net:5432", 500*time.Millisecond, func(ev ProbeResult) {
+		stages = append(stages, ev)
+	})
+	if !found || !finalRes.Reachable || finalRes.Path != "direct" {
+		t.Fatalf("expected streaming probe to succeed, got found=%v finalRes=%+v", found, finalRes)
+	}
+	if len(stages) != 3 {
+		t.Fatalf("expected 3 streamed stage events (netmap, path, port), got %d: %+v", len(stages), stages)
+	}
+	if stages[0].Stage != "netmap" || !stages[0].PeerOnline || stages[0].PeerIP != "100.64.0.88" {
+		t.Fatalf("expected first streamed event to be stage='netmap', got %+v", stages[0])
+	}
+	seenStages := map[string]bool{
+		stages[1].Stage: true,
+		stages[2].Stage: true,
+	}
+	if !seenStages["path"] || !seenStages["port"] {
+		t.Fatalf("expected remaining streamed stages to be 'path' and 'port', got %q and %q", stages[1].Stage, stages[2].Stage)
+	}
+	lastEv := stages[len(stages)-1]
+	if !lastEv.Reachable || lastEv.Path != "direct" || lastEv.Endpoint != "203.0.113.88:41641" {
+		t.Fatalf("expected final streamed event to contain cumulative Reachable=true and Path='direct', got %+v", lastEv)
 	}
 }
