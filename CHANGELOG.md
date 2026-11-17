@@ -8,6 +8,20 @@ While the project is pre-`1.0.0` (`0.y.z`), backward compatibility is not guaran
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-17
+
+### Performance
+- **Refreshed Profile-Guided Optimization Profile (`cmd/proxtail/default.pgo`)**:
+  - Regenerated `cmd/proxtail/default.pgo` against the `v0.6.0` codebase and Go `1.27.3` toolchain (`make pgo`), improving end-to-end `tsnet` + WireGuard throughput by **+3.8%** (`BenchmarkRealTSNetWireGuardTCPThroughput`) to **+14.6%** (`BenchmarkRealTSNetWireGuardTCPParallelThroughput`) while preserving `0 allocs/op` on all hot-path forwarding benchmarks.
+
+### Changed
+- **Dependencies & Container Builder**:
+  - Upgraded `tailscale.com` from `v1.104.4` to `v1.104.6` ([#29](https://github.com/fadlytabrani/proxtail/pull/29)).
+  - Upgraded container builder image in `Dockerfile` from `golang:1.27.3-alpine3.24` to `golang:1.27.4-alpine3.24` ([#30](https://github.com/fadlytabrani/proxtail/pull/30)).
+  - Upgraded GitHub Actions dependencies: `sigstore/cosign-installer` `v4.1.2` → `v4.1.3` ([#25](https://github.com/fadlytabrani/proxtail/pull/25)), `softprops/action-gh-release` `v3.0.3` → `v3.0.4` ([#27](https://github.com/fadlytabrani/proxtail/pull/27)), and `docker/login-action` `v4.7.0` → `v4.8.0` ([#28](https://github.com/fadlytabrani/proxtail/pull/28)).
+- **Documentation**:
+  - Refreshed `README.md` and `CONTRIBUTING.md` with PGO benchmark comparisons (`linux/amd64` and `darwin/arm64`), Multi-Tailnet Fault Isolation & Key Rotation notes, per-tailnet `listen_address` IP isolation examples, Zero-Tailnet Standby Mode, and 5-Point Probing Architecture details.
+
 ## [0.6.0] - 2026-11-04
 
 ### Added
